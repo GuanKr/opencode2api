@@ -104,10 +104,15 @@ body {
   background: var(--paper);
   color: var(--ink);
   font:
-    14px/1.55 ui-sans-serif,
+    16px/1.55 "JetBrains Mono",
+    ui-sans-serif,
     system-ui,
     -apple-system,
     "Segoe UI",
+    "Microsoft YaHei",
+    "PingFang SC",
+    "Hiragino Sans GB",
+    "Noto Sans SC",
     sans-serif;
 }
 button,
@@ -130,7 +135,14 @@ pre,
 .metric,
 .table th,
 .log {
-  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-family:
+    "JetBrains Mono",
+    ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    "Liberation Mono",
+    "Microsoft YaHei",
+    monospace;
 }
 .login {
   min-height: 100vh;
