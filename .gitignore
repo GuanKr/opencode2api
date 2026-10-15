@@ -20,3 +20,11 @@ coverage.out
 # Local credentials, deployment backups, and verification artifacts
 .local/
 *.availability.json
+
+# Local-only artifacts (see AGENTS.md): rebuilt binary and its editor backups,
+# the local usage history snapshot, the Clash watchdog's read-only config, and
+# MCP browser scratch dirs.
+opencode2api.exe*
+config.json.usage.history.json
+watchdog.json
+.playwright-mcp/
