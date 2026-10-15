@@ -737,13 +737,48 @@ textarea {
   color: var(--muted);
 }
 .trend-chart {
+  padding: 18px 4px 0;
+}
+.trend-bars {
   height: 230px;
   display: flex;
   align-items: flex-end;
   gap: 3px;
-  padding: 18px 4px 0;
   border-bottom: 1px solid var(--line);
   overflow: hidden;
+}
+.trend-axis {
+  display: flex;
+  gap: 3px;
+  padding-top: 6px;
+}
+.trend-tick {
+  flex: 1;
+  min-width: 2px;
+  text-align: center;
+  font-family:
+    "JetBrains Mono",
+    ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    "Microsoft YaHei",
+    monospace;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.trend-value {
+  position: absolute;
+  top: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #17231fd9;
+  color: #fffdf7;
+  font-size: 11px;
+  line-height: 1.6;
+  padding: 0 4px;
+  border-radius: 3px;
+  pointer-events: none;
 }
 .trend-bar {
   flex: 1;
@@ -754,6 +789,211 @@ textarea {
 }
 .trend-bar:hover {
   background: var(--orange);
+}
+.donut-row {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.donut {
+  width: 148px;
+  height: 148px;
+  border-radius: 50%;
+  flex: none;
+  border: 1px solid var(--line);
+  background: var(--paper2);
+}
+.donut-legend {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  min-width: 220px;
+  flex: 1;
+}
+.donut-legend div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px dashed #ded9cd;
+  padding: 3px 0;
+}
+.dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 7px;
+}
+.usage-filters {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(140px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+/* 用量页表格与上方 donut / 筛选区之间的间距：走 class 而不是 inline style，
+   因为 admin 的 CSP 是 style-src 'self'，行内 style 属性会被浏览器拦掉。 */
+.usage-table {
+  margin-top: 12px;
+}
+/* 粒度按钮不参与压缩：否则和长标题并排时按钮文字会被挤成两行。 */
+#page-usage .toolbar button {
+  flex: none;
+  white-space: nowrap;
+}
+/* 会话列：同一对话同色，点击按该对话筛选 */
+.table td.conv {
+  font-weight: 700;
+  white-space: nowrap;
+}
+.table td.conv:hover {
+  text-decoration: underline;
+}
+/* token 紧凑格：新输入↓/输出↑ + 缓存读与命中率 + 悬停明细 */
+.tok {
+  position: relative;
+  display: inline-block;
+  line-height: 1.45;
+  white-space: nowrap;
+  cursor: default;
+}
+.tok-l1,
+.tok-l2 {
+  display: block;
+}
+.tok-l1 i {
+  font-style: normal;
+  font-weight: 700;
+  margin-right: 2px;
+}
+.a-dn {
+  color: var(--ok);
+}
+.a-up {
+  color: #7c6cf0;
+}
+.tok-l2 {
+  color: #2f6fd6;
+  font-size: 12px;
+}
+.tok-l2 svg {
+  width: 11px;
+  height: 11px;
+  vertical-align: -1px;
+  margin-right: 3px;
+}
+.tok-hit {
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: 5px;
+}
+.tok-hit.hit95 {
+  color: #237056;
+  font-weight: 700;
+}
+.tok-hit.hit85 {
+  color: #4d7c0f;
+  font-weight: 700;
+}
+.tok-hit.hit70 {
+  color: #b45309;
+  font-weight: 700;
+}
+.tok-hit.hit50 {
+  color: #92400e;
+  font-weight: 700;
+}
+.tok-tip {
+  display: none;
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 50;
+  min-width: 196px;
+  background: #1d2521;
+  color: #f2efe5;
+  border: 1px solid #ffffff1f;
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 12px 35px #17231f66;
+  pointer-events: none;
+  font-size: 12px;
+}
+.tok:hover .tok-tip {
+  display: block;
+}
+.tok-tip b {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: #fff;
+}
+.tok-tip > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 1px 0;
+  color: #b9c4bd;
+}
+.tok-tip > span > span:last-child {
+  color: #f2efe5;
+  font-family:
+    "JetBrains Mono",
+    ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    "Microsoft YaHei",
+    monospace;
+}
+.tok-tip .tt-total {
+  border-top: 1px solid #ffffff26;
+  margin-top: 6px;
+  padding-top: 6px;
+}
+.tok-tip .tt-total > span:last-child {
+  color: #8fb8ff;
+  font-weight: 700;
+}
+.req-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.pager-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pager {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.pager button {
+  min-width: 28px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  background: var(--white);
+  color: var(--ink);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.pager button:hover:not(:disabled) {
+  border-color: var(--forest);
+}
+.pager button.on {
+  border-color: var(--ok);
+  color: var(--ok);
+  font-weight: 700;
+}
+.pager .ell {
+  padding: 0 2px;
+  color: var(--muted);
 }
 .tier-row {
   display: grid;

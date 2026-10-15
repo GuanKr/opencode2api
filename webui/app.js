@@ -17,7 +17,7 @@ const pages = {
   overview: ["01", "运行桌面", "最近一小时、进程累计与当前资源状态。"],
   guide: ["02", "首次运行", "用六个检查点完成从配置到首个请求。"],
   access: ["03", "接入手册", "Chat、Responses、Anthropic 与 SDK 示例。"],
-  usage: ["04", "Token 用量", "覆盖率、每分钟趋势、模型排行与 Tier 分布。"],
+  usage: ["04", "Token 用量", "按小时/天/周/月查看 Token 与预估成本"],
   playground: ["05", "Playground", "三种入口协议共用真实 Gateway 路由与诊断。"],
   diagnostics: ["06", "路由诊断", "Metadata、模型资格与每一次上游尝试。"],
   config: ["07", "配置中心", "验证后原子保存，并热应用可变字段。"],
@@ -113,7 +113,7 @@ function openPage(page) {
   $("#page-title").textContent = meta[1];
   $("#page-sub").textContent = meta[2];
   if (page === "access") renderAccessExamples();
-  if (page === "usage") renderUsage();
+  if (page === "usage") fetchUsage();
   if (page === "model-quotas") {
     loadModelQuotas();
     quotaTimer = setInterval(() => {
@@ -305,11 +305,41 @@ $("#account-form").addEventListener("submit", async (event) => {
     toast(error.message, true);
   }
 });
-function appendCell(row, value, className = "") {
+function appendCell(row, value, className = "", title = "") {
   const cell = document.createElement("td");
   cell.textContent = String(value);
   if (className) cell.className = className;
+  if (title) cell.title = title;
   row.appendChild(cell);
+}
+// Local: 请求明细的 Token 紧凑格（新输入↓/输出↑ + 缓存读与命中率 + 悬停明细）。
+function appendTokenCell(row, tokens) {
+  const cell = document.createElement("td");
+  row.appendChild(cell);
+  const total = Number(tokens.total_tokens || 0);
+  if (!(total > 0)) {
+    cell.textContent = "—";
+    return;
+  }
+  const input = Number(tokens.input_tokens || 0),
+    output = Number(tokens.output_tokens || 0),
+    cached = Number(tokens.cached_tokens || 0),
+    reasoning = Number(tokens.reasoning_tokens || 0),
+    fresh = Math.max(0, input - cached),
+    hit = input > 0 ? Math.min(100, Math.max(0, (cached / input) * 100)) : null;
+  const hitTone = hit == null ? "" : hit >= 95 ? "hit95" : hit >= 85 ? "hit85" : hit >= 70 ? "hit70" : hit >= 50 ? "hit50" : "";
+  const esc = (value) => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  cell.innerHTML =
+    `<span class="tok"><span class="tok-l1"><i class="a-dn">↓</i>${esc(formatTokensK(fresh))} <i class="a-up">↑</i>${esc(formatTokensK(output))}</span>` +
+    `<span class="tok-l2"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><ellipse cx="8" cy="3.6" rx="5.6" ry="2.2"/><path d="M2.4 3.6v8.8c0 1.2 2.5 2.2 5.6 2.2s5.6-1 5.6-2.2V3.6"/><path d="M2.4 8c0 1.2 2.5 2.2 5.6 2.2s5.6-1 5.6-2.2"/></svg>${esc(formatTokensK(cached))}` +
+    `${hit == null ? "" : ' <span class="tok-hit ' + hitTone + '">' + hit.toFixed(1) + "%</span>"}</span>` +
+    `<span class="tok-tip"><b>Token 明细</b>` +
+    `<span><span>输入 Token</span><span>${esc(formatTokensExact(fresh))}</span></span>` +
+    `<span><span>输出 Token</span><span>${esc(formatTokensExact(output))}</span></span>` +
+    `<span><span>缓存读取 Token</span><span>${esc(formatTokensExact(cached))}</span></span>` +
+    `<span><span>推理 Token</span><span>${esc(formatTokensExact(reasoning))}</span></span>` +
+    `<span class="tt-total"><span>总 Token</span><span>${esc(formatTokensExact(total))}</span></span>` +
+    `<span><span>缓存命中率</span><span>${hit == null ? "—" : hit.toFixed(1) + "%"}</span></span></span></span>`;
 }
 function emptyRow(host, columns, message = "暂无数据") {
   const row = document.createElement("tr"),
@@ -426,69 +456,765 @@ function renderGuide() {
   });
 }
 const formatTokens = (value) => Number(value || 0).toLocaleString();
-function renderUsage() {
-  if (!monitorData) return;
-  const usage = monitorData.usage?.last_hour || {},
-    tokens = usage.tokens || {};
-  $("#u-coverage").textContent = `${((usage.coverage || 0) * 100).toFixed(1)}%`;
-  $("#u-total").textContent = formatTokens(tokens.total_tokens);
-  $("#u-cached").textContent = formatTokens(tokens.cached_tokens);
-  $("#u-reasoning").textContent = formatTokens(tokens.reasoning_tokens);
-  const trend = $("#usage-trend"),
-    series = monitorData.metrics?.series || [],
-    maximum = Math.max(1, ...series.map((point) => point.total_tokens || 0));
-  trend.replaceChildren();
-  series.forEach((point) => {
-    const bar = document.createElement("div");
-    bar.className = "trend-bar";
-    bar.style.height = `${Math.max(2, Math.round(((point.total_tokens || 0) / maximum) * 100))}%`;
-    bar.title = `${new Date(point.minute).toLocaleTimeString()} · input ${formatTokens(point.input_tokens)} · output ${formatTokens(point.output_tokens)} · total ${formatTokens(point.total_tokens)}`;
-    trend.appendChild(bar);
+// Local: Token 用量页 —— 紧凑数字/命中率/成本/耗时格式化分区。
+// 紧凑口径只服务本页：上面的 formatTokens 保持上游的纯千分位写法，
+// 元数据与 API Key 页的渲染不受影响。
+const formatTokensCompact = (value) => {
+  let n = Number(value || 0);
+  if (Number.isNaN(n)) return "0";
+  if (!isFinite(n)) return "∞";
+  n = Math.round(n);
+  if (n >= 1e8 || Number((n / 1e4).toFixed(2)) >= 10000) return (n / 1e8).toFixed(2) + "亿";
+  if (n >= 1e4) return (n / 1e4).toFixed(2) + "万";
+  return n.toLocaleString();
+};
+const formatTokensK = (value) => {
+  let n = Number(value || 0);
+  if (Number.isNaN(n)) return "0";
+  if (!isFinite(n)) return "∞";
+  n = Math.round(n);
+  const sign = n < 0 ? "-" : "";
+  const a = Math.abs(n);
+  if (a >= 1000) return sign + (a / 1000).toFixed(2).replace(/\.?0+$/, "") + "k";
+  return sign + a.toLocaleString();
+};
+const formatTokensExact = (value) => {
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? n.toLocaleString() : "—";
+};
+const formatHitRate = (cached, input) => {
+  const c = Number(cached || 0),
+    i = Number(input || 0);
+  if (!(i > 0) || !Number.isFinite(c) || !Number.isFinite(i)) return "—";
+  return Math.min(100, Math.max(0, (c / i) * 100)).toFixed(1) + "%";
+};
+const formatUSD = (value) => {
+  const number = Number(value || 0);
+  if (!isFinite(number) || number === 0) return "$0";
+  if (Math.abs(number) < 0.01) return "$" + number.toFixed(4);
+  return "$" + number.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
+// Three-state cost: known-free ($0) vs unknown-price. Unknown models record
+// $0 cost server-side and set unknown_cost on the point; showing a bare $0
+// would conflate the two, so unknown renders "—" (or keeps the partial sum
+// with a note when other models in range did price).
+const formatCost = (value, unknown) => {
+  if (unknown && !(Number(value) > 0)) return "—";
+  return formatUSD(value);
+};
+const costTitle = (value, unknown) => {
+  const base = "预估成本 " + formatUSD(value) + "（按记录时 models.dev 价格）";
+  return unknown ? base + "；含未知价格模型，实际可能更高" : base;
+};
+// Durations render in seconds (m/s once past a minute) instead of raw ms.
+const formatDurationMS = (value) => {
+  if (value == null) return "—";
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  const ds = Math.round(n / 100);
+  if (ds >= 36000) {
+    const h = Math.floor(ds / 36000);
+    const m = Math.floor((ds - h * 36000) / 600);
+    return `${h}h${m}m${(ds - h * 36000 - m * 600) / 10}s`;
+  }
+  if (ds >= 600) {
+    const m = Math.floor(ds / 600);
+    return `${m}m${(ds - m * 600) / 10}s`;
+  }
+  return `${ds / 10}s`;
+};
+let usageGranularity = "day",
+  usageOffset = 0,
+  usageData = null,
+  usageLoading = false,
+  // Local: /api/usage 失败原因。空字符串表示还没失败过（"加载中"），非空表示
+  // 已失败——用于区分"数据还没到"和"数据不会来了"，避免拿旧口径兜底冒充新口径。
+  usageLoadError = "",
+  lastUsageFetch = 0,
+  usageMetricMode = "tokens",
+  usageReqPage = 1,
+  usageReqPageSize = 20;
+const usageCounts = { hour: 24, day: 30, week: 12, month: 12 },
+  granLabels = { hour: "小时", day: "天", week: "周", month: "月" };
+const formatBeijingDay = (iso) =>
+  new Date(iso).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit" });
+const formatBeijingHour = (iso) =>
+  new Date(iso).toLocaleString("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    hour12: false,
   });
-  const models = $("#usage-models");
-  models.replaceChildren();
-  Object.entries(usage.models || {})
-    .sort((a, b) => (b[1].total_tokens || 0) - (a[1].total_tokens || 0))
-    .slice(0, 15)
-    .forEach(([model, value]) => {
-      const row = document.createElement("tr");
-      appendCell(row, model);
-      appendCell(row, formatTokens(value.input_tokens));
-      appendCell(row, formatTokens(value.output_tokens));
-      appendCell(row, formatTokens(value.total_tokens));
-      models.appendChild(row);
-    });
-  if (!models.children.length) emptyRow(models, 4, "尚无 Token 用量");
-  const tiers = $("#usage-tiers"),
-    tierEntries = Object.entries(usage.tiers || {}).sort(
-      (a, b) => (b[1].total_tokens || 0) - (a[1].total_tokens || 0),
-    ),
-    tierTotal = Math.max(1, ...tierEntries.map(([, value]) => value.total_tokens || 0));
-  tiers.replaceChildren();
-  tierEntries.forEach(([tier, value]) => {
-    const row = document.createElement("div"),
-      name = document.createElement("strong"),
-      track = document.createElement("div"),
-      fill = document.createElement("div"),
-      amount = document.createElement("span");
-    row.className = "tier-row";
-    name.textContent = tier;
-    track.className = "tier-track";
-    fill.className = "tier-fill";
-    fill.style.width = `${Math.round(((value.total_tokens || 0) / tierTotal) * 100)}%`;
-    amount.className = "mono";
-    amount.textContent = formatTokens(value.total_tokens);
-    track.appendChild(fill);
-    row.append(name, track, amount);
-    tiers.appendChild(row);
-  });
-  if (!tierEntries.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = "尚无 Tier 用量";
-    tiers.appendChild(empty);
+// Local: Token 用量页 —— 数据获取 + 北京时间标签/趋势轴分区。
+async function fetchUsage() {
+  if (usageLoading) return;
+  usageLoading = true;
+  try {
+    const count = usageCounts[usageGranularity] || 30;
+    usageData = await api(`/api/usage?granularity=${usageGranularity}&count=${count}&offset=${usageOffset}`);
+    usageLoadError = "";
+    if (location.hash === "#usage") renderUsage();
+  } catch (error) {
+    usageLoadError = error.message || String(error);
+    // Local: 必须同时清空 usageData。否则切换粒度后接口报错，旧粒度的数据会
+    // 留在标题已改成新粒度的页面上（实测出现"按小时"标题配 30 根按天柱）。
+    usageData = null;
+    toast(error.message, true);
+    // Local: 失败后重画一次，让页面从"加载中"切到"加载失败"，
+    // 否则会一直停在无数据的空壳上看不出是失败了还是没数据。
+    if (location.hash === "#usage") renderUsage();
+  } finally {
+    usageLoading = false;
+    // Local: 成功失败都记时间戳。之前只在成功时记，接口持续失败时自动重试
+    // 会退化成每个 3s 轮询周期一次。
+    lastUsageFetch = Date.now();
   }
 }
+function usagePointLabel(iso) {
+  return usageGranularity === "hour" ? formatBeijingHour(iso) : formatBeijingDay(iso);
+}
+function axisTickIndex(n, max) {
+  const cap = max || 12,
+    count = Math.min(Math.max(n || 0, 0), cap),
+    set = new Set();
+  if (n <= 0) return set;
+  if (count <= 1) {
+    set.add(0);
+    return set;
+  }
+  for (let k = 0; k < count; k++) set.add(Math.round((k * (n - 1)) / (count - 1)));
+  return set;
+}
+function formatAxisLabel(iso) {
+  return usageGranularity === "hour"
+    ? new Date(iso).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour: "2-digit", hour12: false })
+    : formatBeijingDay(iso);
+}
+function buildAxisTicks(labels, idx) {
+  const axis = document.createElement("div");
+  axis.className = "trend-axis";
+  labels.forEach((text, i) => {
+    const tick = document.createElement("span");
+    tick.className = "trend-tick";
+    if (idx.has(i)) tick.textContent = text;
+    axis.appendChild(tick);
+  });
+  return axis;
+}
+// Local: Token 用量页 —— 主趋势图（北京时间柱 + 轴刻度）。
+function renderUsage() {
+  const title = $("#usage-trend-title"),
+    caption = $("#usage-trend-caption"),
+    warning = $("#usage-history-warning");
+  $$("[data-gran]").forEach((button) =>
+    button.classList.toggle("primary", button.dataset.gran === usageGranularity),
+  );
+  if (title) title.textContent = "按" + (granLabels[usageGranularity] || "天") + " Token 趋势";
+  // 后端落盘被禁用（历史读回失败）时，页面上的一切都只在内存里，重启即丢：
+  // 与其让它看起来一切正常，不如直接说清楚。
+  if (warning) warning.classList.toggle("hidden", !(usageData && usageData.history_disabled));
+  if (usageData && usageData.points) {
+    const total = usageData.total || {},
+      tokens = total.tokens || {};
+    $("#u-coverage").textContent = ((total.coverage || 0) * 100).toFixed(1) + "%";
+    $("#u-total").textContent = formatTokensCompact(tokens.total_tokens);
+    $("#u-total").title = formatTokensExact(tokens.total_tokens);
+    $("#u-total-note").textContent = "当前范围 · " + (granLabels[usageGranularity] || "") + "视图";
+    $("#u-cost").textContent = formatCost(total.cost_usd, total.unknown_cost);
+    $("#u-cost").title = costTitle(total.cost_usd, total.unknown_cost);
+    $("#u-requests").textContent = Number(total.requests || 0).toLocaleString();
+    $("#u-cached").textContent = formatTokensCompact(tokens.cached_tokens);
+    $("#u-cached").title = formatTokensExact(tokens.cached_tokens);
+    $("#u-reasoning").textContent = formatTokensCompact(tokens.reasoning_tokens);
+    $("#u-reasoning").title = formatTokensExact(tokens.reasoning_tokens);
+    $("#u-hitrate").textContent = formatHitRate(tokens.cached_tokens, tokens.input_tokens);
+    const label = $("#usage-range-label");
+    if (label && usageData.from && usageData.to) {
+      const sameDay =
+        usageGranularity === "hour" &&
+        new Date(usageData.from).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" }) ===
+          new Date(usageData.to).toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" });
+      label.textContent =
+        (sameDay
+          ? formatBeijingHour(usageData.from) + " ~ " + formatBeijingHour(usageData.to)
+          : formatBeijingDay(usageData.from) + " ~ " + formatBeijingDay(usageData.to)) +
+        " · 北京时间 · 共" +
+        usageData.points.length +
+        "个" +
+        (granLabels[usageGranularity] || "点");
+    }
+    if (caption)
+      caption.textContent =
+        "北京时间对齐，柱顶数字为总量，下方时间轴对应各柱时间；悬停查看输入、输出、缓存、命中率与预估成本。";
+    const trend = $("#usage-trend"),
+      points = usageData.points,
+      maximum = Math.max(1, ...points.map((point) => point.tokens?.total_tokens || 0)),
+      bars = document.createElement("div"),
+      tickIdx = axisTickIndex(points.length, usageGranularity === "hour" || usageGranularity === "day" ? points.length : 12);
+    bars.className = "trend-bars";
+    trend.replaceChildren();
+    points.forEach((point) => {
+      const bar = document.createElement("div");
+      bar.className = "trend-bar";
+      const value = point.tokens?.total_tokens || 0;
+      bar.style.height = Math.max(2, Math.round((value / maximum) * 100)) + "%";
+      bar.title =
+        usagePointLabel(point.start) +
+        " · input " +
+        formatTokensCompact(point.tokens?.input_tokens) +
+        " · output " +
+        formatTokensCompact(point.tokens?.output_tokens) +
+        " · cached " +
+        formatTokensCompact(point.tokens?.cached_tokens) +
+        " · 命中率 " +
+        formatHitRate(point.tokens?.cached_tokens, point.tokens?.input_tokens) +
+        " · total " +
+        formatTokensCompact(value) +
+        " · " +
+        formatCost(point.cost_usd, point.unknown_cost) +
+        (point.unknown_cost ? "（含未知价格模型）" : "");
+      const tag = document.createElement("span");
+      tag.className = "trend-value";
+      if (value > 0) tag.textContent = formatTokensCompact(value);
+      bar.appendChild(tag);
+      bars.appendChild(bar);
+    });
+    trend.append(
+      bars,
+      buildAxisTicks(
+        points.map((point) => formatAxisLabel(point.start)),
+        tickIdx,
+      ),
+    );
+    const models = $("#usage-models");
+    models.replaceChildren();
+    const modelCosts = total.model_costs || {};
+    Object.entries(total.models || {})
+      .sort((a, b) => (b[1].total_tokens || 0) - (a[1].total_tokens || 0))
+      .slice(0, 15)
+      .forEach(([model, value]) => {
+        const row = document.createElement("tr");
+        appendCell(row, model);
+        appendCell(row, formatTokensCompact(value.input_tokens), "", formatTokensExact(value.input_tokens));
+        appendCell(row, formatTokensCompact(value.output_tokens), "", formatTokensExact(value.output_tokens));
+        appendCell(row, formatTokensCompact(value.total_tokens), "", formatTokensExact(value.total_tokens));
+        appendCell(row, formatUSD(modelCosts[model]), "cost");
+        models.appendChild(row);
+      });
+    if (!models.children.length) emptyRow(models, 5, "该范围内尚无 Token 用量");
+    const tiers = $("#usage-tiers"),
+      tierCosts = total.tier_costs || {},
+      tierEntries = Object.entries(total.tiers || {}).sort(
+        (a, b) => (b[1].total_tokens || 0) - (a[1].total_tokens || 0),
+      ),
+      tierTotal = Math.max(1, ...tierEntries.map(([, value]) => value.total_tokens || 0));
+    tiers.replaceChildren();
+    tierEntries.forEach(([tier, value]) => {
+      const row = document.createElement("div"),
+        name = document.createElement("strong"),
+        track = document.createElement("div"),
+        fill = document.createElement("div"),
+        amount = document.createElement("span");
+      row.className = "tier-row";
+      name.textContent = tier;
+      track.className = "tier-track";
+      fill.className = "tier-fill";
+      fill.style.width = Math.round(((value.total_tokens || 0) / tierTotal) * 100) + "%";
+      amount.className = "mono";
+      amount.textContent = formatTokensCompact(value.total_tokens) + " · " + formatUSD(tierCosts[tier]);
+      amount.title =
+        "input " +
+        formatTokensCompact(value.input_tokens) +
+        "（" +
+        formatTokensExact(value.input_tokens) +
+        "） · output " +
+        formatTokensCompact(value.output_tokens) +
+        "（" +
+        formatTokensExact(value.output_tokens) +
+        "） · cached " +
+        formatTokensCompact(value.cached_tokens) +
+        " · 命中率 " +
+        formatHitRate(value.cached_tokens, value.input_tokens) +
+        " · total " +
+        formatTokensCompact(value.total_tokens) +
+        "（" +
+        formatTokensExact(value.total_tokens) +
+        "）";
+      track.appendChild(fill);
+      row.append(name, track, amount);
+      tiers.appendChild(row);
+    });
+    if (!tierEntries.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "该范围内尚无 Tier 用量";
+      tiers.appendChild(empty);
+    }
+    renderUsageExtras();
+    return;
+  }
+  // Local: /api/usage 是本页唯一数据源。不回退到 monitorData.usage.last_hour
+  // 兜底：接口报错时它会把"最近 60 分钟"的数字填进按天/周/月标题下方，
+  // 量纲完全对不上（实测强制 500 后持续显示十余秒），比老实显示"无数据"更糟。
+  showUsageUnavailable();
+}
+// Local: 用量数据不可用时的显式空状态，区分"还没加载到"与"加载失败"。
+//
+// 只清由 /api/usage 驱动的槽位（指标、趋势、模型表、Tier 分布）。
+// 使用记录三节（端点 / 通道 / 请求表）来自 /api/monitor，与用量接口无关：
+// 之前一并清掉，结果 /api/usage 一挂，有健康监控数据的区段被永久标成
+// "用量数据加载失败" —— 那正是本次修复要消除的错误闪烁，只是换了位置。
+function showUsageUnavailable() {
+  const failed = !!usageLoadError;
+  const dash = "—",
+    hint = failed ? "加载失败" : "加载中…",
+    body = failed ? "用量数据加载失败" : "正在加载用量数据…";
+  const warning = $("#usage-history-warning");
+  if (warning) warning.classList.toggle("hidden", !(usageData && usageData.history_disabled));
+  for (const id of ["u-coverage", "u-total", "u-cost", "u-requests", "u-cached", "u-reasoning", "u-hitrate"]) {
+    const node = $("#" + id);
+    if (!node) continue;
+    node.textContent = dash;
+    node.title = "";
+  }
+  $("#u-total-note").textContent = hint;
+  const label = $("#usage-range-label");
+  if (label) label.textContent = hint;
+  const caption = $("#usage-trend-caption");
+  if (caption) caption.textContent = body;
+  const trend = $("#usage-trend");
+  if (trend) trend.replaceChildren();
+  // emptyRow 只 append，必须先清空：否则每次重画多堆一行（实测约 40 行/分钟）。
+  const models = $("#usage-models");
+  models.replaceChildren();
+  emptyRow(models, 5, body);
+  const tiers = $("#usage-tiers");
+  if (tiers) {
+    tiers.replaceChildren();
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = body;
+    tiers.appendChild(empty);
+  }
+  // renderUsageExtras 画的是 monitor 驱动的三节；顺带让 donut 走 paintDonut 的
+  // 空分支（渐变复位 + 图例"暂无数据"）。不要手动 replaceChildren：渐变写在
+  // style.background 上，清子节点对它无效。
+  renderUsageExtras();
+}
+const usageDonutPalette = [
+  "#153c34",
+  "#ed5a2a",
+  "#e7b94f",
+  "#204d43",
+  "#68716c",
+  "#8a9a93",
+  "#b6382f",
+  "#237056",
+];
+const sessionPalette = [
+  "#c2410c",
+  "#6d28d9",
+  "#1d4ed8",
+  "#0f766e",
+  "#a21caf",
+  "#92400e",
+  "#4d7c0f",
+  "#be123c",
+];
+// Local: Token 用量页 —— donut 通用绘制（模型/端点共用）。
+function paintDonut(donutId, legendId, rows) {
+  const donut = $(donutId),
+    legend = $(legendId);
+  if (!donut || !legend) return;
+  const total = rows.reduce((sum, row) => sum + (Number(row.value) || 0), 0);
+  if (!(total > 0)) {
+    donut.style.background = "var(--paper2)";
+    legend.replaceChildren();
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "暂无数据";
+    legend.appendChild(empty);
+    return;
+  }
+  let acc = 0;
+  const parts = rows.map((row, index) => {
+    const start = (acc / total) * 360;
+    acc += Number(row.value) || 0;
+    const end = (acc / total) * 360;
+    return `${usageDonutPalette[index % usageDonutPalette.length]} ${start.toFixed(1)}deg ${end.toFixed(1)}deg`;
+  });
+  donut.style.background = `conic-gradient(${parts.join(",")})`;
+  legend.replaceChildren();
+  rows.forEach((row, index) => {
+    const line = document.createElement("div"),
+      left = document.createElement("span"),
+      right = document.createElement("span");
+    left.innerHTML = `<i class="dot" style="background:${usageDonutPalette[index % usageDonutPalette.length]}"></i>`;
+    left.appendChild(document.createTextNode(row.label));
+    right.className = "mono";
+    right.textContent = `${((Number(row.value) / total) * 100).toFixed(1)}%`;
+    right.title = String(row.hint || row.value);
+    line.append(left, right);
+    legend.appendChild(line);
+  });
+}
+// Local: Token 用量页 —— donut/端点/通道/请求表聚合入口。
+function renderUsageExtras() {
+  try {
+    renderUsageDonuts();
+    renderUsageEndpoints();
+    renderUsageChannels();
+    renderUsageRequests();
+  } catch (error) {
+    if (window.console && console.warn) console.warn("renderUsageExtras failed", error);
+  }
+}
+// Local: Token 用量页 —— 请求表分页（ ellipsis 压缩）。
+function pagerList(c, P) {
+  const keep = new Set([1, P, c - 1, c, c + 1]);
+  const arr = [...keep].filter((p) => p >= 1 && p <= P).sort((a, b) => a - b);
+  const out = [];
+  let prev = 0;
+  for (const p of arr) {
+    if (p - prev > 1) out.push(0);
+    out.push(p);
+    prev = p;
+  }
+  return out;
+}
+function renderUsagePager(pages) {
+  const host = $("#usage-pager");
+  if (!host) return;
+  host.replaceChildren();
+  const mk = (label, page, disabled, on) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.disabled = !!disabled;
+    if (on) b.className = "on";
+    b.onclick = () => {
+      if (usageReqPage !== page) {
+        usageReqPage = page;
+        renderUsageRequests();
+      }
+    };
+    return b;
+  };
+  host.appendChild(mk("<", Math.max(1, usageReqPage - 1), usageReqPage <= 1));
+  pagerList(usageReqPage, pages).forEach((p) => {
+    if (p === 0) {
+      const s = document.createElement("span");
+      s.className = "ell";
+      s.textContent = "…";
+      host.appendChild(s);
+    } else host.appendChild(mk(String(p), p, false, p === usageReqPage));
+  });
+  host.appendChild(mk(">", Math.min(pages, usageReqPage + 1), usageReqPage >= pages));
+}
+function usageRangeTotal() {
+  return (usageData && usageData.total) || null;
+}
+// Local: Token 用量页 —— 会话取值（上游 JSON 键为 session）。
+function sessionIDOf(request) {
+  return (request && request.session) || "";
+}
+// Local: Token 用量页 —— 模型 donut（tokens/cost 双模式）。
+function renderUsageDonuts() {
+  const total = usageRangeTotal();
+  const toggleToken = $("#usage-metric-token"),
+    toggleCost = $("#usage-metric-cost");
+  if (toggleToken) toggleToken.classList.toggle("primary", usageMetricMode === "tokens");
+  if (toggleCost) toggleCost.classList.toggle("primary", usageMetricMode === "cost");
+  let rows = [];
+  if (total && total.models) {
+    const costs = total.model_costs || {};
+    const mode = usageMetricMode === "cost" && Object.keys(costs).length ? "cost" : "tokens";
+    rows = Object.entries(total.models).map(([model, value]) => ({
+      label: model,
+      value: mode === "cost" ? Number(costs[model]) || 0 : Number(value.total_tokens) || 0,
+    }));
+  }
+  // Local: 无 usageData 时不再回退到 monitorData.usage.last_hour —— 那口径是
+  // "最近 60 分钟"，和本页标题声明的粒度对不上，画出来的是误导而不是信息。
+  rows.sort((a, b) => b.value - a.value);
+  paintDonut("#usage-model-donut", "#usage-model-legend", rows.slice(0, 8));
+}
+// Local: Token 用量页 —— 端点分布表。
+function renderUsageEndpoints() {
+  const body = $("#usage-endpoints");
+  if (!body) return;
+  const total = usageRangeTotal();
+  body.replaceChildren();
+  let rows = [];
+  if (total && total.endpoints && Object.keys(total.endpoints).length) {
+    const tokens = total.endpoint_tokens || {},
+      costs = total.endpoint_costs || {};
+    rows = Object.entries(total.endpoints).map(([endpoint, count]) => ({
+      endpoint,
+      count,
+      tokens: tokens[endpoint] || null,
+      cost: costs[endpoint],
+    }));
+  } else if (monitorData && monitorData.metrics && monitorData.metrics.endpoints) {
+    rows = Object.entries(monitorData.metrics.endpoints)
+      .filter(
+        ([endpoint]) =>
+          endpoint === "/v1/chat/completions" || endpoint === "/v1/responses" || endpoint === "/v1/messages",
+      )
+      .map(([endpoint, count]) => ({ endpoint, count, tokens: null, cost: null }));
+  }
+  rows.sort((a, b) => b.count - a.count);
+  paintDonut(
+    "#usage-endpoint-donut",
+    "#usage-endpoint-legend",
+    rows.map((row) => ({ label: row.endpoint, value: row.count })),
+  );
+  rows.slice(0, 15).forEach((row) => {
+    const tr = document.createElement("tr");
+    appendCell(tr, row.endpoint);
+    appendCell(tr, Number(row.count || 0).toLocaleString());
+    if (row.tokens) {
+      appendCell(
+        tr,
+        formatTokensCompact(row.tokens.total_tokens),
+        "",
+        formatTokensExact(row.tokens.total_tokens) +
+          " · input " +
+          formatTokensExact(row.tokens.input_tokens) +
+          " · output " +
+          formatTokensExact(row.tokens.output_tokens) +
+          " · cached " +
+          formatTokensExact(row.tokens.cached_tokens),
+      );
+      appendCell(tr, row.cost == null ? "—" : formatUSD(row.cost), "cost");
+    } else {
+      appendCell(tr, "—");
+      appendCell(tr, "—", "cost");
+    }
+    body.appendChild(tr);
+  });
+  if (!rows.length) emptyRow(body, 4, "该范围内尚无端点用量");
+}
+// Local: Token 用量页 —— 通道/状态码摘要。
+function renderUsageChannels() {
+  const host = $("#usage-channels");
+  if (!host || !monitorData) return;
+  const upstream = monitorData.upstream || {},
+    window = upstream.last_hour || upstream.window || {},
+    statuses = (monitorData.metrics && monitorData.metrics.statuses) || {};
+  const channels = window.channels || {};
+  const lines = [];
+  Object.entries(channels)
+    .sort((a, b) => b[1].total - a[1].total)
+    .forEach(([channel, value]) => {
+      const rate = value.total ? ` · 成功率 ${((value.success / value.total) * 100).toFixed(1)}%` : "";
+      lines.push(`${channel}：${Number(value.total || 0).toLocaleString()} 次${rate}`);
+    });
+  const statusLine = Object.entries(statuses)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([status, count]) => `${status} ${Number(count || 0).toLocaleString()}`)
+    .join(" · ");
+  host.replaceChildren();
+  const pre = document.createElement("div");
+  pre.style.whiteSpace = "pre-wrap";
+  pre.textContent = (lines.length ? lines.join("\n") : "暂无通道数据") + (statusLine ? `\n状态码：${statusLine}` : "");
+  host.appendChild(pre);
+}
+// Local: Token 用量页 —— 请求表筛选（模型/tier/通道/状态+会话+时间窗）。
+// 数据源是 /api/usage 自带的明细（覆盖本次查询区间、最新在前），
+// 不再依赖 /api/monitor 的轮询：monitor 只带最近一小时。
+function usageFilteredRequests() {
+  const source = (usageData && usageData.requests) || [];
+  const model = $("#usage-f-model")?.value || "",
+    tier = $("#usage-f-tier")?.value || "",
+    channel = $("#usage-f-channel")?.value || "",
+    status = $("#usage-f-status")?.value || "",
+    query = ($("#usage-f-q")?.value || "").trim().toLowerCase(),
+    range = $("#usage-f-range")?.value || "24h",
+    cutoffMs = Date.now() - (range === "1h" ? 3600000 : range === "6h" ? 21600000 : 86400000);
+  return source
+    .filter((request) => {
+      const ts = Date.parse(request.time || "");
+      if (!Number.isNaN(ts) && ts < cutoffMs) return false;
+      if (model && request.model !== model) return false;
+      if (tier && (request.tier || "") !== tier) return false;
+      if (channel) {
+        if (channel === "anonymous") {
+          if (!request.anonymous && request.channel !== "anonymous") return false;
+        } else if (channel === "key") {
+          if (request.anonymous || request.channel === "anonymous" || request.channel === "not_routed")
+            return false;
+        } else if (request.channel !== channel) return false;
+      }
+      const ok = request.success || (request.status >= 200 && request.status < 400);
+      if (status === "ok" && !ok) return false;
+      if (status === "fail" && ok) return false;
+      if (
+        query &&
+        !(
+          (request.request_id || "").toLowerCase().includes(query) ||
+          sessionIDOf(request).toLowerCase().includes(query) ||
+          (request.model || "").toLowerCase().includes(query)
+        )
+      )
+        return false;
+      return true;
+    })
+    .slice(0, 500);
+}
+// Local: Token 用量页 —— 请求表明细（Token 格/耗时/会话着色/点击筛同对话）。
+function attemptsCell(request) {
+  const attempts = Number(request.attempts);
+  if (!Number.isFinite(attempts) || attempts < 0) return { text: "—", tone: "", title: "" };
+  return {
+    text: String(attempts),
+    tone: attempts > 1 ? "warn" : "",
+    title: "上游尝试次数（含匿名 lane 与 key 回退；>1 表示触发过重试/回退，含自愈）",
+  };
+}
+function renderUsageRequests() {
+  const body = $("#usage-requests");
+  if (!body) return;
+  const select = $("#usage-f-model");
+  if (select) {
+    const models = [
+      ...new Set(
+        ((usageData && usageData.requests) || []).map((request) => request.model).filter(Boolean),
+      ),
+    ].sort();
+    const sig = models.join(" ");
+    if (select.dataset.sig !== sig) {
+      select.dataset.sig = sig;
+      const current = select.value;
+      select.replaceChildren();
+      const all = document.createElement("option");
+      all.value = "";
+      all.textContent = "全部模型";
+      select.appendChild(all);
+      models.forEach((model) => {
+        const option = document.createElement("option");
+        option.value = model;
+        option.textContent = model;
+        select.appendChild(option);
+      });
+      if (current && models.includes(current)) select.value = current;
+    }
+  }
+  const rows = usageFilteredRequests();
+  const sessionColor = new Map();
+  let sessionNext = 0;
+  for (const item of rows) {
+    const key = sessionIDOf(item);
+    if (key && !sessionColor.has(key)) sessionColor.set(key, sessionNext++ % sessionPalette.length);
+  }
+  body.replaceChildren();
+  const total = rows.length,
+    pages = Math.max(1, Math.ceil(total / usageReqPageSize));
+  if (usageReqPage > pages) usageReqPage = pages;
+  const start = total === 0 ? 0 : (usageReqPage - 1) * usageReqPageSize + 1,
+    end = Math.min(total, usageReqPage * usageReqPageSize);
+  rows.slice((usageReqPage - 1) * usageReqPageSize, usageReqPage * usageReqPageSize).forEach((request) => {
+    const row = document.createElement("tr");
+    const rid = request.request_id || "";
+    const tokens = request.tokens || {};
+    const totalTokens = Number(tokens.total_tokens || 0);
+    const ok = request.success || (request.status >= 200 && request.status < 400);
+    appendCell(row, request.time ? new Date(request.time).toLocaleString() : "—");
+    appendCell(row, rid.length > 6 ? "…" + rid.slice(-6) : rid || "—", "", rid);
+    appendCell(row, request.model || "—");
+    appendCell(row, `${request.tier || "—"} / ${request.channel || "—"}`);
+    appendCell(row, request.key_id || "—");
+    const sid = sessionIDOf(request);
+    appendCell(row, sid.length > 6 ? "…" + sid.slice(-6) : sid || "—", sid ? "conv" : "", sid ? sid + "（点击筛选同对话）" : "");
+    if (sid) {
+      const convCell = row.lastChild;
+      convCell.style.cursor = "pointer";
+      const colorIndex = sessionColor.get(sid);
+      if (colorIndex != null) convCell.style.color = sessionPalette[colorIndex];
+      convCell.onclick = () => {
+        const q = $("#usage-f-q");
+        if (q) {
+          q.value = sid;
+          usageReqPage = 1;
+          renderUsageRequests();
+        }
+      };
+    }
+    appendTokenCell(row, tokens);
+    if (totalTokens > 0) {
+      appendCell(row, request.cost_usd == null ? "—" : formatUSD(request.cost_usd), "cost");
+    } else {
+      appendCell(row, request.cost_usd ? formatUSD(request.cost_usd) : "—", "cost");
+    }
+    appendCell(row, request.status || request.outcome || "—", ok ? "ok" : "bad");
+    const ac = attemptsCell(request);
+    appendCell(row, ac.text, ac.tone, ac.title);
+    appendCell(row, formatDurationMS(request.duration_ms));
+    body.appendChild(row);
+  });
+  if (!rows.length) emptyRow(body, 11, "暂无匹配的请求路由");
+  const rangeLabel = { "1h": "最近1小时", "6h": "最近6小时" }[$("#usage-f-range")?.value || "24h"] || "最近24小时";
+  const count = $("#usage-req-count");
+  if (count)
+    count.textContent = `显示 ${start} 至 ${end} 共 ${total} 条结果（${rangeLabel}内最新 500 条）`;
+  renderUsagePager(pages);
+}
+// Local: Token 用量页 —— 控件绑定。
+$$("[data-gran]").forEach(
+  (button) =>
+    (button.onclick = () => {
+      usageGranularity = button.dataset.gran;
+      usageOffset = 0;
+      fetchUsage();
+    }),
+);
+$("#usage-prev").onclick = () => {
+  usageOffset++;
+  fetchUsage();
+};
+$("#usage-next").onclick = () => {
+  if (usageOffset > 0) usageOffset--;
+  fetchUsage();
+};
+$("#usage-metric-token").onclick = () => {
+  usageMetricMode = "tokens";
+  renderUsageExtras();
+};
+$("#usage-metric-cost").onclick = () => {
+  usageMetricMode = "cost";
+  renderUsageExtras();
+};
+$("#usage-req-reset").onclick = () => {
+  $("#usage-f-model").value = "";
+  $("#usage-f-tier").value = "";
+  $("#usage-f-channel").value = "";
+  $("#usage-f-status").value = "";
+  $("#usage-f-q").value = "";
+  $("#usage-f-range").value = "24h";
+  usageReqPage = 1;
+  renderUsageRequests();
+};
+$("#usage-req-refresh").onclick = async () => {
+  await fetchUsage();
+};
+["usage-f-model", "usage-f-tier", "usage-f-channel", "usage-f-status", "usage-f-range"].forEach((id) => {
+  const node = document.getElementById(id);
+  if (node)
+    node.onchange = () => {
+      usageReqPage = 1;
+      renderUsageRequests();
+    };
+});
+$("#usage-f-q").oninput = () => {
+  usageReqPage = 1;
+  renderUsageRequests();
+};
+$("#usage-f-pagesize").onchange = (event) => {
+  usageReqPageSize = Math.max(1, Number(event.target.value) || 20);
+  usageReqPage = 1;
+  renderUsageRequests();
+};
 function renderFacts(selector, entries) {
   const host = $(selector);
   host.replaceChildren();
@@ -788,12 +1514,18 @@ async function refreshMonitor() {
     renderResources(monitorData.resources);
     renderBreakdowns(metrics);
     renderGuide();
-    renderUsage();
+    // Local: 用量页的范围/趋势/明细都由 /api/usage 驱动（按粒度取，最快 30s
+    // 一次）；只有停在这一页时才重画 donut 与请求表——每 3 秒无条件重建
+    // 几百行 DOM 与停在哪一页无关，配置中心页不该为此付代价。
+    if (location.hash === "#usage") {
+      renderUsageExtras();
+      if (Date.now() - lastUsageFetch > 30000) fetchUsage();
+    }
     renderDiagnostics();
   } catch (_) {}
 }
 $("#refresh-now").onclick = async () => {
-  await Promise.all([refreshMonitor(), loadConfig(), loadDebugModels()]);
+  await Promise.all([refreshMonitor(), loadConfig(), loadDebugModels(), fetchUsage()]);
   if (location.hash === "#model-quotas") await loadModelQuotas();
   if (location.hash === "#api-keys") await loadAPIKeys();
   toast("状态已刷新");

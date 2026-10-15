@@ -54,6 +54,7 @@ func (a *Server) Handler() http.Handler {
 	mux.Handle("POST /api/config/reveal", a.authenticate(a.csrf(http.HandlerFunc(a.handleReveal))))
 	mux.Handle("PUT /api/account", a.authenticate(a.csrf(http.HandlerFunc(a.handleAccount))))
 	mux.Handle("GET /api/monitor", a.authenticate(http.HandlerFunc(a.handleMonitor)))
+	mux.Handle("GET /api/usage", a.authenticate(http.HandlerFunc(a.handleUsage)))
 	mux.Handle("GET /api/debug/models", a.authenticate(http.HandlerFunc(a.handleDebugModels)))
 	mux.Handle("GET /api/models/availability", a.authenticate(http.HandlerFunc(a.handleAvailability)))
 	mux.Handle("POST /api/models/restore", a.authenticate(a.csrf(http.HandlerFunc(a.handleRestoreModel))))
@@ -251,6 +252,8 @@ func (a *Server) handleMonitor(w http.ResponseWriter, _ *http.Request) {
 		"version": buildinfo.Version, "metrics": metrics, "usage": metrics.Usage, "upstream": metrics.Upstream, "resources": a.manager.Resources(),
 	})
 }
+
+// Local: usage endpoint lives in usage.go; only the route hook stays here.
 
 func (a *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)

@@ -253,6 +253,29 @@
           </div>
         </section>
         <section id="page-usage" class="page hidden">
+          <div id="usage-history-warning" class="notice hidden">历史持久化已禁用</div>
+          <div class="section">
+            <div class="section-head">
+              <div>
+                <h2>时间范围</h2>
+                <div class="section-caption">
+                  北京时间自然对齐（整点 / 自然日 / 周一起 / 自然月）。成本为记录时按 models.dev
+                  价格估算（USD / 1M tokens），未知模型记 $0。端点分布与请求明细见下方。
+                </div>
+              </div>
+              <div class="toolbar">
+                <button data-gran="hour" class="ghost">小时</button>
+                <button data-gran="day" class="ghost">天</button>
+                <button data-gran="week" class="ghost">周</button>
+                <button data-gran="month" class="ghost">月</button>
+              </div>
+            </div>
+            <div class="toolbar">
+              <button id="usage-prev" class="ghost">← 上一页</button>
+              <span id="usage-range-label" class="tiny mono">—</span>
+              <button id="usage-next" class="ghost">下一页 →</button>
+            </div>
+          </div>
           <div class="metric-grid">
             <div class="metric-card">
               <div class="label">Usage coverage</div>
@@ -262,7 +285,17 @@
             <div class="metric-card">
               <div class="label">Total tokens</div>
               <div id="u-total" class="metric">—</div>
-              <div class="metric-note">最近 60 分钟</div>
+              <div class="metric-note" id="u-total-note">当前范围</div>
+            </div>
+            <div class="metric-card">
+              <div class="label">Est. cost</div>
+              <div id="u-cost" class="metric">—</div>
+              <div class="metric-note">USD · 记录时价格估算</div>
+            </div>
+            <div class="metric-card">
+              <div class="label">Requests</div>
+              <div id="u-requests" class="metric">—</div>
+              <div class="metric-note">当前范围推理请求</div>
             </div>
             <div class="metric-card">
               <div class="label">Cached tokens</div>
@@ -274,12 +307,19 @@
               <div id="u-reasoning" class="metric">—</div>
               <div class="metric-note">上游回报的推理用量</div>
             </div>
+            <div class="metric-card">
+              <div class="label">Cache hit rate</div>
+              <div id="u-hitrate" class="metric">—</div>
+              <div class="metric-note">cached / input · 缓存命中率</div>
+            </div>
           </div>
           <div class="section">
             <div class="section-head">
               <div>
-                <h2>每分钟 Token 趋势</h2>
-                <div class="section-caption">最近 60 分钟；悬停查看输入、输出与总量。</div>
+                <h2 id="usage-trend-title">Token 趋势</h2>
+                <div class="section-caption" id="usage-trend-caption">
+                  柱顶数字为总量，下方时间轴对应各柱时间；悬停查看输入、输出、缓存、命中率与预估成本。
+                </div>
               </div>
             </div>
             <div id="usage-trend" class="trend-chart"></div>
@@ -288,11 +328,19 @@
             <div class="section">
               <div class="section-head">
                 <div>
-                  <h2>模型排行</h2>
-                  <div class="section-caption">按 total_tokens 排序。</div>
+                  <h2>模型分布</h2>
+                  <div class="section-caption">按 total_tokens 排序。 donut 口径可在 Token / 成本间切换。</div>
+                </div>
+                <div class="toolbar">
+                  <button id="usage-metric-token" class="ghost">按 Token</button>
+                  <button id="usage-metric-cost" class="ghost">按成本</button>
                 </div>
               </div>
-              <div class="table-wrap">
+              <div class="donut-row">
+                <div id="usage-model-donut" class="donut"></div>
+                <div id="usage-model-legend" class="donut-legend"></div>
+              </div>
+              <div class="table-wrap usage-table">
                 <table class="table">
                   <thead>
                     <tr>
@@ -300,6 +348,7 @@
                       <th>输入</th>
                       <th>输出</th>
                       <th>总量</th>
+                      <th>预估成本</th>
                     </tr>
                   </thead>
                   <tbody id="usage-models"></tbody>
@@ -309,11 +358,139 @@
             <div class="section">
               <div class="section-head">
                 <div>
+                  <h2>端点分布</h2>
+                  <div class="section-caption">
+                    所选范围内的入站端点请求 / Token / 预估成本；范围无数据时回退为最近一小时计数。
+                  </div>
+                </div>
+              </div>
+              <div class="donut-row">
+                <div id="usage-endpoint-donut" class="donut"></div>
+                <div id="usage-endpoint-legend" class="donut-legend"></div>
+              </div>
+              <div class="table-wrap usage-table">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>端点</th>
+                      <th>请求</th>
+                      <th>Token</th>
+                      <th>预估成本</th>
+                    </tr>
+                  </thead>
+                  <tbody id="usage-endpoints"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          <div class="split">
+            <div class="section">
+              <div class="section-head">
+                <div>
                   <h2>Tier 分布</h2>
-                  <div class="section-caption">Zen / Go 的 Token 去向。</div>
+                  <div class="section-caption">Zen / Go 的 Token 与成本去向（成本按模型价格归集）。</div>
                 </div>
               </div>
               <div id="usage-tiers"></div>
+            </div>
+            <div class="section">
+              <div class="section-head">
+                <div>
+                  <h2>通道与状态</h2>
+                  <div class="section-caption">最近一小时 anonymous / key 通道成功率与状态码。</div>
+                </div>
+              </div>
+              <div id="usage-channels" class="tiny"></div>
+            </div>
+          </div>
+          <div class="section">
+            <div class="section-head">
+              <div>
+                <h2>请求明细</h2>
+                <div class="section-caption">
+                  所选时间范围内实际路由的推理请求，仅展示最新 500 条。同一对话共享同一对话ID与颜色，点击可筛选；颜色仅为当前列表内辅助提示、以ID为准，对话ID取自客户端会话标识、必要时确定性重编码，仅用于同对话关联；Token
+                  与费用为上游回报口径、记录时价格估算；尝试为上游尝试次数（含匿名 lane 与 key 回退，>1 表示触发过重试/回退，含自愈）；仅显示
+                  Key 尾码，不记录客户端密钥与 IP。
+                </div>
+              </div>
+              <div class="toolbar">
+                <button id="usage-req-refresh" class="ghost">刷新</button>
+                <button id="usage-req-reset" class="ghost">重置</button>
+              </div>
+            </div>
+            <div class="usage-filters">
+              <div class="field">
+                <label>模型</label><select id="usage-f-model"><option value="">全部模型</option></select>
+              </div>
+              <div class="field">
+                <label>Tier</label
+                ><select id="usage-f-tier">
+                  <option value="">全部 Tier</option>
+                  <option value="zen">zen</option>
+                  <option value="go">go</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>通道</label
+                ><select id="usage-f-channel">
+                  <option value="">全部通道</option>
+                  <option value="anonymous">anonymous</option>
+                  <option value="key">key</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>状态</label
+                ><select id="usage-f-status">
+                  <option value="">全部状态</option>
+                  <option value="ok">成功 2xx–3xx</option>
+                  <option value="fail">失败 4xx–5xx</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>时间范围</label
+                ><select id="usage-f-range">
+                  <option value="1h">最近1小时</option>
+                  <option value="6h">最近6小时</option>
+                  <option value="24h" selected>最近24小时</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>搜索 Request ID / 对话ID / 模型</label
+                ><input id="usage-f-q" placeholder="msg_ / ses_ / gpt-" />
+              </div>
+            </div>
+            <div class="table-wrap usage-table">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>Request ID</th>
+                    <th>模型</th>
+                    <th>Tier / 通道</th>
+                    <th>Key 尾码</th>
+                    <th>对话ID</th>
+                    <th>Token</th>
+                    <th>费用</th>
+                    <th>状态</th>
+                    <th>尝试</th>
+                    <th>耗时</th>
+                  </tr>
+                </thead>
+                <tbody id="usage-requests"></tbody>
+              </table>
+            </div>
+            <div class="req-foot">
+              <span id="usage-req-count" class="tiny">—</span
+              ><span class="pager-right"
+                ><span class="tiny">每页：</span
+                ><select id="usage-f-pagesize">
+                  <option value="10">10</option>
+                  <option value="20" selected>20</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+                <span id="usage-pager" class="pager"></span
+              ></span>
             </div>
           </div>
         </section>

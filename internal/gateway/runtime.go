@@ -74,6 +74,40 @@ func NewRuntimeManager(root context.Context, configPath string, cfg config.Confi
 		}
 		return clients
 	})
+	// Historical token costs are captured at record time with the current
+	// models.dev price (USD per 1M tokens); unknown models record zero cost
+	// and flag the bucket (see usageCostLocked). Partially-known models
+	// price their known sides (a missing cache-read rate falls back to the
+	// base input rate) instead of rounding the whole request to $0.
+	monitor.SetPriceFunc(func(model string) (telemetry.ModelPrice, bool) {
+		price, ok := manager.metadata.Price(model)
+		if !ok {
+			return telemetry.ModelPrice{}, false
+		}
+		result := telemetry.ModelPrice{}
+		if price.Input != nil {
+			result.Input = *price.Input
+		}
+		if price.Output != nil {
+			result.Output = *price.Output
+		}
+		if price.CacheRead != nil {
+			result.CacheRead = *price.CacheRead
+		} else {
+			result.CacheRead = result.Input
+		}
+		return result, true
+	})
+	usagePath := telemetry.UsageHistoryPath(configPath)
+	// A recovered .replace is not a failure: the history is intact, so it is
+	// logged on its own line to explain why the backup is gone.
+	if recovered, err := monitor.LoadUsageHistory(usagePath); err != nil {
+		if logger != nil {
+			logger.Warn("usage history ignored", "component", "usage", "event", "usage_history_load_failed", "path", usagePath, "error", err)
+		}
+	} else if recovered && logger != nil {
+		logger.Warn("usage history restored from interrupted replace", "component", "usage", "event", "usage_history_replace_recovered", "path", usagePath, "backup", usagePath+".replace")
+	}
 	if cfg.WebUI.Password != "" {
 		hash, err := config.HashPassword(cfg.WebUI.Password)
 		if err != nil {

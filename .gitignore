@@ -23,8 +23,12 @@ coverage.out
 
 # Local-only artifacts (see AGENTS.md): rebuilt binary and its editor backups,
 # the local usage history snapshot, the Clash watchdog's read-only config, and
-# MCP browser scratch dirs.
+# MCP browser scratch dirs. The usage-history patterns are wildcards on
+# purpose: SaveUsageHistory also leaves <config>.usage.history.json.replace,
+# .usage.history.json.corrupt.<unixnano>/.oversized.<unixnano> keeps, and
+# .usage-history-*.tmp scratch files, and the config name is operator-chosen.
 opencode2api.exe*
-config.json.usage.history.json
+*.usage.history.json*
+.usage-history-*.tmp
 watchdog.json
 .playwright-mcp/
