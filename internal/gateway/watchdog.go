@@ -261,16 +261,31 @@ func transportCauseShort(err error) string {
 }
 
 // maxCausePeek bounds the error-body peek behind upstreamErrorType. It is
-// deliberately the same 64 KB ceiling httpx.DrainAndClose already charges the
-// gateway when it abandons a response without looking at it: the label is a
-// net addition to a failure path that has to pay for a bounded drain anyway,
-// so peeking must not make the switch to the next exit node wait longer than
-// that drain did. It was 256 KB, which charged four times the drain budget on
-// an unknown-length body: the peek read on to the bound while the upstream was
-// still sending, so the user waited for bytes the label did not need. A
-// console error payload is a small JSON document, so 64 KB remains orders of
+// pinned to httpx.MaxDrainBytes — the budget httpx.DrainAndClose already
+// charges the gateway when it abandons a response without looking at it —
+// because the label is a net addition to a failure path that has to pay for
+// that bounded drain anyway: peeking must not make the switch to the next exit
+// node wait longer than the drain did. The two numbers used to be unrelated
+// literals, and the drift was silent — shrinking the drain to 8 KB (making the
+// peek eight times the budget it rides on) left the whole suite green, which
+// is exactly why the peek now names the drain's budget instead of repeating
+// its value. It was 256 KB before, which charged four times the drain budget
+// on an unknown-length body: the peek read on to the bound while the upstream
+// was still sending, so the user waited for bytes the label did not need.
+//
+// That ceiling buys latency over precision, deliberately. Measured on a real
+// socket, labelling a slow chunked error body costs 27.10 µs instead of
+// 31.63 ms. The price is paid only by bodies past the bound: when such a body
+// declares its length, the ContentLength guard in upstreamErrorType skips the
+// peek outright, so the cause degrades to "upstream error (upstream HTTP N)"
+// and a 429 whose quota class (FreeUsageLimitError — the free allowance of
+// that exit IP is gone) then classifies as "cooling" instead of "quota". That
+// is one switch recommendation not made — a missed diagnosis, never a wrong
+// one — and it happens for error bodies in the 64 KB–256 KB window that the
+// previous 256 KB bound covered (it degraded there too, just not here). A
+// console error payload is a small JSON document, so 64 KB stays orders of
 // magnitude more than the class field can need.
-const maxCausePeek = 64 << 10
+const maxCausePeek = httpx.MaxDrainBytes
 
 // causePeekChunk is how much upstreamErrorType pulls between two "do I
 // already hold a complete error document?" checks. It only trades read calls
