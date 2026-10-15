@@ -681,25 +681,41 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 }
 
 // anonymousCoreTools are the tool names the anonymous free tier expects on
-// an agent-shaped request. Requests without a shell tool and a read tool are
-// rejected with 403 FreeTierError.
+// an agent-shaped request.
 //
-// "shell" is the name OpenCode 2.x ships; the pre-2.x "bash" spelling is
-// deliberately not injected because the free tier validates the definition of
-// every tool it recognises, and a "bash" definition the gateway synthesises
-// does not match the one upstream expects. Since 2026-10-14 name presence is
-// not enough either: the upstream compares each recognised tool's description
-// and parameter schema against the official CLI's definitions byte-for-byte
-// (minimal stand-ins 403), which is why the genuine definitions below are
-// embedded. Tool order is irrelevant and extra client tools are allowed.
+// Measured 2026-10-15 against /inference, one variable at a time, 6s apart:
+// a request is rejected with 403 FreeTierError unless "tools" is present,
+// non-empty, and at least one entry carries a genuine OpenCode definition.
+// One genuine tool is enough (a lone genuine read passes); stub definitions,
+// unknown names, and an empty array all fail; and a recognised name carrying a
+// client schema, or a genuine definition with a mutated description, passes as
+// long as some other tool stays genuine. tool_choice is not part of the gate:
+// none/auto/required/named all pass. The 403 is therefore a body-shape verdict,
+// while 429 ("Rate limit exceeded") is the separate quota signal — do not read
+// the 403 as "this exit IP is blocked".
+//
+// That is why the genuine definitions are embedded and why a client schema on a
+// core name is replaced. It is not measured that "bash" — the pre-2.x spelling —
+// is simply a name the tier does not recognise; the only evidence is that
+// requests carrying it instead of "shell" were rejected, which is equally
+// consistent with the gate wanting a recognised name present at all. Tool order
+// is irrelevant and extra client tools are allowed.
 var anonymousCoreTools = []string{"shell", "edit", "glob", "grep", "read"}
 
 // opencodeToolsJSON holds the genuine OpenCode tool definitions (description
-// and JSON schema) captured from the official client. The free tier checks the
-// definition of every tool whose name it recognises, so a synthesised stub —
-// even one carrying the right name — is rejected with 403 FreeTierError. The
-// gateway therefore ships the real definitions and uses them both for the tools
-// it injects and for any same-named tool the downstream client declared.
+// and JSON schema) captured from the official client. At least one of them has
+// to reach the free tier intact: a request whose tools are all stubs — even
+// under the right names — is rejected with 403 FreeTierError. The gateway ships
+// the real definitions and uses them for the tools it injects and for any core
+// tool the downstream client declared under the same name; recognised names
+// outside the core set keep the client's own schema.
+//
+// The descriptions are the Windows variants the official client emits on this
+// platform (the CLI builds them as `Commands run on ${OS} using ${shell}.`),
+// and they pass as-is. A gateway running on Linux or macOS still substitutes
+// them for a client-declared core tool, so a Linux client's own "shell"
+// description is replaced by the Windows one; that is the price of the gate,
+// and the placeholder note warns the model off those tools.
 //
 //go:embed opencode_tools.json
 var opencodeToolsJSON []byte
@@ -782,20 +798,32 @@ func ensureAnonymousChatUsage(payload map[string]any, protocol wire.Protocol) bo
 	return true
 }
 
-// ensureAnonymousTools makes the tool list read as an agent session: every
-// recognised OpenCode tool carries its genuine definition, and the missing
-// core tools are appended. It reports whether the payload changed. Tools whose
-// names upstream does not recognise are left exactly as the client declared
-// them, so downstream function calling keeps working.
+// ensureAnonymousTools makes the tool list read as an agent session: the core
+// tools carry their genuine definitions and the missing ones are appended. It
+// reports whether the payload changed. Two rules keep that from damaging the
+// client's own function calling:
+//
+//   - A core tool the client declared under the same name is replaced with the
+//     genuine definition. Measured 2026-10-15: a request whose only recognised
+//     tool carries a client schema is rejected, so a client that declares
+//     "read" alone would otherwise cost the request its 403.
+//   - A recognised name outside the core set (write, execute, webfetch, ...)
+//     is left exactly as declared. The free tier accepts those next to a
+//     genuine definition, and rewriting them would silently hand the model a
+//     schema the client does not implement.
+//
+// A missing, null or non-list "tools" is filled with the core set rather than
+// forwarded: the gate rejects the request either way, so there is nothing to
+// preserve.
+//
+// Whenever definitions are appended, a system-level note marks them as
+// placeholders so the model does not emit calls the client cannot execute.
 func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
-	raw, exists := payload["tools"]
-	if !exists {
-		payload["tools"] = anonymousToolset(protocol, nil)
-		return true
-	}
-	items, ok := raw.([]any)
+	items, ok := payload["tools"].([]any)
 	if !ok {
-		return false
+		payload["tools"] = anonymousToolset(protocol, nil)
+		noteInjectedTools(payload, protocol)
+		return true
 	}
 	changed := false
 	present := make(map[string]bool, len(items))
@@ -805,29 +833,158 @@ func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
 			continue
 		}
 		present[name] = true
-		// A declared definition for a recognised tool name is replaced with the
-		// genuine one: the free tier rejects a stub, and a client that happens to
-		// use the same name with its own schema would otherwise fail the request.
-		if _, known := knownOpencodeTool(name); known {
+		if isAnonymousCoreTool(name) {
 			items[index] = anonymousTool(protocol, name)
 			changed = true
 		}
 	}
-	missing := make([]string, 0, len(anonymousCoreTools))
+	missing := false
 	for _, name := range anonymousCoreTools {
 		if !present[name] {
-			missing = append(missing, name)
+			missing = true
+			break
 		}
 	}
-	if len(missing) > 0 {
-		items = append(items, anonymousToolset(protocol, missing)...)
-		changed = true
+	if missing {
+		items = append(items, anonymousToolset(protocol, missingCoreTools(present))...)
+		payload["tools"] = items
+		noteInjectedTools(payload, protocol)
+		return true
 	}
 	if !changed {
 		return false
 	}
 	payload["tools"] = items
 	return true
+}
+
+func isAnonymousCoreTool(name string) bool {
+	for _, core := range anonymousCoreTools {
+		if core == name {
+			return true
+		}
+	}
+	return false
+}
+
+func missingCoreTools(present map[string]bool) []string {
+	missing := make([]string, 0, len(anonymousCoreTools))
+	for _, name := range anonymousCoreTools {
+		if !present[name] {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
+// injectedToolNote explains the gateway-provided tools to the model. Measured
+// 2026-10-15: before this note a client that declared no tools still received
+// tool_calls for read (finish_reason=tool_calls, 1 of 1 request); with it a
+// neutral question produced none. A prompt that explicitly tells the model to
+// use a tool still gets one — that is the client asking, not a ghost call.
+//
+// The note names the whole core set rather than only what this request
+// appended: a client whose tool declaration varies between turns would
+// otherwise change the system prompt every turn and invalidate the upstream
+// prompt-cache prefix.
+//
+// It is a system-level message rather than extra text inside a tool
+// description on purpose: the free tier compares the definitions it
+// recognises, so the genuine descriptions must stay byte-identical. Measured
+// the same day: a client schema on a recognised name is accepted as long as
+// some tool keeps a genuine definition, so a system-only change costs no 403.
+func injectedToolNote() string {
+	return "[gateway] This API gateway provides the tools named " + strings.Join(anonymousCoreTools, ", ") +
+		" because the upstream endpoint requires them; they may differ from what the client expects. " +
+		"Treat them as placeholders: the client may not be able to execute calls to them. " +
+		"Prefer the tools the user gave you; if those are the only tools you have, " +
+		"answer directly instead of calling a placeholder."
+}
+
+// noteInjectedTools merges the note into the payload's system slot, falling
+// back to a fresh slot when the existing one is not plain text. A slot whose
+// value is null counts as empty; one holding some other unusable value is left
+// alone, and the request goes out without a note rather than losing client data.
+func noteInjectedTools(payload map[string]any, protocol wire.Protocol) {
+	note := injectedToolNote()
+	switch protocol {
+	case wire.Anthropic:
+		noteAnthropicSystem(payload, note)
+	case wire.Responses:
+		noteResponsesSystem(payload, note)
+	default:
+		noteChatSystem(payload, note)
+	}
+}
+
+func noteChatSystem(payload map[string]any, note string) {
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, item := range messages {
+		entry, ok := item.(map[string]any)
+		if !ok || !isSystemRole(jsonutil.StringAt(entry, "role")) {
+			continue
+		}
+		if text, ok := entry["content"].(string); ok {
+			if text == "" {
+				entry["content"] = note
+			} else {
+				entry["content"] = text + "\n\n" + note
+			}
+			return
+		}
+	}
+	payload["messages"] = append([]any{map[string]any{"role": "system", "content": note}}, messages...)
+}
+
+func noteAnthropicSystem(payload map[string]any, note string) {
+	switch existing := payload["system"].(type) {
+	case nil:
+		payload["system"] = note
+	case string:
+		if existing != "" {
+			existing += "\n\n"
+		}
+		payload["system"] = existing + note
+	case []any:
+		payload["system"] = append(existing, map[string]any{"type": "text", "text": note})
+	}
+}
+
+func noteResponsesSystem(payload map[string]any, note string) {
+	if existing, ok := payload["instructions"]; ok && existing == nil {
+		payload["instructions"] = note
+		return
+	}
+	if text, ok := payload["instructions"].(string); ok {
+		if text == "" {
+			payload["instructions"] = note
+		} else {
+			payload["instructions"] = text + "\n\n" + note
+		}
+		return
+	}
+	if input, ok := payload["input"].([]any); ok {
+		for _, item := range input {
+			entry, ok := item.(map[string]any)
+			if !ok || !isSystemRole(jsonutil.StringAt(entry, "role")) {
+				continue
+			}
+			if text, ok := entry["content"].(string); ok && text != "" {
+				entry["content"] = text + "\n\n" + note
+				return
+			}
+		}
+	}
+	if _, exists := payload["instructions"]; !exists {
+		payload["instructions"] = note
+	}
+}
+
+func isSystemRole(role string) bool {
+	return role == "system" || role == "developer"
 }
 
 func anonymousToolName(protocol wire.Protocol, item any) string {

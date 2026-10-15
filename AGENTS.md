@@ -39,6 +39,15 @@
   - **不发 `x-opencode-request`**（上游对这个遗留头直接 403）
   - 工具用 `internal/gateway/opencode_tools.json` 里的**真实定义**（v2 名字：`shell`/`edit`/`glob`/`grep`/`read`…，社区那套 `bash`/`task`/`todowrite` 是 v1 旧名），`stream:true`，非流式客户端由网关把 SSE 聚合回 JSON
   - 上游对**所有 tier** 都看客户端身份（头 + 版本），工具注入则是**免费模型**在匿名与带 key 两条 lane 上都要加（`shapeKeyBody`）；别为了省体积把它改成空壳声明
+- **免费层的「门」到底看什么（2026-10-15 逐变量实测，别再凭 PR 结论改）**：在 `/inference` 上，直到目前观察到的全部 403 `FreeTierError`（文案 "can only be used from within OpenCode"）都符合同一条——`tools` 必须在、必须非空、且**至少一个条目带逐字忠实的官方定义**。单个真 `read` 就够（200）；全 stub、只有未知名、空数组一律 403；而**已识别名字带客户端 schema、或真定义被改过描述/参数，只要另有任一真定义在场就照样放行**（200）。由此三条：
+  - `tool_choice` **不参与判定**：`none`/`auto`/`required`/命名对象在有工具时全 200（经网关在 Chat/Responses/Messages 三条协议上端到端各 200）。社区 #4842「`tool_choice:"none"` 触发 403」的结论在当前端点**不成立，别加删 `tool_choice` 的补丁**。
+  - **403 是 body 形状判决，429 `"Rate limit exceeded"` 才是额度信号**（第三个信号，此前只见过前两个）。所以别把 403 读成「这个出口 IP 被封」，也别照 #4842 把它改成不重试不冷却——真要区分就在 watchdog 侧按 body 分类（已如此，`fingerprint` verdict）。
+  - 端点再确认：`/zen/v1` + `Bearer public` = 403，`/inference` + `public` = 200。免费层只在 `/inference`；**key 通道走 `/zen/v1` 是否仍通尚未验证**（本机 0 个 key，加 key 后必须先测这一条，否则「匿名失败后回退 key」整条是黑的）。
+- **测形状必须留间隔**：同一份 body 连发 14 次（8 次隔 10s + 6 次连发）全 200，说明 403 不是随机噪声；但**连发不带间隔**时结果会被额度污染成一片 403（本轮就踩过：一批探针结果因此作废重测）。逐变量探测一律**间隔 ≥6s**，否则结论不可信。
+- **工具整形（`ensureAnonymousTools`）三条规则**，改之前先读代码注释：
+  - 追加的 5 个核心定义是门的要求，不是可选项；客户端声明了同名**核心**工具（`shell/edit/glob/grep/read`）时替换成真定义——否则「客户端只声明了 `read`」这类请求会直接 403。
+  - 已识别但**非核心**的名字（`write/execute/webfetch/websearch/question/skill/subagent`）**原样透传**：实测与真定义共存不 403，透传才不会让模型按 OpenCode 的参数名发起调用、而客户端按自己的 schema 处理。真修要靠别名 + 响应侧还原（覆盖流式与历史改名，改动面大），别顺手做。
+  - 只在**确实追加了**工具时，往 **system 槽**（Chat `messages` / Responses `instructions` / Anthropic `system`）写一条占位说明。实测收益：中性提问的幽灵 `tool_calls` 从 1 次观测有变成 0 次观测有；**用户明确要求「用你的工具读 X」时模型仍会调**——那是听用户指令，不算幽灵，别为了消灭它去撤掉注入。说明放 system 而不是塞进工具描述，是因为门要比对已识别工具的定义，真描述一个字节都不能动（实测：只有 system 槽改动零风险）。说明里**点名固定的 5 个核心工具名、不随本次追加了哪几个而变**——否则客户端工具声明每轮一变，系统提示就每轮变一次，上游 prompt-cache 前缀被打散。
 - 会话 ID：`identity.CanonicalSessionID` 对非规范信号做确定性重编码（`descendingTimePart`：hash 的 36 位移入高 36 位、`| counter=1`、整体取反 → 12 位 hex 尾部 `ffe`）。实测门只接受 counter 1–63（低 12 位 `0xFC0–0xFFF`），**别改回摘要直出、也别改计数器窗口**；已有规范形状的原样透传以保住上游 prompt-cache 亲和。
 - 冷却：按 proxy 指数退避（`1x/2x/4x/8x` 封顶），上游 `Retry-After` 被 `maxAnonymousRetryAfterMultiplier=8` 夹住（匿名 lane 没有「最早到期节点」兜底，挂几个小时会把出口跳过后不再回来）；key 通道仍全量尊重 `Retry-After`。代理恢复时 `RestoreProxy` 会清匿名节点的冷却残留**与看门狗的失败原因记忆**（`coolCause`/`lastCause`/`causeExpires`）——因为只有 transport 类原因能在陈旧票里投票，而健康检查通过恰恰是传输层恢复的证据；非传输类（配额）本来就投不了票，所以清掉不会掩盖额度问题。`lastSuccess`/`lastFailure` 不清，脚本仍要看到一次真实成功才认恢复。
 - 看门狗取因子的**预读预算 = 排空预算**：`watchdog.maxCausePeek` 引用 `httpx.MaxDrainBytes`（`DrainAndClose` 放弃一个响应本来就要付的排空成本），所以取因子绝不让"换下一个出口节点"比原本那次排空更久；预读按 4 KB 分块、拿到完整错误文档就早停（真实 socket 实测：慢发 chunked 错误体从 31.63 ms 降到 27.10 µs）。**这是"延迟优先于精度"的显式取舍**：错误体一旦超过该上限且**长度已知**，预读被整段跳过 → cause 退化成 `upstream error (upstream HTTP N)` → 429（免费额度烧尽）会判成 `cooling` 而不是 `quota`，即**少**建议一次换节点（漏报，不是错报）。退化窗口是 64 KB–256 KB，改动前 256 KB 上限时同样会退化、只是不在这个窗口。真实 opencode/Zen 的错误体是 ~100 字节的小 JSON，概率极低。
