@@ -1,8 +1,8 @@
 # AGENTS.md
 
 > 本地运维契约（上游仓库没有 AGENTS.md，本文件由 `local` 分支维护）。
-> 2026-10-15 起基线 = 上游 `main`（含其自带的免费层修复），本地只保留字体、启动脚本与本文件；
-> 三件本地特性（看门狗决策通道 / 使用记录页 / staleMemo 中毒治理）暂停在 `local-pre-upstream-20261015`，移植状态见末节。
+> 2026-10-15 起基线 = 上游 `main`（含其自带的免费层修复），本地保留字体、启动脚本与本文件，
+> 外加三件按基线重新接过的本地特性（使用记录页 / staleMemo 中毒治理 / 看门狗决策通道，见末节）。
 
 多包 Go 网关：把 OpenCode Zen / Zen Go 转为 OpenAI（Chat / Responses / Models）与 Anthropic Messages 协议。后端在 `cmd/opencode2api`（入口）与 `internal/*` 包（`gateway` 路由/转发/冷却、`protocol` 转换、`models` 目录与价格、`admin` 管理 API、`telemetry` 内存指标、`config` 配置、`identity` 请求身份、`httpx`/`jsonutil`/`buildinfo` 基础件），前端为 `webui/index.html` + `webui/app.js` + `webui/styles.css`（经 `webui/embed.go` 中 `//go:embed` 打包，改完必须重新构建）。改完 WebUI 先跑 `node --check webui/app.js`，通过再构建。
 
@@ -10,7 +10,7 @@
 
 - 需 Go 1.24+：`go build -o opencode2api.exe ./cmd/opencode2api`（`start.bat`/`start.ps1` 认这个文件名）。
 - 校验：`go vet ./...`；CI（`v*` tag / 手动触发）跑 `go test ./...`。
-- **上游 `main` 当前没有任何 `_test.go`**（2026-10-15 核实）：`go test ./...` 通过不代表行为被锁定，改网关语义时要自己补最小内存用例，别因为「测试绿了」就以为安全。
+- **上游 `main` 本身零 `_test.go`**（2026-10-15 核实）；本地已补测试集中在 `internal/admin`、`internal/gateway`、`internal/telemetry` 三处，覆盖使用记录页、staleMemo 预剥离、看门狗决策。`go test ./...` 通过不代表行为被全锁定——尤其是网关热路径，改语义时仍要自己补最小内存用例，并确认新用例**能证伪**（改坏→红→恢复→绿）。
 - 上游已删掉 npm/Prettier 工具链（无 `package.json`），WebUI 只能靠 `node --check webui/app.js` 做语法检查。
 - 跨平台 / 镜像构建以 `.github/workflows/release.yml` 与 `Dockerfile` 为准：`CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$TAG"`（入口包保留 `var version` 作注入点）；不要改构建 flag。
 - 无 lint / formatter 配置，不要整仓 `gofmt -w`；换行跟随 `.gitattributes`（`text=auto eol=lf`）。
@@ -51,19 +51,20 @@
 
 ## 改代码时
 
-- 包布局（上游现状）：`internal/gateway`（`gateway.go` 路由入口、`upstream.go` 转发/重试/agent 形状、`pool.go` key 与匿名冷却、`probe.go` 免费模型探测、`health.go` 健康与模型列表、`refresh.go` 目录刷新、`rotation.go`、`runtime.go` 热重载、`availability.go`、`first_event.go`、`opencode_tools.json`）、`internal/protocol`（转换与流）、`internal/models`（目录与价格）、`internal/admin`（管理 API：除登录外均需 session，POST/PUT 另需 CSRF；诊断请求经 `WithDiagnosticRequest` 隔离，永不写生产池状态）、`internal/telemetry`（纯内存指标，重启清空）、`internal/identity/request.go`（会话与请求身份）。改动前先读对应文件的现有注释。
+- 包布局（上游现状）：`internal/gateway`（`gateway.go` 路由入口、`upstream.go` 转发/重试/agent 形状、`pool.go` key 与匿名冷却（含看门狗 cause/年龄记忆）、`probe.go` 免费模型探测、`health.go` 健康与模型列表、`refresh.go` 目录刷新、`rotation.go`、`runtime.go` 热重载、`availability.go`、`first_event.go`、`opencode_tools.json`；本地加的：`stale_memo.go` 预剥离记忆、`watchdog.go` 只读决策端点与 verdict 分类）、`internal/protocol`（转换与流）、`internal/models`（目录与价格）、`internal/admin`（管理 API：除登录外均需 session，POST/PUT 另需 CSRF；`usage.go` 是 `/api/usage`；诊断请求经 `WithDiagnosticRequest` 隔离，永不写生产池状态）、`internal/telemetry`（指标本身纯内存，但使用记录页的小时桶与请求明细会落盘到 `*.usage.history.json`，重启读回；其余指标重启清空；`usage_history.go`/`usage_range.go`/`usage_cost.go` 是使用记录页的存储与聚合）、`internal/identity/request.go`（会话与请求身份）。改动前先读对应文件的现有注释。
 - 动管理 API 时同步检查 session/CSRF/限速与敏感字段脱敏；动模型路由用 `GET /api/debug/models` 与 `POST /api/debug/inference`（强制非流式）验证；动免费层先看本文「免费层身份形状」。
 - WebUI 字体在 `webui/styles.css`：正文 `body font` 与等宽主组（`.mono,code,pre,.eyebrow,.nav-no,.metric,.table th,.log`）首选 JetBrains Mono，中文靠 `Microsoft YaHei` 等系统回退，无外部字体依赖。改完 `node --check webui/app.js` 再 `go build`。
 
 ## 本地维护（上游 clone，不推回）
 
 - 本仓库是上游项目的本地 clone，修改只在 `local` 分支维护，`main` 永远干净跟随 `origin/main`，禁止 push。
-- 提交范围：源码（`cmd/**`、`internal/**`、`webui/*`、`AGENTS.md`、`.gitattributes`、`.gitignore`）＋个人脚本（`start.bat`/`start.ps1`）＋ `.codegraph/.gitignore`；`.codegraph/codegraph.db` 不收；其余（`config.json`、`watchdog.json`、`*.bak`、`*~`、`*.models.*.json`、`opencode2api.exe*`）永不 `git add`。
-- **当前合并状态（2026-10-15）**：本地原有 12 个主题提交（会话身份、指纹工具、冷却退避、用量页、看门狗、staleMemo、字体…）与上游同期实现高度重叠，逐 hunk rebase 冲突过大，已按「移植分支」路线重建基线。`local` = 上游 `main` + 字体 + 启动脚本 + 本文件。以下三件本地特性**尚未移植**，代码保留在 `local-pre-upstream-20261015`：
-  1. `GET /v1/watchdog/status` + `watchdog-clash.ps1` / `watchdog.example.json`：依赖本地自建的匿名 cause 管道（`coolHash`/`causeExpires`/`lastCause` + `describeAnonymousCause` 词表 + verdict 分类）。上游 pool.go 已简化且删掉了指纹作用域冷却，需要重新接一遍；`watchdog.json` 是脚本只读配置（`exclude_contains`/`deprioritize`，支持注释）。
-  2. 使用记录页：`/api/usage` + 24h `RecentRequests` 环 + webui 用量页（对话 ID/k 秒/时间范围/趋势图）。与上游「按 server key 拆分用量」的 telemetry 改动重叠，移植前先读 `internal/telemetry/metrics.go` 的新结构。
-  3. staleMemo 中毒治理（`encodeResponsesReasoningInput` 快照黑名单 + 选择剥离）。上游已实现 hollow 推理丢弃，但没有跨轮记忆，自愈仍要吃一次 400。
-  移植时每件单独一个提交，跑 `go vet ./... && go build ./cmd/opencode2api && go test ./...` 并实测免费模型，再删对应备份分支。
+- 提交范围：源码（`cmd/**`、`internal/**`、`webui/*`、`AGENTS.md`、`.gitattributes`、`.gitignore`）＋个人脚本（`start.bat`/`start.ps1`、`watchdog-clash.ps1`、`watchdog.example.json`）＋ `.codegraph/.gitignore`；`.codegraph/codegraph.db` 不收；其余（`config.json`、`watchdog.json`、`*.usage.history.json*`、`.usage-history-*.tmp`、`*.bak`、`*~`、`*.models.*.json`、`opencode2api.exe*`）永不 `git add`。
+- **当前合并状态（2026-10-15，已完成）**：上游 `main` 35 个提交并入（旧基线 `1e2702f` → `25afadd`）。本地原有 12 个主题提交与上游同期实现高度重叠，逐 hunk rebase 冲突过大，已按「移植分支」路线重建：`local` = 上游 `main` + 字体/启动脚本 + 本文件 + 三件按基线重新接过的本地特性，每件一个提交：
+  1. `9aa0c36` 使用记录页：`GET /api/usage`（小时/天/周/月区间、成本、缓存命中率、最近 24h 请求明细）+ 小时桶落盘（`*.usage.history.json`、0600、原子写、仅变更时写、400 天）+ webui 用量页。明细放 `/api/usage`，`/api/monitor` 保持上游 1 小时窗口（环内存仍留 24h）。
+  2. `f311f6d` staleMemo 中毒治理：`internal/gateway/stale_memo.go` 按会话记忆被剥掉的 reasoning id / 失效 prev，下一轮**发出请求前**预剥离（不再吃一次 400），选择剥离保住新增的健康推理；telemetry 落 `prestripped`/`prestrip_mode`/`prestrip_ids`（能活过落盘往返）。
+  3. `c417d07` 看门狗决策通道：`GET /v1/watchdog/status`（server key 鉴权、只读）+ `watchdog-clash.ps1` / `watchdog.example.json`（与旧版字节一致）。cause 与成功/失败年龄挂在 `anonymousPool` 冷却状态旁，只由**用户流量**推进；后台目录刷新不算恢复证据；冷却退避语义与上游透传错误**一字未改**。`watchdog.json` 是脚本只读配置（`exclude_contains`/`deprioritize`，支持注释）。
+  - 移植时每件单独一个提交并跑 `go vet ./... && go build ./cmd/opencode2api && go test -count=1 ./...`；本轮还做了每件的变异证据（改坏→红→恢复→绿）与独立审查。
+- **故意不移植的旧本地子系统**（上游已自研实现取代，别在后续移植里复活）：`internal/gateway/anonymous_cooling.go`、`anonymous_errors.go`（指纹作用域冷却 + `opencode2api:` 合成错误——上游把上游错误原样透传，这条是基线约定）、`internal/identity/{canonical,fingerprint,ua_probe}.go`、`internal/protocol/{collect,fingerprint,reasoning_labels}.go`、大请求零拷贝懒编码。代码只存在于 `local-pre-upstream-20261015`；该分支与 `try-rebase`/`bak_0915` 现在可删，但删之前确认你不需要回看这些子系统。
 - 本地 opencode 源码在 `F:\go\src\opencode`（clone 可能落后于线上，如 2026-10-15 本机 CLI 已是 v2.0.29 而 clone 停在 10-10）：对齐原生行为以该目录为准，但版本号与端点这类「线上才变」的事实，以上游 `main` 的实现与抓包为准。
 - 上游更新流程：`fetch` 后先 `log/stat` 看量；默认先在一次性分支试 rebase，冲突过多就退到移植分支（从 `main` 新开分支逐件移植），验证通过再替换 `local`，**替换前先留 `local-pre-upstream-<日期>` 备份分支**。
 
