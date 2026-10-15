@@ -1064,12 +1064,65 @@ function usageFilteredRequests() {
     .slice(0, 500);
 }
 // Local: Token 用量页 —— 请求表明细（Token 格/耗时/会话着色/点击筛同对话）。
+// 尝试数单元格：attempts=0（无可用节点或本地拒绝，无形状可标）只显示裸 0；
+// 预剥离首跳用后缀区分选择剥离(s)/全量剥离(*)，>1 一律 warn。
+// 未知 prestrip_mode 按全量处理。
 function attemptsCell(request) {
   const attempts = Number(request.attempts);
   if (!Number.isFinite(attempts) || attempts < 0) return { text: "—", tone: "", title: "" };
+  // Allowlist：只有明确的 selective 才走选择分支，其余（含老数据缺字段、
+  // 脏数据）有 prestripped 即按全量处理。
+  const mode = request.prestrip_mode === "selective" ? "selective" : request.prestripped ? "full" : "";
+  // 脏数据防护：只接受正整数（小数/负数/NaN 归零），并以上限挡掉指数记数
+  // 显示（后端黑名单上限 1024，此处留余量到 100000，超限视为脏数据隐藏）。
+  const rawBlacklist = Number(request.prestrip_ids);
+  const blacklist =
+    Number.isInteger(rawBlacklist) && rawBlacklist > 0 && rawBlacklist <= 100000 ? rawBlacklist : 0;
+  const blacklistSuffix = blacklist > 0 ? `；黑名单 ${blacklist} 个推理 ID` : "";
+  if (attempts === 0) {
+    return {
+      text: "0",
+      tone: "",
+      title: "未发出上游尝试：无可用节点，或请求在本地被拒",
+    };
+  }
+  if (attempts > 1 && mode) {
+    return {
+      text: String(attempts) + (mode === "selective" ? "s" : "*"),
+      tone: "warn",
+      title:
+        (mode === "selective"
+          ? "命中中毒历史快照：首跳为选择剥离（仅剥黑名单推理ID，s=选择剥离），之后又触发了重试/回退（含全量回退）"
+          : "命中中毒历史记忆（全量剥离）：首跳为剥离体，之后又触发了重试/回退") + blacklistSuffix,
+    };
+  }
+  if (attempts > 1) {
+    return {
+      text: String(attempts),
+      tone: "warn",
+      title:
+        "上游尝试次数（含匿名 lane 与 key 回退；>1 表示触发过重试/回退，含自愈）" + blacklistSuffix,
+    };
+  }
+  if (mode === "selective") {
+    return {
+      text: String(attempts) + "s",
+      tone: "prestrip-sel",
+      title:
+        "命中中毒历史快照：首跳仅剥离黑名单推理ID（标记前中毒段，s=选择剥离），保留其后健康推理；未消耗 400 往返" +
+        (blacklistSuffix || "；黑名单无 ID（本轮仅剥离无 ID 推理块，命中死链一并剥离）"),
+    };
+  }
+  if (mode) {
+    return {
+      text: String(attempts) + "*",
+      tone: "prestrip",
+      title: "命中中毒历史记忆（全量剥离）：首跳直接发送剥离体（等价于自愈重试体），未消耗 400 往返；命中期间连续多轮均为 *",
+    };
+  }
   return {
     text: String(attempts),
-    tone: attempts > 1 ? "warn" : "",
+    tone: "",
     title: "上游尝试次数（含匿名 lane 与 key 回退；>1 表示触发过重试/回退，含自愈）",
   };
 }
@@ -1442,7 +1495,8 @@ function renderDiagnostics() {
       appendCell(row, request.tier || "—");
       appendCell(row, request.channel);
       appendCell(row, request.key_id || "—");
-      appendCell(row, request.attempts);
+      const dac = attemptsCell(request);
+      appendCell(row, dac.text, dac.tone, dac.title);
       const terminalResults = {
         stream_error: "流式响应失败",
         client_canceled: "客户端已取消",

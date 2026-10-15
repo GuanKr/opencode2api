@@ -849,6 +849,18 @@ textarea {
 .table td.conv:hover {
   text-decoration: underline;
 }
+/* 预剥离尝试数：加粗强调，但不可点击、悬停无下划线 */
+.table td.prestrip {
+  font-weight: 700;
+  white-space: nowrap;
+  color: var(--ink);
+}
+/* 选择剥离（仅剥黑名单，保留其后健康推理）：同为加粗，用绿色与全量剥离区分 */
+.table td.prestrip-sel {
+  font-weight: 700;
+  white-space: nowrap;
+  color: var(--ok);
+}
 /* token 紧凑格：新输入↓/输出↑ + 缓存读与命中率 + 悬停明细 */
 .tok {
   position: relative;

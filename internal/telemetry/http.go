@@ -39,7 +39,22 @@ type RequestMeta struct {
 	// normalized to agent shape (stream + core tools) like the anonymous
 	// lane. Non-streaming responses for shaped requests arrive as SSE
 	// and must be collapsed like anonymous ones.
-	Shaped         bool
+	Shaped bool
+	// Prestripped is set by the gateway when the first upstream attempt
+	// goes out pre-stripped (poisoned-history fast path). It lets the
+	// usage page tell a pre-stripped att=1 apart from a clean att=1.
+	Prestripped bool
+	// PrestripMode distinguishes the first-attempt shape: "selective"
+	// strips only the snapshotted blacklist (pre-mark poisoned reasoning
+	// ids) while keeping newer healthy reasoning, "full" removes every
+	// reasoning reference. Empty when the request was not pre-stripped.
+	// Old records without a mode are full strips.
+	PrestripMode string
+	// PrestripIDs is the number of blacklisted reasoning ids stored for
+	// this session: the selective first-attempt blacklist size, or the
+	// size recorded by an in-turn self-heal retry. Zero for full strips
+	// and for requests without reasoning surgery.
+	PrestripIDs    int
 	Usage          protocol.Usage
 	UsageReported  bool
 	AttemptOutcome string

@@ -52,6 +52,11 @@ type Gateway struct {
 	catalog      *models.Catalog
 	monitor      *telemetry.Monitor
 	availability *models.AvailabilityStore
+	// staleMemo is embedded by value: never copy a Gateway after use, and
+	// note that hot-reload builds a fresh Gateway whose memo starts empty
+	// (the first post-reload turn on a poisoned history simply self-heals
+	// once, exactly as before this memory existed).
+	staleMemo staleMemo
 	// attemptTimeout bounds a whole upstream attempt (dial + write + headers +
 	// first event), not just the header wait. Zero keeps the legacy behavior.
 	attemptTimeout time.Duration
