@@ -1077,6 +1077,7 @@ func TestObserveAnonymousResultSlowBodyStillRecordsQuotaSwitch(t *testing.T) {
 	}
 	pool := newAnonymousPool(true, transports, 15*time.Second)
 	g := watchdogTestGateway(transports, pool)
+	freezeProxyHealth(g)
 	body := newGatedSlowBody(head)
 	upstream := watchdogChunkedResponse(http.StatusTooManyRequests, "application/json", body)
 
@@ -1126,6 +1127,7 @@ func TestObserveAnonymousResultRecordsQuotaVerdict(t *testing.T) {
 	}
 	pool := newAnonymousPool(true, transports, 15*time.Second)
 	g := watchdogTestGateway(transports, pool)
+	freezeProxyHealth(g)
 	node := pool.nodes[0]
 	upstream := watchdogErrorResponse(http.StatusTooManyRequests, "application/json", payload)
 	g.observeAnonymousResult(context.Background(), node, upstream, nil)
@@ -1160,6 +1162,7 @@ func TestObserveAnonymousResultSkipsDiagnostic(t *testing.T) {
 	}
 	pool := newAnonymousPool(true, transports, 15*time.Second)
 	g := watchdogTestGateway(transports, pool)
+	freezeProxyHealth(g)
 	node := pool.nodes[0]
 	ctx := WithDiagnosticRequest(context.Background())
 	g.observeAnonymousResult(ctx, node, watchdogErrorResponse(http.StatusTooManyRequests, "application/json", `{"error":{"type":"FreeUsageLimitError"}}`), nil)
