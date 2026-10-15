@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"opencode2api/internal/protocol"
 	"opencode2api/internal/telemetry"
 )
 
@@ -79,6 +80,71 @@ func TestHandleUsagePreciseToUnshifted(t *testing.T) {
 	wantTo := "2026-09-05T17:00:00Z"
 	if got := result.To.UTC().Format("2006-01-02T15:04:05Z"); got != wantTo {
 		t.Fatalf("precise to must stay Beijing 09-06 01:00, got %s", got)
+	}
+}
+
+func TestHandleUsageRequestShapeFieldsReachTheWire(t *testing.T) {
+	// The usage page reads request.endpoint / .stream / .reasoning_effort /
+	// .first_byte_ms / .session by those exact names. Assert on the raw JSON
+	// rather than the decoded struct: a renamed tag still decodes into these Go
+	// fields and would pass a struct-level check while emptying the columns.
+	// `session` earned its place here the hard way — it was renamed from
+	// session_id between releases, and only the wire name catches that.
+	monitor := telemetry.NewMonitor()
+	monitor.Record("/v1/messages", 200, 900*time.Millisecond, &telemetry.RequestMeta{
+		Model: "model-a", Tier: "zen", Request: "req_wire", Channel: "key",
+		Session: "ses_wire", Stream: true, ReasoningEffort: "high", FirstByteMS: 250,
+		UsageReported: true,
+		Usage:         protocol.Usage{Input: 10, Output: 5, Total: 15},
+	})
+	// A non-stream row: stream must still be present as an explicit false so
+	// the UI can tell "recorded as sync" from "recorded before the field
+	// existed" (which arrives as an absent key).
+	monitor.Record("/v1/chat/completions", 200, 700*time.Millisecond, &telemetry.RequestMeta{
+		Model: "model-a", Tier: "zen", Request: "req_sync", Channel: "key",
+		Session: "ses_wire", UsageReported: true,
+		Usage: protocol.Usage{Input: 10, Output: 5, Total: 15},
+	})
+	server := &Server{monitor: monitor}
+	req := httptest.NewRequest(http.MethodGet, "/api/usage?granularity=day", nil)
+	rec := httptest.NewRecorder()
+	server.handleUsage(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("usage must be 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Requests []map[string]any `json:"requests"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Requests) != 2 {
+		t.Fatalf("expected 2 requests in the range, got %d", len(payload.Requests))
+	}
+	byID := map[string]map[string]any{}
+	for _, item := range payload.Requests {
+		byID[item["request_id"].(string)] = item
+	}
+	for _, want := range []map[string]any{
+		{
+			"request_id": "req_wire", "endpoint": "/v1/messages", "stream": true,
+			"reasoning_effort": "high", "first_byte_ms": float64(250), "session": "ses_wire",
+		},
+		{
+			"request_id": "req_sync", "endpoint": "/v1/chat/completions", "stream": false,
+			"session": "ses_wire",
+		},
+	} {
+		got := byID[want["request_id"].(string)]
+		if got == nil {
+			t.Fatalf("request %v missing from the response: %s", want["request_id"], rec.Body.String())
+		}
+		for key, value := range want {
+			if got[key] != value {
+				t.Fatalf("request %v field %q must reach the wire as %v, got %v (body %s)",
+					want["request_id"], key, value, got[key], rec.Body.String())
+			}
+		}
 	}
 }
 

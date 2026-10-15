@@ -409,7 +409,7 @@
                 <h2>请求明细</h2>
                 <div class="section-caption">
                   所选时间范围内实际路由的推理请求，仅展示最新 500 条。同一对话共享同一对话ID与颜色，点击可筛选；颜色仅为当前列表内辅助提示、以ID为准，对话ID取自客户端会话标识、必要时确定性重编码，仅用于同对话关联；Token
-                  与费用为上游回报口径、记录时价格估算；尝试为上游尝试次数（含匿名 lane 与 key 回退，>1 表示触发过重试/回退，含自愈）；仅显示
+                  与费用为上游回报口径、记录时价格估算；尝试为上游尝试次数（含匿名 lane 与 key 回退，>1 表示触发过重试/回退，含自愈）；首字为客户端观测的首字节耗时（TTFT，仅流式有效，非流式显示—）；耗时已减去首字时间（总耗时−首字，悬停查看原始值）；推理强度与端点取自客户端请求本身；仅显示
                   Key 尾码，不记录客户端密钥与 IP。
                 </div>
               </div>
@@ -447,6 +447,9 @@
                 </select>
               </div>
               <div class="field">
+                <label>推理强度</label><select id="usage-f-effort"><option value="">全部强度</option></select>
+              </div>
+              <div class="field">
                 <label>时间范围</label
                 ><select id="usage-f-range">
                   <option value="1h">最近1小时</option>
@@ -466,14 +469,18 @@
                     <th>时间</th>
                     <th>Request ID</th>
                     <th>模型</th>
+                    <th>推理强度</th>
+                    <th>端点</th>
                     <th>Tier / 通道</th>
                     <th>Key 尾码</th>
+                    <th>流式</th>
                     <th>对话ID</th>
                     <th>Token</th>
                     <th>费用</th>
                     <th>状态</th>
                     <th>尝试</th>
-                    <th>耗时</th>
+                    <th>首字</th>
+                    <th>耗时(去首字)</th>
                   </tr>
                 </thead>
                 <tbody id="usage-requests"></tbody>

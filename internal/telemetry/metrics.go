@@ -138,6 +138,24 @@ type UpstreamRequest struct {
 	DurationMS  int64  `json:"duration_ms"`
 	Success     bool   `json:"success"`
 	Outcome     string `json:"outcome"`
+	// Endpoint is the inbound path the client called (/v1/messages, ...).
+	Endpoint string `json:"endpoint,omitempty"`
+	// Stream records the client-requested response shape as stated on the
+	// wire, recorded before routing: a failed stream must not be relabelled
+	// as a sync request.
+	//
+	// It is a pointer because all three states are meaningful. A plain bool
+	// decodes an absent key (a row persisted before this field existed) as
+	// false and then re-emits `"stream": false`, so the usage page could not
+	// tell "recorded as sync" from "never recorded" and would silently
+	// mislabel up to 24h of older history. nil marshals away under omitempty
+	// while &false still emits false, so all three survive the disk round trip.
+	Stream *bool `json:"stream,omitempty"`
+	// ReasoningEffort is the client-requested reasoning intensity label
+	// (see RequestMeta); omitted when the request stated none.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// FirstByteMS is client-observed TTFT, streams only; 0 otherwise.
+	FirstByteMS int64 `json:"first_byte_ms,omitempty"`
 	// Tokens and CostUSD are the per-request slice of the usage history:
 	// Tokens is the reported usage (zero when upstream reported none) and
 	// CostUSD is priced at record time with the models.dev price.
@@ -424,13 +442,19 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 				Time: now.UTC(), RequestID: meta.Request, Session: meta.Session, ServerKeyID: meta.ServerKeyID, Model: meta.Model, Tier: meta.Tier,
 				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Proxy: meta.Proxy,
 				Attempts: meta.Attempts, Status: status, DurationMS: max(duration.Milliseconds(), 0),
-				Success: success,
+				Success:         success,
+				Endpoint:        endpoint,
+				ReasoningEffort: meta.ReasoningEffort, FirstByteMS: meta.FirstByteMS,
 				// Poisoned-history fast path: persisted so the usage page can
 				// mark a pre-stripped first attempt across restarts (see
 				// gateway staleMemo and UpstreamRequest).
 				Prestripped: meta.Prestripped, PrestripMode: meta.PrestripMode,
 				PrestripIDs: meta.PrestripIDs,
 			}
+			// Always a real pointer, sync included: nil would read back as
+			// "never recorded" in the usage page's 流式 column.
+			streamShape := meta.Stream
+			request.Stream = &streamShape
 			if hasHourUsage {
 				request.Tokens = hourTokens
 				request.CostUSD = hourCost

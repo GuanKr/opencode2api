@@ -166,6 +166,10 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		meta := telemetry.MetaFromRequest(r)
 		if meta != nil {
 			meta.Model = model
+			meta.ReasoningEffort = wire.ReasoningEffortLabel(external, payload)
+			// The client-requested shape is recorded up front: a spot past
+			// the non-2xx return mislabels failed streams as sync.
+			meta.Stream = jsonutil.BoolAt(payload, "stream")
 		}
 		if model == "" {
 			wire.WriteError(w, external, http.StatusBadRequest, "model is required", "invalid_request_error", "model")
@@ -343,6 +347,11 @@ func (g *Gateway) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 	model := jsonutil.StringAt(payload, "model")
 	if meta := telemetry.MetaFromRequest(r); meta != nil {
 		meta.Model = model
+		// Same client-shape recording as handleInference (see gateway.go), so
+		// the usage page's 推理强度 / 流式 columns are not blank for traffic
+		// that arrives on this endpoint instead of the three message ones.
+		meta.ReasoningEffort = wire.ReasoningEffortLabel(wire.SystemOne, payload)
+		meta.Stream = jsonutil.BoolAt(payload, "stream")
 	}
 	if model == "" {
 		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "model is required", "invalid_request_error", "model")
@@ -425,6 +434,9 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 	}
 	if contentType := resp.Header.Get("Content-Type"); strings.HasPrefix(contentType, "text/event-stream") {
 		if meta != nil {
+			// Upstream decided the response is an event stream even if the
+			// client did not ask for one; the client really does receive a
+			// stream, so this is the accurate shape to record.
 			meta.Stream = true
 		}
 		w.Header().Set("Content-Type", contentType)

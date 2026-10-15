@@ -523,6 +523,50 @@ const formatDurationMS = (value) => {
   }
   return `${ds / 10}s`;
 };
+// Local: 请求明细 —— 推理强度显示。空值（客户端未设推理，或显式 none）显示 —；
+// 归一化（小写、去 -/_/空格）与服务端 ReasoningEffortLabel 同口径，但这一层额外
+// 做纯显示的别名美化（extrahigh→XHigh），筛选仍按服务端的原始小写值比对。
+const formatEffort = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "—";
+  const n = raw.toLowerCase().replace(/[-_\s]/g, ""),
+    known = {
+      low: "Low",
+      medium: "Medium",
+      high: "High",
+      xhigh: "XHigh",
+      extrahigh: "XHigh",
+      max: "Max",
+      minimal: "Minimal",
+    };
+  if (known[n]) return known[n];
+  if (n === "none") return "—";
+  return raw.length > 1 ? raw[0].toUpperCase() + raw.slice(1) : raw.toUpperCase();
+};
+// Local: 请求明细 —— 首字节耗时。0/负数一律显示 —（非流式无 TTFT，或后端未记录）。
+const formatFirstByte = (value) => {
+  const n = Number(value || 0);
+  if (!(n > 0)) return "—";
+  return formatDurationMS(n);
+};
+// Local: 请求明细 —— 耗时列显示「总耗时 − 首字」。仅流式且首字 >0 时相减；
+// 非流式直接显示总耗时（其首字与完成时刻重合，相减会得到无意义的 0）。
+const durationExcludingFirstByte = (total, first, stream) => {
+  if (total == null) return null;
+  const t = Number(total),
+    f = Number(first || 0);
+  if (!Number.isFinite(t) || t < 0) return null;
+  if (!stream || !(f > 0)) return t;
+  return Math.max(0, t - f);
+};
+const durationExcludingFirstByteTitle = (total, first, stream) => {
+  if (total == null) return "";
+  const t = Number(total),
+    f = Number(first || 0);
+  if (!Number.isFinite(t) || t < 0) return "";
+  if (!stream || !(f > 0)) return "总耗时 " + formatDurationMS(t) + (stream ? "" : "（非流式无 TTFT）");
+  return "总耗时 " + formatDurationMS(t) + " · 首字 " + formatDurationMS(f) + " · 已减首字";
+};
 let usageGranularity = "day",
   usageOffset = 0,
   usageData = null,
@@ -1030,6 +1074,7 @@ function usageFilteredRequests() {
     tier = $("#usage-f-tier")?.value || "",
     channel = $("#usage-f-channel")?.value || "",
     status = $("#usage-f-status")?.value || "",
+    effort = $("#usage-f-effort")?.value || "",
     query = ($("#usage-f-q")?.value || "").trim().toLowerCase(),
     range = $("#usage-f-range")?.value || "24h",
     cutoffMs = Date.now() - (range === "1h" ? 3600000 : range === "6h" ? 21600000 : 86400000);
@@ -1038,6 +1083,7 @@ function usageFilteredRequests() {
       const ts = Date.parse(request.time || "");
       if (!Number.isNaN(ts) && ts < cutoffMs) return false;
       if (model && request.model !== model) return false;
+      if (effort && (request.reasoning_effort || "") !== effort) return false;
       if (tier && (request.tier || "") !== tier) return false;
       if (channel) {
         if (channel === "anonymous") {
@@ -1154,6 +1200,33 @@ function renderUsageRequests() {
       if (current && models.includes(current)) select.value = current;
     }
   }
+  const effortSelect = $("#usage-f-effort");
+  if (effortSelect) {
+    const efforts = [
+      ...new Set(
+        ((usageData && usageData.requests) || [])
+          .map((request) => request.reasoning_effort)
+          .filter(Boolean),
+      ),
+    ].sort();
+    const sig = efforts.join(" ");
+    if (effortSelect.dataset.sig !== sig) {
+      effortSelect.dataset.sig = sig;
+      const current = effortSelect.value;
+      effortSelect.replaceChildren();
+      const all = document.createElement("option");
+      all.value = "";
+      all.textContent = "全部强度";
+      effortSelect.appendChild(all);
+      efforts.forEach((effort) => {
+        const option = document.createElement("option");
+        option.value = effort;
+        option.textContent = formatEffort(effort);
+        effortSelect.appendChild(option);
+      });
+      if (current && efforts.includes(current)) effortSelect.value = current;
+    }
+  }
   const rows = usageFilteredRequests();
   const sessionColor = new Map();
   let sessionNext = 0;
@@ -1176,8 +1249,15 @@ function renderUsageRequests() {
     appendCell(row, request.time ? new Date(request.time).toLocaleString() : "—");
     appendCell(row, rid.length > 6 ? "…" + rid.slice(-6) : rid || "—", "", rid);
     appendCell(row, request.model || "—");
+    appendCell(row, formatEffort(request.reasoning_effort), "", request.reasoning_effort || "");
+    appendCell(row, request.endpoint || "—");
     appendCell(row, `${request.tier || "—"} / ${request.channel || "—"}`);
     appendCell(row, request.key_id || "—");
+    // 流式列是三态而不是两态：`stream` 没有 omitempty，所以"键不存在"唯一地表示
+// 这条记录产自该字段加入之前（本机最长 24h 的历史）。把它读成"同步"会把当时的
+// 流式请求错标；宁可显示 —，让"没记录"和"记录为同步"分得开。
+const streamLabel = request.stream === true ? "流式" : request.stream === false ? "同步" : "—";
+appendCell(row, streamLabel, request.stream === true ? "ok" : "");
     const sid = sessionIDOf(request);
     appendCell(row, sid.length > 6 ? "…" + sid.slice(-6) : sid || "—", sid ? "conv" : "", sid ? sid + "（点击筛选同对话）" : "");
     if (sid) {
@@ -1203,10 +1283,23 @@ function renderUsageRequests() {
     appendCell(row, request.status || request.outcome || "—", ok ? "ok" : "bad");
     const ac = attemptsCell(request);
     appendCell(row, ac.text, ac.tone, ac.title);
-    appendCell(row, formatDurationMS(request.duration_ms));
+    appendCell(
+      row,
+      formatFirstByte(request.stream === true ? request.first_byte_ms : 0),
+      "",
+      "客户端首字节耗时 · 仅流式有效（TTFT），非流式显示—",
+    );
+    appendCell(
+      row,
+      formatDurationMS(
+        durationExcludingFirstByte(request.duration_ms, request.first_byte_ms, request.stream === true),
+      ),
+      "",
+      durationExcludingFirstByteTitle(request.duration_ms, request.first_byte_ms, request.stream === true),
+    );
     body.appendChild(row);
   });
-  if (!rows.length) emptyRow(body, 11, "暂无匹配的请求路由");
+  if (!rows.length) emptyRow(body, 15, "暂无匹配的请求路由");
   const rangeLabel = { "1h": "最近1小时", "6h": "最近6小时" }[$("#usage-f-range")?.value || "24h"] || "最近24小时";
   const count = $("#usage-req-count");
   if (count)
@@ -1243,6 +1336,7 @@ $("#usage-req-reset").onclick = () => {
   $("#usage-f-tier").value = "";
   $("#usage-f-channel").value = "";
   $("#usage-f-status").value = "";
+  $("#usage-f-effort").value = "";
   $("#usage-f-q").value = "";
   $("#usage-f-range").value = "24h";
   usageReqPage = 1;
@@ -1251,7 +1345,7 @@ $("#usage-req-reset").onclick = () => {
 $("#usage-req-refresh").onclick = async () => {
   await fetchUsage();
 };
-["usage-f-model", "usage-f-tier", "usage-f-channel", "usage-f-status", "usage-f-range"].forEach((id) => {
+["usage-f-model", "usage-f-tier", "usage-f-channel", "usage-f-status", "usage-f-effort", "usage-f-range"].forEach((id) => {
   const node = document.getElementById(id);
   if (node)
     node.onchange = () => {

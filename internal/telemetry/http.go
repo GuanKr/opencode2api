@@ -31,6 +31,16 @@ type RequestMeta struct {
 	Stop      string
 	Tail      string
 	Stream    bool
+	// ReasoningEffort is the client-requested reasoning intensity as a short
+	// display label (see protocol.ReasoningEffortLabel). Telemetry-only: it
+	// never affects routing or the wire body. Empty when the request stated
+	// no reasoning setting, or explicitly asked for none.
+	ReasoningEffort string
+	// FirstByteMS is the client-observed time to the first response body byte.
+	// Set by Middleware for streams only; buffered non-stream responses
+	// complete on their first write, so it stays 0 there and the usage page
+	// shows the total instead of a bogus ~0s TTFT.
+	FirstByteMS int64
 	// ServerKeyID is the fingerprint of the local server key the caller
 	// authenticated with, so usage can be split per caller. KeyID is the
 	// upstream account that served the request.
@@ -88,8 +98,9 @@ func MetaFromRequest(r *http.Request) *RequestMeta {
 
 type statusWriter struct {
 	http.ResponseWriter
-	status int
-	bytes  int64
+	status     int
+	bytes      int64
+	firstWrite time.Time
 }
 
 func (w *statusWriter) WriteHeader(status int) {
@@ -103,6 +114,9 @@ func (w *statusWriter) WriteHeader(status int) {
 func (w *statusWriter) Write(data []byte) (int, error) {
 	if w.status == 0 {
 		w.WriteHeader(http.StatusOK)
+	}
+	if w.firstWrite.IsZero() {
+		w.firstWrite = time.Now()
 	}
 	n, err := w.ResponseWriter.Write(data)
 	w.bytes += int64(n)
@@ -136,6 +150,13 @@ func Middleware(monitor *Monitor, logger *slog.Logger, next http.Handler) http.H
 				status = http.StatusOK
 			}
 			duration := time.Since(started)
+			if !writer.firstWrite.IsZero() && meta.Stream {
+				// Client-observed time to first body byte: genuine TTFT for
+				// streams only. Buffered non-stream responses complete on
+				// first write, so FirstByteMS stays 0 there and the UI shows
+				// the total directly instead of a bogus ~0s.
+				meta.FirstByteMS = max(writer.firstWrite.Sub(started).Milliseconds(), 0)
+			}
 			monitor.Record(r.URL.Path, status, duration, meta)
 			outcome := meta.Outcome
 			if outcome == "" {
