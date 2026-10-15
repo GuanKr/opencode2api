@@ -82,6 +82,15 @@ func (a *Server) staticHandler() http.Handler {
 			writeAdminError(w, http.StatusNotFound, "not_found", "management endpoint not found")
 			return
 		}
+		// The console is embedded at compile time, so its asset names never
+		// change and embed.FS carries no validator to revalidate against. With
+		// no Cache-Control the browser is free to keep serving its own copy:
+		// a stale app.js then renders the old table against the new API and
+		// the page shows permanently blank columns after an upgrade. Refetch
+		// unconditionally; these are a few KB behind an authenticated admin
+		// port, and the alternative is a UI that silently disagrees with the
+		// backend it ships with.
+		w.Header().Set("Cache-Control", "no-cache, no-store")
 		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
 			if _, err := fs.Stat(assets, strings.TrimPrefix(r.URL.Path, "/")); err != nil {
 				r.URL.Path = "/"
