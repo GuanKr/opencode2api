@@ -46,6 +46,30 @@ type anonymousNode struct {
 	proxy         *proxyTransport
 	failures      atomic.Uint32
 	cooldownUntil atomic.Int64
+	// coolCause is a short summary of what triggered the current cooldown
+	// (e.g. "FreeUsageLimitError (upstream HTTP 429)"), stored next to
+	// cooldownUntil so the watchdog feed can report remaining seconds and
+	// cause from the same cooldown (see maxCooldownSnapshot in watchdog.go).
+	// Empty when the cooldown carries no user-traffic trigger.
+	coolCause atomic.Value
+	// lastCause remembers the most recent user-traffic failure cause even
+	// after its cooldown expires, so the watchdog can keep reporting
+	// transport until either a real user-traffic success lands or
+	// staleCauseTTL passes. Only transport causes are surfaced from here
+	// (see staleCauseSnapshot): only transport proves nothing recovered.
+	lastCause atomic.Value
+	// causeExpires is the UnixNano moment the stale lastCause stops being
+	// reported (cooldownUntil at failure time + staleCauseTTL). It is
+	// snapshotted at write time so read-only status polls can never extend it.
+	causeExpires atomic.Int64
+	// lastSuccess is the UnixNano moment of the most recent user-traffic
+	// MarkSuccess. Background catalog refresh uses markRefreshSuccess and
+	// must not touch it: a models-endpoint 200 proves less than a real
+	// inference turn (and would fake "recovered" overnight with zero traffic).
+	lastSuccess atomic.Int64
+	// lastFailure is the UnixNano moment of the most recent user-traffic
+	// MarkFailure, i.e. of the failures that carry a cause label.
+	lastFailure atomic.Int64
 }
 
 type anonymousCursor struct {
@@ -104,12 +128,33 @@ func (c *anonymousCursor) Next() *anonymousNode {
 	return nil
 }
 
+// MarkSuccess records a successful anonymous inference turn: it clears the
+// cooldown and, as the only positive recovery proof the watchdog feed accepts,
+// drops the stale transport memory and stamps the success moment.
 func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	if node == nil {
 		return
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	node.coolCause.Store("")
+	node.lastCause.Store("")
+	node.causeExpires.Store(0)
+	node.lastSuccess.Store(time.Now().UnixNano())
+}
+
+// markRefreshSuccess heals active cooling after a background catalog fetch
+// without manufacturing recovery evidence: the stale transport cause stays
+// for the watchdog (a models-endpoint 200 does not prove inference turns
+// succeed) and lastSuccess keeps its user-traffic-only meaning. The cooldown
+// clearing is exactly what MarkSuccess does, unchanged.
+func (p *anonymousPool) markRefreshSuccess(node *anonymousNode) {
+	if node == nil {
+		return
+	}
+	node.failures.Store(0)
+	node.cooldownUntil.Store(0)
+	node.coolCause.Store("")
 }
 
 // RestoreProxy clears cooldowns for anonymous nodes bound to a recovered
@@ -144,7 +189,29 @@ func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
 // recovers first.
 const maxAnonymousRetryAfterMultiplier = 8
 
+// MarkFailure cools the node down after a failure that carries no user traffic
+// in context (the background catalog refresh). The cooldown itself is exactly
+// as it always was; the watchdog feed records nothing, because a
+// models-endpoint probe must neither fake a user-traffic failure age nor cast
+// a stale transport vote that would send the watchdog switching nodes.
 func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
+	p.startCooldown(node, resp, err, "")
+}
+
+// markUserFailure is MarkFailure for a real inference turn: besides the same
+// cooldown it records the watchdog feed's user-traffic evidence. cause is the
+// label classifyAnonymousVerdict parses (see watchdogCause); it is never empty
+// on this path, and its presence is what makes the failure count as user
+// traffic (lastFailure plus the TTL-bounded stale transport memory).
+func (p *anonymousPool) markUserFailure(node *anonymousNode, resp *http.Response, err error, cause string) {
+	p.startCooldown(node, resp, err, cause)
+}
+
+// startCooldown applies the anonymous cooldown for one failed attempt and
+// stores the watchdog cause label that belongs to it. An empty cause means
+// "no user traffic": the cooldown still happens, only the watchdog memory is
+// skipped.
+func (p *anonymousPool) startCooldown(node *anonymousNode, resp *http.Response, err error, cause string) {
 	if node == nil {
 		return
 	}
@@ -158,7 +225,126 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 			delay = min(retryAfter, p.cooldown*maxAnonymousRetryAfterMultiplier)
 		}
 	}
-	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
+	node.coolCause.Store(cause)
+	until := time.Now().Add(delay).UnixNano()
+	node.cooldownUntil.Store(until)
+	if cause == "" {
+		return
+	}
+	// Stale watchdog memory: snapshotted once here so later status polls can
+	// report it without ever extending it.
+	node.lastFailure.Store(time.Now().UnixNano())
+	node.lastCause.Store(cause)
+	node.causeExpires.Store(until + int64(staleCauseTTL))
+}
+
+// staleCauseTTL bounds how long an expired transport cause keeps voting in
+// the watchdog feed after its cooldown lapses with no new success. It must
+// comfortably exceed the worst active wall (8x base, 120s at the default
+// failure_cooldown_seconds=15) plus the script's TransportConfirmRounds window
+// (3x15s poll = 45s), or the "two failures then expiry looks like recovery"
+// resonance simply moves from ~15s to TTL. Five minutes keeps a real outage
+// voting long enough to switch while capping the collateral of a transient
+// blip (a recovered node is served again immediately once its cooldown lapses).
+const staleCauseTTL = 5 * time.Minute
+
+// maxCooldownSnapshot returns the longest still-active anonymous cooldown
+// among transport-healthy proxies and its stored trigger in one pass. One
+// pass keeps seconds and cause on the same node in the common case (two
+// separate scans could straddle an expiry boundary and mix seconds of one
+// node with the cause of another).
+// Transport-unhealthy proxies are skipped, mirroring Next: their cooldowns
+// cannot block any request (unhealthy nodes are never served), so surfacing
+// them would cry wolf to the watchdog.
+// This is a worst-case snapshot across all nodes, not a verdict for any
+// particular request: one node's residual cooldown can outlive its own turns,
+// so the watchdog must treat a quota/transport verdict as one vote (ideally
+// confirmed twice), never as proof that the next turn needs a switch.
+// It is still best-effort under concurrency: MarkSuccess clears
+// cooldownUntil before coolCause, so a success landing between the two loads
+// can surface a stale remain with an empty cause; callers treat that as plain
+// cooling (wait), never as a switch signal.
+func (p *anonymousPool) maxCooldownSnapshot() (time.Duration, string) {
+	if p == nil {
+		return 0, ""
+	}
+	now := time.Now().UnixNano()
+	var longest time.Duration
+	cause := ""
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() {
+			continue
+		}
+		until := node.cooldownUntil.Load()
+		if remain := time.Duration(until - now); remain > longest {
+			longest = remain
+			cause, _ = node.coolCause.Load().(string)
+		}
+	}
+	return longest, cause
+}
+
+// staleCauseSnapshot returns the most recently expired transport cause
+// still inside its TTL, or "" when none qualifies. Transport-only by design:
+// an expired quota cause must not hold recommend_switch=true for minutes,
+// an expired ratelimit cause must not park the script in wait, and an
+// unknown cause classifies as ok without cooling anyway. Unhealthy proxies
+// stay skipped, mirroring maxCooldownSnapshot.
+func (p *anonymousPool) staleCauseSnapshot() string {
+	if p == nil {
+		return ""
+	}
+	now := time.Now().UnixNano()
+	var bestExpiry int64
+	stale := ""
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() {
+			continue
+		}
+		expiry := node.causeExpires.Load()
+		if expiry <= now {
+			continue
+		}
+		cause, _ := node.lastCause.Load().(string)
+		if cause == "" || classifyAnonymousVerdict(cause, false) != "transport" {
+			continue
+		}
+		if expiry > bestExpiry {
+			bestExpiry = expiry
+			stale = cause
+		}
+	}
+	return stale
+}
+
+// successFailureAges reports the newest user-traffic success and failure
+// moments across transport-healthy proxies as ages. ok=false per side when
+// that side was never recorded (process memory, restart clears, same as the
+// telemetry minute metrics). Read-only: never extends any deadline.
+func (p *anonymousPool) successFailureAges() (successAge, failureAge time.Duration, successOK, failureOK bool) {
+	if p == nil {
+		return 0, 0, false, false
+	}
+	now := time.Now().UnixNano()
+	var newestSuccess, newestFailure int64
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() {
+			continue
+		}
+		if ts := node.lastSuccess.Load(); ts > newestSuccess {
+			newestSuccess = ts
+		}
+		if ts := node.lastFailure.Load(); ts > newestFailure {
+			newestFailure = ts
+		}
+	}
+	if newestSuccess > 0 {
+		successAge, successOK = time.Duration(now-newestSuccess), true
+	}
+	if newestFailure > 0 {
+		failureAge, failureOK = time.Duration(now-newestFailure), true
+	}
+	return successAge, failureAge, successOK, failureOK
 }
 
 func (p *transportPool) hasHealthy() bool {

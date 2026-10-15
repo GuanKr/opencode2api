@@ -231,7 +231,7 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 		g.syncProxyResult(refreshCtx, node.proxy, status, err)
 		cancel()
 		if err == nil {
-			g.anonymous.MarkSuccess(node)
+			g.anonymous.markRefreshSuccess(node)
 			return models
 		}
 		g.anonymous.MarkFailure(node, nil, err)

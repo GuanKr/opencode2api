@@ -1101,7 +1101,10 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 	if err == nil && status/100 == 2 {
 		g.anonymous.MarkSuccess(node)
 	} else {
-		g.anonymous.MarkFailure(node, resp, err)
+		// watchdogCause only labels the failure for the watchdog feed; the
+		// upstream error document itself is still passed through untouched
+		// (the label peeks the body at most and puts it back byte for byte).
+		g.anonymous.markUserFailure(node, resp, err, watchdogCause(resp, err))
 	}
 }
 

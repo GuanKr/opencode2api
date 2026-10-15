@@ -105,9 +105,13 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/responses", g.authenticate(g.handleInference(wire.Responses)))
 	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(wire.Anthropic)))
 	mux.HandleFunc("POST /v1/systemone", g.authenticate(g.handleSystemOne))
+	mux.HandleFunc("GET /v1/watchdog/status", g.authenticate(g.handleWatchdogStatus))
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	return telemetry.Recover(g.logger, mux)
 }
+
+// Local: watchdog (read-only Clash decision feed) lives in watchdog.go;
+// only the route hook stays here.
 
 func (g *Gateway) authenticate(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
