@@ -214,11 +214,13 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 			fallback.Body = io.NopCloser(bytes.NewReader(errBody))
 			return &fallback, effectiveRoute, nil
 		}
-		// The poison is the same old history: keep the old blacklist and
-		// only move the window forward, so healthy ids appended since the
-		// mark are never blacklisted.
+		// The blacklist was proven incomplete: the upstream rejected a body
+		// that no longer carried the blacklisted ids, and only removing the
+		// rest of them made the replay succeed. Merge those into the
+		// blacklist so the next turn strips them on its first attempt
+		// instead of paying this same 400 + fallback every turn.
 		if !diagnostic {
-			g.staleMemo.refresh(ids.Session)
+			g.rememberStaleHistory(ids.Session, bodies[effectiveRoute.Tier], prestripMode)
 			recordBlacklistSize()
 		}
 		return retryResp, retryRoute, nil
@@ -253,9 +255,12 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 	}
 	// The history needed surgery this turn; remember it so the next turns
 	// pre-strip on the first attempt instead of burning a 400 each time.
-	// Diagnostic requests never write production memory.
+	// prestripMode tells rememberStaleHistory whether this turn's failure is
+	// fresh evidence (selective pre-strip still rejected) or just the same old
+	// poison (no pre-strip / full pre-strip). Diagnostic requests never write
+	// production memory.
 	if !diagnostic {
-		g.rememberStaleHistory(ids.Session, bodies[effectiveRoute.Tier])
+		g.rememberStaleHistory(ids.Session, bodies[effectiveRoute.Tier], prestripMode)
 		recordBlacklistSize()
 	}
 	return retryResp, retryRoute, nil
@@ -267,13 +272,34 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 // upstream: a real 400 would spawn the background proxy verification, which
 // dials the public internet.
 //
-// A re-probe within the window that still fails keeps the old blacklist: the
-// failure is still the pre-mark poisoned history, while ids appended during
-// the window are healthy and must not be blacklisted. Only the first-ever
-// poison snapshots the current failing body (which is exactly the stripped id
-// set). Past the TTL the memo no longer remembers the session, so the turn
-// re-learns from its failing body instead.
-func (g *Gateway) rememberStaleHistory(session string, failingBody []byte) {
+// prestripMode is what this turn's FIRST attempt was already stripped with
+// ("" when nothing was pre-stripped), because it decides whether the failing
+// body carries fresh evidence:
+//
+//   - "selective": the blacklist was proven INCOMPLETE. The rejected body no
+//     longer carried the blacklisted ids, yet the upstream still refused it
+//     and only the full strip (dropping everything it did carry — the
+//     remaining reasoning ids AND the chain link) was accepted — so those
+//     references are dead as well and get learned. Without this, a session
+//     whose upstream moved on to other references pays one more 400 +
+//     fallback every single turn for the whole window, because the entry it
+//     holds can never grow. Note the chain link is not stripped by the
+//     selective pass unless it equals the remembered dead one, so a
+//     fresh-but-dead link reaches this point and must be learned here too.
+//   - anything else ("" / "full"): the failure carries no new evidence, so an
+//     already-remembered session only has its window moved. Ids appended
+//     during the window are healthy — nothing rejected them — and must never
+//     be blacklisted.
+//
+// Only the first-ever poison snapshots the current failing body (which is
+// exactly the stripped id set). Past the TTL the memo no longer remembers the
+// session, so the turn re-learns from its failing body instead.
+func (g *Gateway) rememberStaleHistory(session string, failingBody []byte, prestripMode string) {
+	if prestripMode == "selective" {
+		failingIDs, failingPrev := collectStaleReasoningIDs(failingBody)
+		g.staleMemo.mergeRejected(session, failingIDs, failingPrev)
+		return
+	}
 	if _, _, _, hadOld := g.staleMemo.snapshot(session); hadOld {
 		g.staleMemo.refresh(session)
 		return

@@ -24,13 +24,17 @@ import (
 // would have to be learned again from the next failing body, which by then
 // also contains the healthy reasoning appended since.
 //
-// A strip retry that succeeds refreshes the window (keeping the old
-// snapshot, never the larger current id set), so only 48h-idle entries
-// expire; the next touch then lazily deletes the entry and re-probes the
-// full shape, re-learning with one 400 if the poison persists. Worst case
-// is bounded by the session cap below (idle entries self-release; the memo
-// itself is process memory, cleared by restart or config hot-reload which
-// rebuilds the Gateway).
+// A strip retry that succeeds refreshes the window. What happens to the
+// snapshot itself depends on the evidence the turn produced: a failure with
+// no selective pre-strip, or after a full one, is still just the pre-mark
+// poison, so the old snapshot is kept as-is and ids appended during the
+// window (healthy — nothing rejected them) are never blacklisted. A selective
+// pre-strip that was rejected ANYWAY is different: the blacklist proved
+// incomplete, and the ids the refused body still carried are merged in (see
+// mergeRejected), so only 48h-idle entries expire and an upstream that keeps
+// rejecting does not cost another 400 every turn. Worst case is bounded by
+// the session cap below (idle entries self-release; the memo itself is process
+// memory, cleared by restart or config hot-reload which rebuilds the Gateway).
 // It stores only session IDs, opaque reasoning ids and timestamps — no
 // request content. Zero value is ready to use, which also keeps
 // test-constructed Gateways working.
@@ -39,13 +43,17 @@ type staleEntry struct {
 	// ids holds the blacklisted reasoning item ids snapshotted from the
 	// failed body — the whole reasoning set it carried, not only the id the
 	// 400 named (see collectStaleReasoningIDs). Ids absent from this set
-	// (i.e. reasoning that arrived after the mark) are kept. Nil together
+	// (i.e. reasoning that arrived after the mark) are kept. The set only ever
+	// grows, and only on the evidence of mergeRejected. Nil together
 	// with full=false and prev=="" means empty.
 	ids map[string]struct{}
-	// prev is the dead previous_response_id seen at snapshot time ("" when
-	// the failed body carried none). Selective stripping drops the chain
-	// link only when it still equals this value, so a fresh link issued
-	// after the mark is preserved.
+	// prev is the dead previous_response_id this session's selective pre-strip
+	// must drop: the one snapshotted at poison-discovery time, or "" when the
+	// failing body carried none. Selective stripping drops the chain link only
+	// when it still equals this value, so a fresh link issued after the mark is
+	// preserved — until mergeRejected learns it, when a selective pre-strip
+	// carrying it was refused anyway and only dropping it was accepted. One
+	// slot is enough because a client chain link only moves forward.
 	prev string
 	// full forces full stripping when the snapshot would be too large to
 	// keep (or when no usable snapshot exists). It preserves the old
@@ -150,6 +158,10 @@ func (m *staleMemo) snapshot(session string) (ids map[string]struct{}, prev stri
 // snapshot (no ids, no chain link) is intentionally retained: the failed
 // body then carried only id-less reasoning blocks, and the entry keeps
 // pre-stripping those on later turns instead of burning a 400 every time.
+// It is the first-poison write only: an already-remembered session goes
+// through refresh (no new evidence) or mergeRejected (a selective pre-strip
+// proved the snapshot incomplete), never through a replacement here — see
+// rememberStaleHistory for which one a given turn earns.
 func (m *staleMemo) noteStripped(session string, ids []string, prev string) {
 	if m == nil || session == "" {
 		return
@@ -187,11 +199,14 @@ func (m *staleMemo) noteStripped(session string, ids []string, prev string) {
 }
 
 // refresh moves the prestrip window forward while keeping the existing
-// blacklist. It is used when a strip retry (selective or full) succeeds:
-// the poison is the same old history, so the snapshot must not be replaced
-// by the current (larger) id set that includes healthy reasoning appended
-// during the window. (Past the TTL there is nothing to refresh: the entry
-// was already lazily released, and the turn re-learns via noteStripped.)
+// blacklist. It is used when a strip retry succeeds WITHOUT the selective
+// pre-strip having proven the blacklist incomplete (no pre-strip at all, or a
+// full pre-strip): the poison is then just the same old history, so the
+// snapshot must not be replaced by the current (larger) id set that includes
+// healthy reasoning appended during the window. The selective case has fresh
+// evidence instead and goes through mergeRejected. (Past the TTL there is
+// nothing to refresh: the entry was already lazily released, and the turn
+// re-learns via noteStripped.)
 func (m *staleMemo) refresh(session string) {
 	if m == nil || session == "" {
 		return
@@ -210,4 +225,86 @@ func (m *staleMemo) noteClean(session string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.last, session)
+}
+
+// mergeRejected learns what a turn whose SELECTIVE pre-strip was rejected
+// anyway proves about the upstream's dead references, so the next turn
+// pre-strips them too instead of paying this same 400 + full-strip fallback
+// every turn for the rest of the window. That happens whenever the upstream
+// moves on to a different set of references: a long session, a rewritten
+// history, or simply more items going stale.
+//
+// The proof: the refused body no longer carried the blacklisted ids, and the
+// full strip that finally made the replay succeed removed everything it DID
+// carry. Each of those references is therefore a possible cause, and the
+// gateway cannot tell which one the 400 meant (see collectStaleReasoningIDs),
+// so it records them all. Two kinds are learned, both read from the refused
+// (selectively stripped) body — never from the client's original one:
+//
+//   - reasoning ids not already blacklisted, merged into the entry's set;
+//   - the chain link, when it is non-empty and differs from the remembered
+//     deadPrev. The selective strip only drops the link when it equals
+//     deadPrev (with deadPrev == "" it never drops it at all), so a freshly
+//     issued link survives into the refused body and only the full strip
+//     removes it — which is exactly why a fresh-but-dead link used to stay
+//     unlearnable and cost the 400 again on every turn. One slot is enough: a
+//     client chain link only moves forward, so the link replaced here can
+//     never reappear in a later body.
+//
+// full is never touched: a rejection says nothing about the snapshot being
+// oversized. The per-session id cap still holds — once the blacklist reaches
+// staleMemoMaxIDsPerSession further ids are skipped instead of blowing up
+// memo memory or degrading the entry to full-strip mode. Those skipped ids
+// are NOT picked up later (a later refused body no longer contains the
+// blacklisted ones, so it offers nothing new), so a capped blacklist stays
+// frozen at the cap until the entry disappears — only a TTL expiry or
+// noteClean does that. No session is added here either, so the oldest-half
+// eviction noteStripped performs stays the only one.
+//
+// Nothing is learned without an entry: this is only ever called on the path
+// whose pre-strip came from a snapshot. A missing or TTL-expired entry
+// (released lazily here, honoring the test override via effectiveTTL) is left
+// alone and the turn re-learns with a full snapshot via noteStripped.
+//
+// The full-mode guard is not dead code: this request's own path cannot reach
+// it (doUpstream takes the full pre-strip branch for such entries), but a
+// concurrent request of the same session can install a >cap-id full entry
+// between this turn's snapshot and this write, so the guard stays.
+func (m *staleMemo) mergeRejected(session string, ids []string, prev string) {
+	if m == nil || session == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.last[session]
+	if !ok {
+		return
+	}
+	if ttl := m.effectiveTTL(); time.Since(entry.ts) > ttl {
+		delete(m.last, session)
+		return
+	}
+	// A full-mode entry already strips every reasoning item and the chain
+	// link, so nothing can be learned from it; only the window moves.
+	if !entry.full {
+		if entry.ids == nil {
+			entry.ids = make(map[string]struct{}, len(ids))
+		}
+		for _, id := range ids {
+			if id == "" {
+				continue
+			}
+			if _, known := entry.ids[id]; known {
+				continue
+			}
+			if len(entry.ids) >= staleMemoMaxIDsPerSession {
+				break
+			}
+			entry.ids[id] = struct{}{}
+		}
+		if prev != "" && prev != entry.prev {
+			entry.prev = prev
+		}
+	}
+	entry.ts = time.Now()
 }

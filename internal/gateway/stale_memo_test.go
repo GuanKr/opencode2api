@@ -142,10 +142,14 @@ func TestExpiryReprobeFailureRelearns(t *testing.T) {
 	}
 }
 
-// TestSelectiveFallbackKeepsOldSnapshot locks the in-turn fallback branch
+// TestSelectiveFallbackMergesRejectedIDs locks the in-turn fallback branch
 // without a failing upstream: a selective pre-strip that still 400s falls
-// back to a full strip once, and the success keeps the old blacklist.
-func TestSelectiveFallbackKeepsOldSnapshot(t *testing.T) {
+// back to a full strip once, and the success learns what the refused body
+// carried — its reasoning ids (that rejection is the proof rs_new is dead
+// too) and its chain link (the selective pass keeps any link that is not the
+// remembered dead one, so a fresh link survives into the refused body and only
+// the full strip removes it).
+func TestSelectiveFallbackMergesRejectedIDs(t *testing.T) {
 	var memo staleMemo
 	memo.noteStripped("ses_fb", []string{"rs_old"}, "resp_old")
 	r := testSelectiveRoute()
@@ -163,7 +167,8 @@ func TestSelectiveFallbackKeepsOldSnapshot(t *testing.T) {
 	if got := reasoningIDs(t, sel[config.TierZen]); len(got) != 1 || got[0] != "rs_new" {
 		t.Fatalf("selective strip must keep healthy rs_new, got %v", got)
 	}
-	// Simulate the still-400: the full-strip fallback must drop everything.
+	// Simulate the still-400: the full-strip fallback must drop everything,
+	// the reasoning ids and the chain link alike.
 	fullStripped, changed := stripStaleReasoningInputs(r, sel)
 	if !changed {
 		t.Fatal("fallback full strip must change the selective body")
@@ -171,15 +176,102 @@ func TestSelectiveFallbackKeepsOldSnapshot(t *testing.T) {
 	if got := reasoningIDs(t, fullStripped[config.TierZen]); len(got) != 0 {
 		t.Fatalf("fallback full strip must drop all reasoning, got %v", got)
 	}
-	// Branch semantic under test: refresh only, never snapshot the current
-	// (larger) id set that includes healthy rs_new.
-	memo.refresh("ses_fb")
-	ids2, prev2, _, _ := memo.snapshot("ses_fb")
-	if prev2 != "resp_old" || len(ids2) != 1 {
-		t.Fatalf("fallback must keep the old blacklist, got ids=%v prev=%q", ids2, prev2)
+	// Branch semantic under test: what is learned comes from the refused
+	// body (what the selective strip produced), NOT from the client's larger
+	// body — healthy rs_new is only ever learned because the upstream rejected
+	// it, and the fresh link is only ever learned because it survived into
+	// the refused body and the full strip removed it.
+	rejectedIDs, rejectedPrev := collectStaleReasoningIDs(sel[config.TierZen])
+	if len(rejectedIDs) != 1 || rejectedIDs[0] != "rs_new" {
+		t.Fatalf("the refused body must yield only the un-blacklisted id, got ids=%v prev=%q", rejectedIDs, rejectedPrev)
 	}
-	if _, ok := ids2["rs_old"]; !ok {
-		t.Fatalf("fallback must keep the old blacklist, got %v", ids2)
+	if rejectedPrev != "resp_fresh" {
+		t.Fatalf("the refused body must still carry its fresh link, got %q", rejectedPrev)
+	}
+	memo.mergeRejected("ses_fb", rejectedIDs, rejectedPrev)
+	ids2, prev2, full2, ok := memo.snapshot("ses_fb")
+	if !ok || full2 {
+		t.Fatalf("the entry must survive the fallback, got full=%v ok=%v", full2, ok)
+	}
+	if len(ids2) != 2 {
+		t.Fatalf("the rejected id must be learned into the blacklist, got ids=%v", ids2)
+	}
+	for _, want := range []string{"rs_old", "rs_new"} {
+		if _, ok := ids2[want]; !ok {
+			t.Fatalf("the blacklist must hold %s, got %v", want, ids2)
+		}
+	}
+	// The freshly issued link is what the refused body carried and what the
+	// full strip removed, so it replaces the recorded one: a client chain only
+	// moves forward, so the link replaced here can never come back.
+	if prev2 != "resp_fresh" {
+		t.Fatalf("the refused body must be recorded as the dead chain link, got %q", prev2)
+	}
+	// The next turn's selective strip now removes both ids AND that link, so
+	// the refused body shape is gone and the 400 + fallback cannot repeat.
+	sel2, changed := stripSelectiveReasoningInputs(r, map[config.Tier][]byte{config.TierZen: fullBody}, ids2, prev2)
+	if !changed {
+		t.Fatal("the merged blacklist must still strip something")
+	}
+	if got := reasoningIDs(t, sel2[config.TierZen]); len(got) != 0 {
+		t.Fatalf("one pre-strip must now clear every dead id, got %v", got)
+	}
+	var afterSel map[string]any
+	if err := json.Unmarshal(sel2[config.TierZen], &afterSel); err != nil {
+		t.Fatal(err)
+	}
+	if _, still := afterSel["previous_response_id"]; still {
+		t.Fatalf("one pre-strip must now drop the dead link too: %s", sel2[config.TierZen])
+	}
+	// Merging again is a no-op (no duplicates, no link churn, window still
+	// moving). Once the link is recorded the selective pass strips it, so the
+	// next refused body has none and cannot disturb the recorded one.
+	memo.mergeRejected("ses_fb", rejectedIDs, "")
+	ids3, prev3, _, _ := memo.snapshot("ses_fb")
+	if len(ids3) != 2 {
+		t.Fatalf("re-merging the same ids must not duplicate, got %v", ids3)
+	}
+	if prev3 != "resp_fresh" {
+		t.Fatalf("an empty link must not disturb the recorded one, got %q", prev3)
+	}
+}
+
+// TestMergeRejectedRespectsIDCap locks the memory bound: merging never grows
+// a session past staleMemoMaxIDsPerSession and never flips the entry into
+// full-strip mode, because a rejection says nothing about the snapshot being
+// oversized.
+func TestMergeRejectedRespectsIDCap(t *testing.T) {
+	var memo staleMemo
+	// Seed one below the cap so the merge has exactly one slot of headroom:
+	// everything past that slot must be refused.
+	big := make([]string, 0, staleMemoMaxIDsPerSession)
+	for i := 0; i < staleMemoMaxIDsPerSession-1; i++ {
+		big = append(big, fmt.Sprintf("rs_big_%04d", i))
+	}
+	memo.noteStripped("ses_cap", big, "resp_old")
+	extra := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		extra = append(extra, fmt.Sprintf("rs_extra_%04d", i))
+	}
+	memo.mergeRejected("ses_cap", extra, "")
+	ids, prev, full, ok := memo.snapshot("ses_cap")
+	if !ok || full {
+		t.Fatalf("the entry must survive a capped merge in selective mode, got full=%v ok=%v", full, ok)
+	}
+	if len(ids) != staleMemoMaxIDsPerSession {
+		t.Fatalf("merge must stop at the per-session cap, got %d ids", len(ids))
+	}
+	if prev != "resp_old" {
+		t.Fatalf("merge must not touch the chain link, got %q", prev)
+	}
+	if _, added := ids["rs_extra_0000"]; !added {
+		t.Fatal("ids must be merged in order until the cap is reached")
+	}
+	if _, over := ids["rs_extra_0001"]; over {
+		t.Fatal("ids past the cap must not be stored")
+	}
+	if !memo.shouldPrestrip("ses_cap") {
+		t.Fatal("a capped merge must still leave the session pre-stripping")
 	}
 }
 
@@ -219,13 +311,14 @@ func TestStaleMemoEvictsOldestHalf(t *testing.T) {
 
 // TestRememberStaleHistoryWritePath locks the memo write branch of the
 // self-heal: the first poison snapshots the failing body's ids and chain
-// link, and a later poison of a LARGER body (healthy ids appended since)
-// refreshes the window instead of blacklisting the new ids.
+// link, while later turns that carry NO evidence that the blacklist is
+// incomplete (no pre-strip, or a full one) refresh the window instead of
+// blacklisting the new ids.
 func TestRememberStaleHistoryWritePath(t *testing.T) {
 	g, _, _, _ := staleStubGateway(t)
 	failing := mustStaleBody(t, "resp_old", []string{"rs_old", "rs_dup", "rs_dup"})
 
-	g.rememberStaleHistory("ses_write", failing)
+	g.rememberStaleHistory("ses_write", failing, "")
 	ids, prev, full, ok := g.staleMemo.snapshot("ses_write")
 	if !ok || full || prev != "resp_old" || len(ids) != 2 {
 		t.Fatalf("first poison must snapshot the failing body, got ids=%v prev=%q full=%v ok=%v", ids, prev, full, ok)
@@ -239,7 +332,7 @@ func TestRememberStaleHistoryWritePath(t *testing.T) {
 
 	// Same session, later turn, bigger failing body: rs_new is healthy
 	// reasoning appended inside the window and must not be blacklisted.
-	g.rememberStaleHistory("ses_write", mustStaleBody(t, "resp_old", []string{"rs_old", "rs_new"}))
+	g.rememberStaleHistory("ses_write", mustStaleBody(t, "resp_old", []string{"rs_old", "rs_new"}), "")
 	ids, prev, _, ok = g.staleMemo.snapshot("ses_write")
 	if !ok || prev != "resp_old" || len(ids) != 2 {
 		t.Fatalf("repeat poison must keep the old blacklist, got ids=%v prev=%q ok=%v", ids, prev, ok)
@@ -248,13 +341,24 @@ func TestRememberStaleHistoryWritePath(t *testing.T) {
 		t.Fatalf("healthy id appended inside the window must not be blacklisted, got %v", ids)
 	}
 
+	// A full pre-strip is not evidence either: it removes everything, so a
+	// rejection afterwards says nothing about which ids are dead.
+	g.rememberStaleHistory("ses_write", mustStaleBody(t, "resp_old", []string{"rs_old", "rs_new2"}), "full")
+	ids, prev, full, ok = g.staleMemo.snapshot("ses_write")
+	if !ok || full || prev != "resp_old" || len(ids) != 2 {
+		t.Fatalf("a full pre-strip failure must keep the old blacklist, got ids=%v prev=%q full=%v ok=%v", ids, prev, full, ok)
+	}
+	if _, blacklisted := ids["rs_new2"]; blacklisted {
+		t.Fatalf("a full pre-strip failure must not blacklist anything new, got %v", ids)
+	}
+
 	// noteClean (a clean turn) forgets the session, so the next poison is a
 	// first poison again and re-snapshots the current body.
 	g.staleMemo.noteClean("ses_write")
 	if g.staleMemo.shouldPrestrip("ses_write") {
 		t.Fatal("cleaned session must not pre-strip")
 	}
-	g.rememberStaleHistory("ses_write", mustStaleBody(t, "resp_fresh", []string{"rs_new"}))
+	g.rememberStaleHistory("ses_write", mustStaleBody(t, "resp_fresh", []string{"rs_new"}), "")
 	ids, prev, _, ok = g.staleMemo.snapshot("ses_write")
 	if !ok || prev != "resp_fresh" || len(ids) != 1 {
 		t.Fatalf("after a clean turn the next poison must re-snapshot, got ids=%v prev=%q ok=%v", ids, prev, ok)

@@ -52,8 +52,12 @@ type RequestMeta struct {
 	PrestripMode string
 	// PrestripIDs is the number of blacklisted reasoning ids stored for
 	// this session: the selective first-attempt blacklist size, or the
-	// size recorded by an in-turn self-heal retry. Zero for full strips
-	// and for requests without reasoning surgery.
+	// size recorded by an in-turn self-heal retry. Note the two differ
+	// when a selective pre-strip was rejected and its full-strip fallback
+	// then succeeded: that write learns the ids the refused body carried
+	// before re-publishing the size, so the reported number is the
+	// post-merge one, not the one the first attempt was stripped with.
+	// Zero for full strips and for requests without reasoning surgery.
 	PrestripIDs    int
 	Usage          protocol.Usage
 	UsageReported  bool
