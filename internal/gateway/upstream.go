@@ -707,6 +707,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 // and extra client tools are allowed.
 var anonymousCoreTools = []string{"shell", "edit", "glob", "grep", "read"}
 
+// anonymousGateSaturators are the names a genuine definition can be appended
+// under when the client occupies every core name. Non-core, because the gate
+// wants a core name present: measured 2026-10-15 against /inference, a genuine
+// non-core definition next to a client core stub returns 200, while the same
+// definition next to nothing, or next to a stub on an unrecognised name, is
+// rejected with 403 FreeTierError. Tried in a fixed order and skipped when the
+// client already claims the name, so the choice never moves between turns.
+var anonymousGateSaturators = []string{"execute", "webfetch", "websearch", "question", "skill", "subagent"}
+
 // opencodeToolsJSON holds the genuine OpenCode tool definitions (description
 // and JSON schema) captured from the official client. At least one of them has
 // to reach the free tier intact: a request whose tools are all stubs — even
@@ -817,10 +826,16 @@ func ensureAnonymousChatUsage(payload map[string]any, protocol wire.Protocol) bo
 //
 // A missing, null or non-list "tools" is filled with the whole core set rather
 // than forwarded: the gate rejects the request either way, so there is nothing
-// to preserve. The one destructive case left is a client that occupies every
-// core name with its own schema and keeps none of them genuine; that request
-// would be rejected outright, so exactly one entry is traded for the real
-// definition to keep it alive.
+// to preserve.
+//
+// A client can occupy every core name with its own schema and keep none of them
+// genuine. That request still needs one genuine definition, and appending one
+// under a name the client did not claim satisfies the gate (measured 2026-10-15)
+// without touching anything the client sent — so that is what happens, and the
+// gateway stops overwriting client tools entirely. Only a client that already
+// claims every saturator name as well falls through to trading one entry, which
+// keeps the "a genuine definition always reaches the upstream" invariant true
+// without qualification.
 //
 // Whenever the gateway provides definitions of its own, a system-level note
 // marks them as placeholders so the model does not emit calls the client cannot
@@ -849,14 +864,23 @@ func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
 	if carriesGenuineDefinition(protocol, items) {
 		return false
 	}
-	// The victim is the first core name in the gateway's own order, not the last
-	// core entry in the client's array. Client tool order is not something the
-	// gateway controls and commonly varies between turns; a target that moves
-	// would churn the upstream prompt-cache prefix and make the damage
-	// unpredictable. "shell" goes first because it is the core name a client
-	// most plausibly renamed to something of its own, and losing it costs the
-	// least — the client keeps its own file tools, which are the ones whose
-	// parameter names this whole change exists to protect.
+	// Nothing genuine is present and nothing is missing, so the gate needs a real
+	// definition. Appending one under a name the client did not claim costs the
+	// client nothing but a placeholder it is told about in the note.
+	for _, name := range anonymousGateSaturators {
+		if present[name] {
+			continue
+		}
+		items = append(items, anonymousTool(protocol, name))
+		payload["tools"] = items
+		noteSystemSlot(payload, protocol, injectedToolNote())
+		return true
+	}
+	// Last resort, and it needs a client that declares every name above as well:
+	// trade one entry for the real definition. The victim is the first core name
+	// in the gateway's own order, never the client's last entry — client tool
+	// order varies between turns, and a target that moves would churn the
+	// prompt-cache prefix.
 	for _, core := range anonymousCoreTools {
 		for index, item := range items {
 			if anonymousToolName(protocol, item) != core {
