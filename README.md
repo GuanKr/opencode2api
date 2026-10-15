@@ -338,7 +338,7 @@ The per-attempt header timeout is capped by the request timeout. Set it below th
 | ----------------------------- | ------------------------------------------------------------- |
 | `logging.level`               | `info`; accepts `debug`, `info`, `warn`, `error`.             |
 | `logging.ring_size`           | `2000`; range 100–50,000.                                     |
-| `logging.dump_request_bodies` | `false`. Requires `debug` logging to emit outbound bodies.    |
+| `logging.dump_request_bodies` | `false`. Requires `debug` logging to emit outbound bodies: one record per tier before lane shaping (`phase=client`) and the bytes actually sent (`phase=shaped`). |
 | `webui.enabled`               | `false` when omitted; the example sets it to `true`.          |
 | `webui.listen`                | `0.0.0.0:8081`.                                               |
 | `webui.username`              | Required when the WebUI is enabled; the example uses `admin`. |

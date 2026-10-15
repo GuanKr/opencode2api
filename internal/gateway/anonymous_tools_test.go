@@ -106,7 +106,9 @@ func mustTools(t *testing.T, payload map[string]any) []any {
 
 // 2026-10-15: a client that declared nothing at all received tool_calls for
 // read, which it cannot execute. The gateway now marks the definitions it
-// provides as placeholders in the system slot.
+// appends as placeholders in the system slot. The same note is what keeps a
+// client whose own tools carry a core name honest: it credits those
+// declarations instead of calling them placeholders too.
 func TestAnonymousShapingNotesInjectedTools(t *testing.T) {
 	payload := shapedPayload(t, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, wire.Chat)
 
@@ -118,9 +120,14 @@ func TestAnonymousShapingNotesInjectedTools(t *testing.T) {
 	if want := strings.Join(anonymousCoreTools, ", "); !strings.Contains(system, want) {
 		t.Fatalf("system text %q does not name the core tools as %q", system, want)
 	}
-	// The operative sentence is the whole measured benefit: rewrite it into
+	// The operative sentences are the measured benefit plus the promise this
+	// gateway now makes about the client's own tools. Rewrite any of them into
 	// something empty and this has to go red.
-	for _, want := range []string{"placeholders", "answer directly instead of calling a placeholder"} {
+	for _, want := range []string{
+		"do not call them",
+		"keeps exactly the parameters it declared",
+		"answer directly instead of calling a placeholder",
+	} {
 		if !strings.Contains(system, want) {
 			t.Fatalf("system text %q is missing %q", system, want)
 		}
@@ -141,9 +148,52 @@ func TestAnonymousShapingNoteTextIsStableAcrossRequests(t *testing.T) {
 	}
 }
 
-// The note must not appear when the client already carries every core tool:
-// that traffic is a real agent session and its system prompt is its own.
-func TestAnonymousShapingLeavesCompleteAgentAlone(t *testing.T) {
+// A client that already carries a genuine definition satisfies the gate on its
+// own, so the gateway must add nothing: that traffic is a real agent session
+// and its system prompt stays its own.
+func TestAnonymousShapingLeavesGenuineClientAlone(t *testing.T) {
+	tools := make([]any, 0, len(anonymousCoreTools))
+	for _, name := range anonymousCoreTools {
+		tools = append(tools, chatClientTool(name, "Agent tool "+name))
+	}
+	genuine, _ := knownOpencodeTool("read")
+	for index, item := range tools {
+		entry, _ := item.(map[string]any)
+		if jsonutil.StringAt(entry, "function", "name") != "read" {
+			continue
+		}
+		tools[index] = map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "read",
+				"description": genuine.Description,
+				"parameters":  genuine.Parameters,
+			},
+		}
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(mustJSON(t, map[string]any{
+		"model":    "m",
+		"messages": []any{map[string]any{"role": "system", "content": "you are an agent"}},
+		"tools":    tools,
+	}), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if ensureAnonymousTools(payload, wire.Chat) {
+		t.Fatalf("shaping reported a change, want the request forwarded untouched: %v", toolSummaries(t, payload))
+	}
+	if got := chatSystemText(t, payload); got != "you are an agent" {
+		t.Fatalf("system text = %q, want the client prompt untouched", got)
+	}
+	if got := len(mustTools(t, payload)); got != len(anonymousCoreTools) {
+		t.Fatalf("tools = %d, want %d", got, len(anonymousCoreTools))
+	}
+}
+
+// The one destructive case left: the client occupies every core name and keeps
+// none of them genuine, so the free tier would reject the request. Exactly one
+// entry is traded for the real definition; the other four survive untouched.
+func TestAnonymousShapingTradesOneNameWhenNoGenuineIsPresent(t *testing.T) {
 	tools := make([]any, 0, len(anonymousCoreTools))
 	for _, name := range anonymousCoreTools {
 		tools = append(tools, chatClientTool(name, "Agent tool "+name))
@@ -157,13 +207,37 @@ func TestAnonymousShapingLeavesCompleteAgentAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !ensureAnonymousTools(payload, wire.Chat) {
-		t.Fatalf("shaping reported no change, want the core definitions replaced")
-	}
-	if got := chatSystemText(t, payload); got != "you are an agent" {
-		t.Fatalf("system text = %q, want the client prompt untouched", got)
+		t.Fatal("shaping reported no change, want the gate satisfied")
 	}
 	if got := len(mustTools(t, payload)); got != len(anonymousCoreTools) {
 		t.Fatalf("tools = %d, want %d", got, len(anonymousCoreTools))
+	}
+	survivors, genuine := 0, 0
+	for _, item := range mustTools(t, payload) {
+		if toolDescription(t, wire.Chat, item) == "Agent tool "+toolName(t, wire.Chat, item) {
+			survivors++
+			continue
+		}
+		genuine++
+	}
+	if survivors != len(anonymousCoreTools)-1 || genuine != 1 {
+		t.Fatalf("client definitions = %d, genuine = %d, want %d and 1", survivors, genuine, len(anonymousCoreTools)-1)
+	}
+	// The victim is the gateway's own first core name, never the client's last
+	// entry: client tool order varies between turns, and a moving target would
+	// churn the prompt-cache prefix.
+	if shell := findToolOrNil(t, mustTools(t, payload), "shell"); shell == nil ||
+		toolDescription(t, wire.Chat, shell) == "Agent tool shell" {
+		t.Fatalf("shell was not the trade target: %v", toolSummaries(t, payload))
+	}
+	system := chatSystemText(t, payload)
+	if !strings.Contains(system, "replaced that tool's definition") {
+		t.Fatalf("system text = %q, want the note to admit it replaced a client definition", system)
+	}
+	// The append-only promise is exactly what the trade gave up, so it must not
+	// appear here: it would send the model to call a tool with the wrong names.
+	if strings.Contains(system, "keeps exactly the parameters it declared") {
+		t.Fatalf("the trade branch must not promise the client's parameters survived: %q", system)
 	}
 }
 
@@ -262,29 +336,110 @@ func TestAnonymousShapingKeepsClientSchemaForNonCoreNames(t *testing.T) {
 	}
 }
 
-// A core name the client declared is still replaced: measured, a request whose
-// only recognised tool carries a client schema loses its 403.
-func TestAnonymousShapingReplacesCoreNamesOnly(t *testing.T) {
-	payload := map[string]any{
+// The shape a real client sends: core names carrying the client's own
+// parameters — OpenCode spells its path argument "path", most harnesses spell
+// it "file_path" — next to a non-core tool. Those definitions have to reach the
+// upstream untouched; only the core names the client left out may be appended.
+// Replacing one would aim the model at a call the client cannot execute, which
+// is a worse failure than the phantom tool the note warns about.
+func TestAnonymousShapingKeepsClientCoreDefinitions(t *testing.T) {
+	var payload map[string]any
+	if err := json.Unmarshal(mustJSON(t, map[string]any{
+		"model":    "m",
 		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
 		"tools": []any{
-			chatClientTool("read", "client read"),
+			map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        "read",
+					"description": "Read a UTF-8 text file and return line-numbered content.",
+					"parameters": map[string]any{
+						"type":       "object",
+						"properties": map[string]any{"file_path": map[string]any{"type": "string"}},
+						"required":   []any{"file_path"},
+					},
+				},
+			},
+			chatClientTool("edit", "client edit"),
 			chatClientTool("execute", "client execute"),
 		},
+	}), &payload); err != nil {
+		t.Fatal(err)
 	}
 	if !ensureAnonymousTools(payload, wire.Chat) {
-		t.Fatal("shaping reported no change")
+		t.Fatal("shaping reported no change, want the missing core names appended")
 	}
-	descriptions := map[string]string{}
+
+	items := mustTools(t, payload)
+	summaries := toolSummaries(t, payload)
+	if got := summaries["read"]; got != "Read a UTF-8 text file and return line-numbered content." {
+		t.Fatalf("read description = %q, want the client's own definition", got)
+	}
+	if got := summaries["edit"]; got != "client edit" {
+		t.Fatalf("edit description = %q, want the client's own definition", got)
+	}
+	if got := summaries["execute"]; got != "client execute" {
+		t.Fatalf("execute description = %q, want the client's own definition", got)
+	}
+	read, ok := findTool(t, items, "read")
+	if !ok {
+		t.Fatalf("the client's read tool is gone: %v", summaries)
+	}
+	if !hasKey(read, "function", "parameters", "properties", "file_path") {
+		t.Fatalf("read lost its own parameter: %v", read)
+	}
+	if hasKey(read, "function", "parameters", "properties", "path") {
+		t.Fatalf("read was rewritten to the OpenCode schema: %v", read)
+	}
+
+	// Only the names the client left out may be added, and they have to arrive
+	// genuine or the free tier rejects the request outright.
+	added := []string{"shell", "glob", "grep"}
+	if got := len(items); got != 3+len(added) {
+		t.Fatalf("tools = %d, want the client's 3 plus the %d missing core names: %v", got, len(added), summaries)
+	}
+	for _, name := range added {
+		entry := findToolOrNil(t, items, name)
+		definition, known := knownOpencodeTool(name)
+		if entry == nil {
+			t.Fatalf("%s is missing, the gate needs every core name: %v", name, summaries)
+		}
+		if !known || toolDescription(t, wire.Chat, entry) != definition.Description {
+			t.Fatalf("%s did not arrive genuine: %v", name, entry)
+		}
+	}
+}
+
+func findTool(t *testing.T, items []any, name string) (map[string]any, bool) {
+	t.Helper()
+	entry := findToolOrNil(t, items, name)
+	return entry, entry != nil
+}
+
+func findToolOrNil(t *testing.T, items []any, name string) map[string]any {
+	t.Helper()
+	for _, item := range items {
+		if toolName(t, wire.Chat, item) != name {
+			continue
+		}
+		entry, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("tool entry %q is %T, want an object", name, item)
+		}
+		return entry
+	}
+	return nil
+}
+
+// toolSummaries maps each declared tool to its description so a failure message
+// shows what actually reached the request.
+func toolSummaries(t *testing.T, payload map[string]any) map[string]string {
+	t.Helper()
+	summaries := map[string]string{}
 	for _, item := range mustTools(t, payload) {
-		descriptions[toolName(t, wire.Chat, item)] = toolDescription(t, wire.Chat, item)
+		summaries[toolName(t, wire.Chat, item)] = toolDescription(t, wire.Chat, item)
 	}
-	if descriptions["read"] == "client read" {
-		t.Fatalf("core tool read kept the client definition: %v", descriptions)
-	}
-	if descriptions["execute"] != "client execute" {
-		t.Fatalf("execute = %q, want the client's own definition", descriptions["execute"])
-	}
+	return summaries
 }
 
 // A tools slot the gateway cannot read is filled rather than forwarded: the
@@ -453,7 +608,8 @@ func TestAnonymousShapingIsIdempotent(t *testing.T) {
 		"anthropic plain":    `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 		"anthropic blocks":   `{"model":"m","system":[{"type":"text","text":"be terse"}],"messages":[{"role":"user","content":"hi"}]}`,
 		"client write only":  `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"write","description":"client"}}]}`,
-		"client all core":    `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"read","description":"client"}}]}`,
+		"client read only":   `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"read","description":"client"}}]}`,
+		"client all stubs":   `{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"shell","description":"Agent tool shell"}},{"type":"function","function":{"name":"edit","description":"Agent tool edit"}},{"type":"function","function":{"name":"glob","description":"Agent tool glob"}},{"type":"function","function":{"name":"grep","description":"Agent tool grep"}},{"type":"function","function":{"name":"read","description":"Agent tool read"}}]}`,
 		"systemone decision": `{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 	} {
 		for _, protocol := range []wire.Protocol{wire.Chat, wire.Responses, wire.Anthropic, wire.SystemOne} {
@@ -471,7 +627,8 @@ func TestAnonymousShapingIsIdempotent(t *testing.T) {
 			if !bytes.Equal(once, twice) {
 				t.Fatalf("%s/%s: second pass changed the body:\n%s\n%s", name, protocol, once, twice)
 			}
-			if got := bytes.Count(twice, []byte("placeholders")); got > 1 {
+			// The note text names placeholders more than once, so count its marker instead.
+			if got := bytes.Count(twice, []byte("[gateway]")); got > 1 {
 				t.Fatalf("%s/%s: note appears %d times", name, protocol, got)
 			}
 		}
@@ -485,4 +642,118 @@ func mustJSON(t *testing.T, value any) []byte {
 		t.Fatal(err)
 	}
 	return encoded
+}
+
+// protocolStubTool renders a placeholder definition in the shape its protocol
+// uses, so a case under test cannot accidentally pass because the shape was
+// wrong. It is the genuine renderer with the description marked as a stub.
+func protocolStubTool(protocol wire.Protocol, name string) map[string]any {
+	entry := anonymousTool(protocol, name)
+	if protocol == wire.Chat {
+		entry["function"].(map[string]any)["description"] = "Agent tool " + name
+		return entry
+	}
+	entry["description"] = "Agent tool " + name
+	return entry
+}
+
+func protocolStubToolset(protocol wire.Protocol) []any {
+	tools := make([]any, 0, len(anonymousCoreTools))
+	for _, name := range anonymousCoreTools {
+		tools = append(tools, protocolStubTool(protocol, name))
+	}
+	return tools
+}
+
+func protocolPayload(t *testing.T, protocol wire.Protocol, tools []any) (map[string]any, []byte) {
+	t.Helper()
+	body := mustJSON(t, map[string]any{
+		"model":    "m",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"tools":    tools,
+	})
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload, body
+}
+
+// The predicate that keeps a real client untouched is protocol-shaped, and
+// Anthropic hides its schema under input_schema while Responses keeps
+// parameters at the top. Reading the wrong key would silently disable the
+// short-circuit on that protocol and start trading a client tool on every
+// request, so all three shapes are pinned here.
+func TestAnonymousShapingGenuineShortCircuitPerProtocol(t *testing.T) {
+	for _, protocol := range []wire.Protocol{wire.Chat, wire.Responses, wire.Anthropic} {
+		t.Run(string(protocol), func(t *testing.T) {
+			tools := protocolStubToolset(protocol)
+			// One genuine entry is all the gate needs; the rest stay the client's.
+			tools[3] = anonymousTool(protocol, "grep")
+
+			payload, before := protocolPayload(t, protocol, tools)
+			if ensureAnonymousTools(payload, protocol) {
+				t.Fatalf("shaping reported a change although a genuine definition was present: %v",
+					payload["tools"])
+			}
+			if after := mustJSON(t, payload); !bytes.Equal(before, after) {
+				t.Fatalf("payload changed although nothing had to be appended:\nbefore %s\nafter  %s", before, after)
+			}
+		})
+	}
+}
+
+// The trade branch is the one place the gateway overwrites a client entry, so it
+// has to behave the same way on every protocol: exactly one victim, always the
+// gateway's own first core name, and a note that admits the replacement.
+func TestAnonymousShapingTradesOneNamePerProtocol(t *testing.T) {
+	for _, protocol := range []wire.Protocol{wire.Chat, wire.Responses, wire.Anthropic} {
+		t.Run(string(protocol), func(t *testing.T) {
+			payload, _ := protocolPayload(t, protocol, protocolStubToolset(protocol))
+			if !ensureAnonymousTools(payload, protocol) {
+				t.Fatal("shaping reported no change although no genuine definition was present")
+			}
+			items := mustTools(t, payload)
+			if len(items) != len(anonymousCoreTools) {
+				t.Fatalf("tools = %d, want %d", len(items), len(anonymousCoreTools))
+			}
+			replaced := map[string]bool{}
+			for _, name := range anonymousCoreTools {
+				for _, item := range items {
+					if anonymousToolName(protocol, item) != name {
+						continue
+					}
+					if description := anonymousToolDescription(protocol, item.(map[string]any)); description != "Agent tool "+name {
+						replaced[name] = true
+					}
+				}
+			}
+			if len(replaced) != 1 {
+				t.Fatalf("replaced %v, want exactly one entry traded", replaced)
+			}
+			if !replaced["shell"] {
+				t.Fatalf("the victim was %v, want the gateway's own first core name", replaced)
+			}
+			if note := protocolSystemText(t, protocol, payload); strings.Contains(note, "keeps exactly the parameters it declared") {
+				t.Fatalf("the trade branch must not promise the client's parameters survived: %q", note)
+			} else if !strings.Contains(note, "replaced that tool's definition") {
+				t.Fatalf("system text = %q, want the note to admit the replacement", note)
+			}
+		})
+	}
+}
+
+// protocolSystemText reads the slot each protocol carries the note in.
+func protocolSystemText(t *testing.T, protocol wire.Protocol, payload map[string]any) string {
+	t.Helper()
+	switch protocol {
+	case wire.Responses:
+		text, _ := payload["instructions"].(string)
+		return text
+	case wire.Anthropic:
+		text, _ := payload["system"].(string)
+		return text
+	default:
+		return chatSystemText(t, payload)
+	}
 }

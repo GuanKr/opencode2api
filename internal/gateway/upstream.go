@@ -537,7 +537,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	var lastErr error
 	effectiveRoute := route
 	attempts := attemptOffset
-	g.dumpOutboundBodies(route, bodies, ids, attemptOffset)
+	g.dumpClientBodies(route, bodies, ids, attemptOffset)
 	if override, selected := debugKeyOverrideFrom(ctx); selected {
 		resp, err, used := g.doSelectedKeyUpstream(ctx, route, bodies, ids, override, attemptOffset)
 		return resp, route, used, err
@@ -616,6 +616,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// collapses the stream back when the downstream client asked for a plain
 	// JSON reply. Key tiers keep their original bodies.
 	body = prepareAnonymousBody(body, route.ProtocolFor(config.TierZen))
+	g.dumpOutboundBody(route, config.TierZen, body, ids, shapedDumpPhase(attemptOffset))
 	for attempts < limit {
 		if ctx.Err() != nil {
 			// The request-level budget is already gone. Stop scanning instead
@@ -694,28 +695,30 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 // while 429 ("Rate limit exceeded") is the separate quota signal — do not read
 // the 403 as "this exit IP is blocked".
 //
-// That is why the genuine definitions are embedded and why a client schema on a
-// core name is replaced. It is not measured that "bash" — the pre-2.x spelling —
-// is simply a name the tier does not recognise; the only evidence is that
-// requests carrying it instead of "shell" were rejected, which is equally
-// consistent with the gate wanting a recognised name present at all. Tool order
-// is irrelevant and extra client tools are allowed.
+// What the gate needs is one genuine definition, not five: a client schema on a
+// recognised name passes as long as some other entry stays genuine. So the
+// gateway appends the core names the client left out and never rewrites an entry
+// the client did declare: a replaced definition makes the model call a tool with
+// parameters the client does not implement, which is worse than the placeholder
+// the note warns about. It is not measured that "bash", the pre-2.x spelling, is
+// simply a name the tier does not recognise; the only evidence is that requests
+// carrying it instead of "shell" were rejected, which is equally consistent with
+// the gate wanting a recognised name present at all. Tool order is irrelevant
+// and extra client tools are allowed.
 var anonymousCoreTools = []string{"shell", "edit", "glob", "grep", "read"}
 
 // opencodeToolsJSON holds the genuine OpenCode tool definitions (description
 // and JSON schema) captured from the official client. At least one of them has
 // to reach the free tier intact: a request whose tools are all stubs — even
 // under the right names — is rejected with 403 FreeTierError. The gateway ships
-// the real definitions and uses them for the tools it injects and for any core
-// tool the downstream client declared under the same name; recognised names
-// outside the core set keep the client's own schema.
+// the real definitions for the tools it appends; whatever the client declared is
+// forwarded exactly as declared.
 //
 // The descriptions are the Windows variants the official client emits on this
 // platform (the CLI builds them as `Commands run on ${OS} using ${shell}.`),
-// and they pass as-is. A gateway running on Linux or macOS still substitutes
-// them for a client-declared core tool, so a Linux client's own "shell"
-// description is replaced by the Windows one; that is the price of the gate,
-// and the placeholder note warns the model off those tools.
+// and they pass as-is. A gateway running on Linux or macOS still injects that
+// Windows wording, so an injected "shell" describes PowerShell to every client;
+// the placeholder note warns the model off those definitions.
 //
 //go:embed opencode_tools.json
 var opencodeToolsJSON []byte
@@ -798,64 +801,74 @@ func ensureAnonymousChatUsage(payload map[string]any, protocol wire.Protocol) bo
 	return true
 }
 
-// ensureAnonymousTools makes the tool list read as an agent session: the core
-// tools carry their genuine definitions and the missing ones are appended. It
-// reports whether the payload changed. Two rules keep that from damaging the
-// client's own function calling:
+// ensureAnonymousTools makes the tool list pass the free tier's gate without
+// touching what the client declared: the core names the client left out are
+// appended with their genuine definitions, and every entry the client sent is
+// forwarded verbatim. It reports whether the payload changed.
 //
-//   - A core tool the client declared under the same name is replaced with the
-//     genuine definition. Measured 2026-10-15: a request whose only recognised
-//     tool carries a client schema is rejected, so a client that declares
-//     "read" alone would otherwise cost the request its 403.
-//   - A recognised name outside the core set (write, execute, webfetch, ...)
-//     is left exactly as declared. The free tier accepts those next to a
-//     genuine definition, and rewriting them would silently hand the model a
-//     schema the client does not implement.
+// One genuine definition satisfies the gate, so the minimum is always
+// append-only. Replacing a client-declared core tool hands the model a schema
+// the client does not implement — OpenCode spells its path argument "path"
+// where most clients spell it "file_path" — and a wrong argument name fails at
+// execution time, which is a worse outcome than the phantom tool the note warns
+// about. The same reasoning covers a recognised name outside the core set
+// (write, execute, webfetch, ...): the free tier accepts a client definition
+// next to a genuine one, so there is nothing to gain by rewriting it.
 //
-// A missing, null or non-list "tools" is filled with the core set rather than
-// forwarded: the gate rejects the request either way, so there is nothing to
-// preserve.
+// A missing, null or non-list "tools" is filled with the whole core set rather
+// than forwarded: the gate rejects the request either way, so there is nothing
+// to preserve. The one destructive case left is a client that occupies every
+// core name with its own schema and keeps none of them genuine; that request
+// would be rejected outright, so exactly one entry is traded for the real
+// definition to keep it alive.
 //
-// Whenever definitions are appended, a system-level note marks them as
-// placeholders so the model does not emit calls the client cannot execute.
+// Whenever the gateway provides definitions of its own, a system-level note
+// marks them as placeholders so the model does not emit calls the client cannot
+// execute. The trade branch gets its own wording, because there the promise
+// "your client declared it, so its parameters are the ones you must use" is
+// exactly what the trade gave up.
 func ensureAnonymousTools(payload map[string]any, protocol wire.Protocol) bool {
 	items, ok := payload["tools"].([]any)
 	if !ok {
 		payload["tools"] = anonymousToolset(protocol, nil)
-		noteInjectedTools(payload, protocol)
+		noteSystemSlot(payload, protocol, injectedToolNote())
 		return true
 	}
-	changed := false
 	present := make(map[string]bool, len(items))
-	for index, item := range items {
-		name := anonymousToolName(protocol, item)
-		if name == "" {
-			continue
-		}
-		present[name] = true
-		if isAnonymousCoreTool(name) {
-			items[index] = anonymousTool(protocol, name)
-			changed = true
+	for _, item := range items {
+		if name := anonymousToolName(protocol, item); name != "" {
+			present[name] = true
 		}
 	}
-	missing := false
-	for _, name := range anonymousCoreTools {
-		if !present[name] {
-			missing = true
-			break
-		}
-	}
-	if missing {
-		items = append(items, anonymousToolset(protocol, missingCoreTools(present))...)
+	if missing := missingCoreTools(present); len(missing) > 0 {
+		items = append(items, anonymousToolset(protocol, missing)...)
 		payload["tools"] = items
-		noteInjectedTools(payload, protocol)
+		noteSystemSlot(payload, protocol, injectedToolNote())
 		return true
 	}
-	if !changed {
+	if carriesGenuineDefinition(protocol, items) {
 		return false
 	}
-	payload["tools"] = items
-	return true
+	// The victim is the first core name in the gateway's own order, not the last
+	// core entry in the client's array. Client tool order is not something the
+	// gateway controls and commonly varies between turns; a target that moves
+	// would churn the upstream prompt-cache prefix and make the damage
+	// unpredictable. "shell" goes first because it is the core name a client
+	// most plausibly renamed to something of its own, and losing it costs the
+	// least — the client keeps its own file tools, which are the ones whose
+	// parameter names this whole change exists to protect.
+	for _, core := range anonymousCoreTools {
+		for index, item := range items {
+			if anonymousToolName(protocol, item) != core {
+				continue
+			}
+			items[index] = anonymousTool(protocol, core)
+			payload["tools"] = items
+			noteSystemSlot(payload, protocol, tradedToolNote())
+			return true
+		}
+	}
+	return false
 }
 
 func isAnonymousCoreTool(name string) bool {
@@ -877,16 +890,88 @@ func missingCoreTools(present map[string]bool) []string {
 	return missing
 }
 
-// injectedToolNote explains the gateway-provided tools to the model. Measured
-// 2026-10-15: before this note a client that declared no tools still received
-// tool_calls for read (finish_reason=tool_calls, 1 of 1 request); with it a
-// neutral question produced none. A prompt that explicitly tells the model to
-// use a tool still gets one — that is the client asking, not a ghost call.
+// carriesGenuineDefinition reports whether one of the client's own entries is
+// already the genuine OpenCode definition. That request satisfies the gate as it
+// stands, so the gateway appends nothing to it and its system prompt stays its
+// own.
+func carriesGenuineDefinition(protocol wire.Protocol, items []any) bool {
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		definition, known := knownOpencodeTool(anonymousToolName(protocol, entry))
+		if !known {
+			continue
+		}
+		if anonymousToolDescription(protocol, entry) != definition.Description {
+			continue
+		}
+		if sameJSONDocument(definition.Parameters, anonymousToolSchema(protocol, entry)) {
+			return true
+		}
+	}
+	return false
+}
+
+// anonymousToolDescription and anonymousToolSchema read a tool entry in the
+// shape its protocol uses: Chat nests both under "function", Anthropic keeps the
+// description at the top and the schema under "input_schema", and Responses
+// keeps both at the top.
+func anonymousToolDescription(protocol wire.Protocol, entry map[string]any) string {
+	if protocol == wire.Chat {
+		return jsonutil.StringAt(entry, "function", "description")
+	}
+	return jsonutil.StringAt(entry, "description")
+}
+
+func anonymousToolSchema(protocol wire.Protocol, entry map[string]any) any {
+	switch protocol {
+	case wire.Chat:
+		return jsonutil.AnyAt(entry, "function", "parameters")
+	case wire.Anthropic:
+		return jsonutil.AnyAt(entry, "input_schema")
+	default:
+		return jsonutil.AnyAt(entry, "parameters")
+	}
+}
+
+// sameJSONDocument compares two decoded JSON values through their canonical
+// encoding, so key order and number spelling cannot make equal schemas look
+// different.
+func sameJSONDocument(left, right any) bool {
+	leftBytes, err := json.Marshal(left)
+	if err != nil {
+		return false
+	}
+	rightBytes, err := json.Marshal(right)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(leftBytes, rightBytes)
+}
+
+// injectedToolNote marks the definitions the gateway itself appended as
+// placeholders so the model does not emit calls the client cannot execute. It
+// is written for the append-only case, where every entry the client sent is
+// still the client's own, and it says so: a coding harness spells its path
+// argument "file_path" where OpenCode spells it "path", and telling the model
+// otherwise pushes it off the tools it can actually run.
+// Measured 2026-10-15: before this note a client that declared no tools still
+// received tool_calls for read (finish_reason=tool_calls, 1 of 1 request); with
+// it a neutral question produced none. A prompt that explicitly tells the model
+// to use a tool still gets one — that is the client asking, not a ghost call.
+// The note is advisory, not enforced: a model can still call a placeholder, so
+// the client has to survive one.
 //
 // The note names the whole core set rather than only what this request
 // appended: a client whose tool declaration varies between turns would
 // otherwise change the system prompt every turn and invalidate the upstream
-// prompt-cache prefix.
+// prompt-cache prefix. It also has to stay true for a client whose own tools
+// carry the same names, which is why it credits the client's declarations
+// explicitly: a coding harness spells its path argument "file_path" where
+// OpenCode spells it "path", and telling the model those tools are placeholders
+// pushes it away from the tools it can actually run.
 //
 // It is a system-level message rather than extra text inside a tool
 // description on purpose: the free tier compares the definitions it
@@ -894,19 +979,38 @@ func missingCoreTools(present map[string]bool) []string {
 // the same day: a client schema on a recognised name is accepted as long as
 // some tool keeps a genuine definition, so a system-only change costs no 403.
 func injectedToolNote() string {
-	return "[gateway] This API gateway provides the tools named " + strings.Join(anonymousCoreTools, ", ") +
-		" because the upstream endpoint requires them; they may differ from what the client expects. " +
-		"Treat them as placeholders: the client may not be able to execute calls to them. " +
-		"Prefer the tools the user gave you; if those are the only tools you have, " +
-		"answer directly instead of calling a placeholder."
+	return "[gateway] This request passed through an API gateway that had to append some of its own " +
+		"tool definitions (the names " + strings.Join(anonymousCoreTools, ", ") + ") because the upstream " +
+		"endpoint requires at least one of them to be present. Definitions the gateway appended are " +
+		"placeholders this client cannot execute: do not call them. Every tool your client declared is " +
+		"real and keeps exactly the parameters it declared, including where its name is one of the " +
+		"placeholders listed above. Prefer your client's own tools; if the only thing left is a " +
+		"placeholder, answer directly instead of calling a placeholder."
 }
 
-// noteInjectedTools merges the note into the payload's system slot, falling
+// tradedToolNote is the wording for the one case where the gateway supplies a
+// definition in place of the client's own entry. It must not promise that the
+// client's parameters survived — that is precisely what the trade gave up — and
+// it must not describe the action as an append, because nothing was appended.
+//
+// It is a system-level message for the same reason as injectedToolNote: the
+// free tier compares the definitions it recognises, so the genuine descriptions
+// must stay byte-identical.
+func tradedToolNote() string {
+	return "[gateway] This request passed through an API gateway that had to supply one of its own " +
+		"tool definitions (the names " + strings.Join(anonymousCoreTools, ", ") + ") because the upstream " +
+		"endpoint requires at least one of them to be present. Most of them are placeholders this client " +
+		"cannot execute: do not call them. Every tool your client declared is real, except one: the " +
+		"gateway replaced that tool's definition, so call it with the parameters it now declares and do " +
+		"not assume they match your client's usual names. Prefer your client's own tools; if the only " +
+		"thing left is a placeholder, answer directly instead of calling a placeholder."
+}
+
+// noteSystemSlot merges note into the payload's system slot, falling
 // back to a fresh slot when the existing one is not plain text. A slot whose
 // value is null counts as empty; one holding some other unusable value is left
 // alone, and the request goes out without a note rather than losing client data.
-func noteInjectedTools(payload map[string]any, protocol wire.Protocol) {
-	note := injectedToolNote()
+func noteSystemSlot(payload map[string]any, protocol wire.Protocol, note string) {
 	switch protocol {
 	case wire.Anthropic:
 		noteAnthropicSystem(payload, note)
@@ -1055,19 +1159,45 @@ func anonymousTool(protocol wire.Protocol, name string) map[string]any {
 // requestBodyDumpLimit caps how much of an outbound body is written to the log.
 const requestBodyDumpLimit = 64 << 10
 
-// dumpOutboundBodies records the exact bytes about to be sent upstream when
-// logging.dump_request_bodies is enabled. It exists so retry and translation
-// problems (stale rs_* references, re-encoded history, tier re-encoding) can be
-// diagnosed without patching the binary. Credentials travel in headers and never
-// in the body. The logger redacts configured secrets, but conversation content
-// can still be sensitive. Reference IDs are retained for replay diagnostics.
-func (g *Gateway) dumpOutboundBodies(route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) {
+// dumpOutboundBody records one request body when logging.dump_request_bodies is
+// enabled. It exists so retry, translation and tool-shaping problems (stale
+// rs_* references, re-encoded history, tier re-encoding, appended core tool
+// definitions, the injected placeholder note) can be diagnosed without patching
+// the binary. Credentials travel in headers and never in the body. The logger
+// redacts configured secrets, but conversation content can still be sensitive.
+// Reference IDs are retained for replay diagnostics.
+//
+// phase says which bytes these are. "client" is what the client sent, before the
+// lane shapes the body; "shaped" is what goes on the wire. Both are logged so the
+// pair can be compared: an equal sha256 proves the lane changed nothing, and a
+// differing one localises the change to one transformation. Logging only the
+// client-side body hides every shaping step, and that is exactly where the tool
+// definitions and the placeholder note live.
+func (g *Gateway) dumpOutboundBody(route models.Route, tier config.Tier, body []byte, ids identity.RequestIDs, phase string) {
+	if !g.cfg.Logging.DumpRequestBodies || len(body) == 0 {
+		return
+	}
+	sum := sha256.Sum256(body)
+	truncated := len(body) > requestBodyDumpLimit
+	payload := body
+	if truncated {
+		payload = body[:requestBodyDumpLimit]
+	}
+	g.logger.Debug("outbound upstream request body", "component", "upstream", "event", "upstream_request_body",
+		"request_id", ids.Request, "model", route.ID, "tier", tier, "protocol", route.ProtocolFor(tier),
+		"phase", phase, "bytes", len(body), "sha256", hex.EncodeToString(sum[:8]),
+		"truncated", truncated, "body", string(payload))
+}
+
+// dumpClientBodies logs the per-tier bodies a request arrived with, before any
+// lane shaping. See dumpOutboundBody for the phase vocabulary.
+func (g *Gateway) dumpClientBodies(route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) {
 	if !g.cfg.Logging.DumpRequestBodies || len(bodies) == 0 {
 		return
 	}
-	phase := "initial"
+	phase := "client"
 	if attemptOffset > 0 {
-		phase = "retry"
+		phase = "client-retry"
 	}
 	tiers := make([]string, 0, len(bodies))
 	for tier := range bodies {
@@ -1075,22 +1205,17 @@ func (g *Gateway) dumpOutboundBodies(route models.Route, bodies map[config.Tier]
 	}
 	sort.Strings(tiers)
 	for _, name := range tiers {
-		tier := config.Tier(name)
-		body := bodies[tier]
-		if len(body) == 0 {
-			continue
-		}
-		sum := sha256.Sum256(body)
-		truncated := len(body) > requestBodyDumpLimit
-		payload := body
-		if truncated {
-			payload = body[:requestBodyDumpLimit]
-		}
-		g.logger.Debug("outbound upstream request body", "component", "upstream", "event", "upstream_request_body",
-			"request_id", ids.Request, "model", route.ID, "tier", tier, "protocol", route.ProtocolFor(tier),
-			"phase", phase, "bytes", len(body), "sha256", hex.EncodeToString(sum[:8]),
-			"truncated", truncated, "body", string(payload))
+		g.dumpOutboundBody(route, config.Tier(name), bodies[config.Tier(name)], ids, phase)
 	}
+}
+
+// shapedDumpPhase names the shaped-phase line so a retry stays distinguishable
+// from the first attempt, the way the client-side phase does.
+func shapedDumpPhase(attemptOffset int) string {
+	if attemptOffset > 0 {
+		return "shaped-retry"
+	}
+	return "shaped"
 }
 
 // shapeKeyBody normalizes key-tier free-model wire bodies to agent shape
@@ -1133,6 +1258,7 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 			meta.Shaped = true
 		}
 	}
+	g.dumpOutboundBody(route, override.Tier, body, ids, shapedDumpPhase(attemptOffset))
 	proxy := nodes.Proxy(node)
 	if proxy == nil {
 		return nil, errors.New("selected upstream key has no proxy binding"), 0
@@ -1181,6 +1307,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			meta.Shaped = true
 		}
 	}
+	g.dumpOutboundBody(route, route.Tier, body, ids, shapedDumpPhase(attemptOffset))
 	for attempts < g.cfg.Retry.MaxAttempts {
 		if ctx.Err() != nil {
 			// Same guard as the anonymous loop: an exhausted request budget
