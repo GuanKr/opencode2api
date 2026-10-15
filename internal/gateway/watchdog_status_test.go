@@ -414,6 +414,122 @@ func TestRefreshSuccessKeepsStaleWithoutSuccessAge(t *testing.T) {
 	}
 }
 
+// A recovered proxy must take its stale transport memory with it: that vote
+// exists only because nothing proved the route back, and a passing proxy
+// health check is exactly the transport-layer proof. Left behind, the feed
+// keeps recommending a switch for up to staleCauseTTL on a node that is
+// demonstrably fine — one needless switch, and probably one switch back.
+func TestRestoreProxyClearsStaleTransportVote(t *testing.T) {
+	pool, node := staleTestPool(t, "transport (connection failed)")
+	g := watchdogTestGateway(watchdogTestTransports(true), pool)
+	before := doWatchdogStatus(t, g)
+	if before.Anonymous.Verdict != "transport" || !before.RecommendSwitch {
+		t.Fatalf("setup must leave a live stale transport vote, got verdict %q switch %v (cause %q)", before.Anonymous.Verdict, before.RecommendSwitch, before.Anonymous.Cause)
+	}
+	if cleared := pool.RestoreProxy(node.proxy); cleared != 1 {
+		t.Fatalf("restore must report the healed node once, got %d", cleared)
+	}
+	// The pre-existing contract still holds: cooldown, counter and its label go.
+	if remain, cause := pool.maxCooldownSnapshot(); remain != 0 || cause != "" {
+		t.Fatalf("restore must clear the cooldown, got %v/%q", remain, cause)
+	}
+	if node.failures.Load() != 0 || node.cooldownUntil.Load() != 0 {
+		t.Fatalf("restore must clear failures and cooldown, got failures %d cooldown %d", node.failures.Load(), node.cooldownUntil.Load())
+	}
+	if stale, _ := node.lastCause.Load().(string); stale != "" || node.causeExpires.Load() != 0 {
+		t.Fatalf("restore must drop the stale cause memory, got %q expiring at %d", stale, node.causeExpires.Load())
+	}
+	after := doWatchdogStatus(t, g)
+	if after.Anonymous.Verdict != "ok" || after.Anonymous.Cause != "" {
+		t.Fatalf("a recovered proxy must read ok again, got verdict %q cause %q", after.Anonymous.Verdict, after.Anonymous.Cause)
+	}
+	if after.RecommendSwitch {
+		t.Fatal("a recovered proxy must not keep recommending a node switch")
+	}
+	if after.Anonymous.CoolingSeconds != 0 {
+		t.Fatalf("restore must leave no cooling behind, got %d s", after.Anonymous.CoolingSeconds)
+	}
+	// User-traffic evidence is untouched: the script still needs a real turn
+	// before it calls the node recovered, and the failure age stays readable.
+	if after.Anonymous.LastFailureAgeS == nil {
+		t.Fatal("restore must not erase the recorded user-traffic failure age")
+	}
+	if after.Anonymous.LastSuccessAgeS != nil {
+		t.Fatalf("restore must not fake a user-traffic success, got %d s", *after.Anonymous.LastSuccessAgeS)
+	}
+}
+
+// The same fix through the real seam: the background health check that judges
+// a proxy recovered (a passed check that saw the proxy unhealthy) is what
+// reaches the pool, not the feed's own logic.
+func TestProxyHealthCheckRestoreClearsStaleTransportVote(t *testing.T) {
+	pool, node := staleTestPool(t, "transport (timeout)")
+	g := watchdogTestGateway(watchdogTestTransports(true), pool)
+	if resp := doWatchdogStatus(t, g); resp.Anonymous.Verdict != "transport" || !resp.RecommendSwitch {
+		t.Fatalf("setup must leave a live stale transport vote, got verdict %q switch %v (cause %q)", resp.Anonymous.Verdict, resp.RecommendSwitch, resp.Anonymous.Cause)
+	}
+	g.applyProxyHealthResult(proxyHealthResult{proxy: node.proxy, err: nil, wasHealthy: false}, "scheduled health check", 0)
+	resp := doWatchdogStatus(t, g)
+	if resp.Anonymous.Verdict != "ok" || resp.RecommendSwitch {
+		t.Fatalf("a passed health check must stop the stale vote, got verdict %q switch %v (cause %q)", resp.Anonymous.Verdict, resp.RecommendSwitch, resp.Anonymous.Cause)
+	}
+}
+
+// A background catalog refresh heals the cooldown but deliberately keeps the
+// stale vote, which leaves the node with zero failures and zero cooldown. The
+// restore must still drop the memory: skipping it as "nothing to clear" would
+// leave a live vote on a proxy already reported healthy.
+func TestRestoreProxyClearsStaleVoteAfterRefreshSuccess(t *testing.T) {
+	pool, node := staleTestPool(t, "transport (connection failed)")
+	pool.markRefreshSuccess(node)
+	if node.failures.Load() != 0 || node.cooldownUntil.Load() != 0 {
+		t.Fatalf("setup must leave nothing but the stale memory, got failures %d cooldown %d", node.failures.Load(), node.cooldownUntil.Load())
+	}
+	if got := pool.staleCauseSnapshot(); got != "transport (connection failed)" {
+		t.Fatalf("background refresh must keep the stale vote, got %q", got)
+	}
+	if cleared := pool.RestoreProxy(node.proxy); cleared != 1 {
+		t.Fatalf("restore must report the cleared stale memory, got %d", cleared)
+	}
+	if got := pool.staleCauseSnapshot(); got != "" {
+		t.Fatalf("restore must drop the stale vote a refresh left behind, got %q", got)
+	}
+}
+
+// The premise that makes dropping a recovered proxy's cause memory safe: the
+// only causes that keep voting after their cooldown lapsed are the ones that
+// classify as transport (staleCauseSnapshot filters the rest), while a quota,
+// ratelimit or fingerprint residue never votes there — so a passing proxy
+// health check, which proves the transport layer only, cannot be masking an
+// allowance problem. If this table ever starts voting a non-transport residue,
+// dropping the memory on restore would hide it and this test goes red.
+func TestStaleVotesAreTransportOnly(t *testing.T) {
+	cases := []struct{ cause, want string }{
+		{"transport (connection failed)", "transport (connection failed)"},
+		{"transport (timeout)", "transport (timeout)"},
+		// A 5xx tail classifies as transport (server-side wobble, not
+		// allowance), so it is votable and is dropped on restore as well.
+		{"upstream error (upstream HTTP 502)", "upstream error (upstream HTTP 502)"},
+		{"FreeUsageLimitError (upstream HTTP 429)", ""},
+		{"BlackUsageLimitError (upstream HTTP 429)", ""},
+		{"RateLimitError (upstream HTTP 429)", ""},
+		{"FreeTierError (upstream HTTP 403)", ""},
+		{"upstream error (upstream HTTP 429)", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		proxy := &proxyTransport{index: 0, name: "direct"}
+		proxy.healthy.Store(true)
+		node := &anonymousNode{proxy: proxy}
+		pool := &anonymousPool{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
+		node.lastCause.Store(tc.cause)
+		node.causeExpires.Store(time.Now().Add(time.Minute).UnixNano())
+		if got := pool.staleCauseSnapshot(); got != tc.want {
+			t.Errorf("cause %q: stale vote = %q, want %q", tc.cause, got, tc.want)
+		}
+	}
+}
+
 // Background catalog failures still cool the lane (unchanged baseline
 // behavior), but they must leave no user-traffic evidence behind: no failure
 // age, no stale transport vote, and a cooling verdict with an empty cause.

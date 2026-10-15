@@ -157,10 +157,34 @@ func (p *anonymousPool) markRefreshSuccess(node *anonymousNode) {
 	node.coolCause.Store("")
 }
 
+// hasCauseMemory reports whether the node still holds cause memory a snapshot
+// can surface: the active coolCause, the stale lastCause, or the deadline that
+// keeps that stale cause voting. Read-only, like the snapshot helpers.
+// markRefreshSuccess clears the cooldown without the stale pair, so a node can
+// reach RestoreProxy with zero failures and zero cooldown yet still be voting.
+func (n *anonymousNode) hasCauseMemory() bool {
+	active, _ := n.coolCause.Load().(string)
+	stale, _ := n.lastCause.Load().(string)
+	return active != "" || stale != "" || n.causeExpires.Load() != 0
+}
+
 // RestoreProxy clears cooldowns for anonymous nodes bound to a recovered
 // proxy, mirroring nodePool.RestoreProxy for key nodes. Without this, an
 // outage-era cooldown survives the proxy's recovery and the anonymous lane
 // stays skipped even though the route is healthy again.
+//
+// The cause memory goes with the cooldown. A proxy only turns unhealthy through
+// isProxyFailure (timeout / connection refused) and only comes back once an
+// HTTP round trip through it succeeds, so a restore is precisely the
+// transport-layer proof staleCauseSnapshot is waiting for: the only causes that
+// can still vote there classify as transport, while a quota or ratelimit
+// residue never votes at all (a proxy health check says nothing about the
+// upstream allowance), so dropping the memory cannot hide a real allowance
+// problem. Keeping it would instead leave the feed reporting transport with
+// recommend_switch for up to staleCauseTTL after the route is demonstrably
+// back, and the watchdog would switch a healthy node once for nothing.
+// lastSuccess and lastFailure stay untouched: they are user-traffic evidence,
+// so the script still has to see a real turn before it calls the node recovered.
 func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
 	if p == nil || proxy == nil {
 		return 0
@@ -170,11 +194,14 @@ func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
 		if node.proxy != proxy {
 			continue
 		}
-		if node.cooldownUntil.Load() == 0 && node.failures.Load() == 0 {
+		if node.cooldownUntil.Load() == 0 && node.failures.Load() == 0 && !node.hasCauseMemory() {
 			continue
 		}
 		node.failures.Store(0)
 		node.cooldownUntil.Store(0)
+		node.coolCause.Store("")
+		node.lastCause.Store("")
+		node.causeExpires.Store(0)
 		cleared++
 	}
 	return cleared
