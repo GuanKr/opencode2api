@@ -260,10 +260,24 @@ func transportCauseShort(err error) string {
 	return "connection failed"
 }
 
-// maxCausePeek bounds the error-body peek behind upstreamErrorType. Console
-// error payloads are small JSON; a huge body only contributes its status code
-// to the cause while the intact original still flows downstream.
-const maxCausePeek = 256 << 10
+// maxCausePeek bounds the error-body peek behind upstreamErrorType. It is
+// deliberately the same 64 KB ceiling httpx.DrainAndClose already charges the
+// gateway when it abandons a response without looking at it: the label is a
+// net addition to a failure path that has to pay for a bounded drain anyway,
+// so peeking must not make the switch to the next exit node wait longer than
+// that drain did. It was 256 KB, which charged four times the drain budget on
+// an unknown-length body: the peek read on to the bound while the upstream was
+// still sending, so the user waited for bytes the label did not need. A
+// console error payload is a small JSON document, so 64 KB remains orders of
+// magnitude more than the class field can need.
+const maxCausePeek = 64 << 10
+
+// causePeekChunk is how much upstreamErrorType pulls between two "do I
+// already hold a complete error document?" checks. It only trades read calls
+// against how much of a slow body is pulled before the first check — the loop
+// below stops as soon as the answer is yes, so a small error body costs one
+// read of at most this size, not the whole bound.
+const causePeekChunk = 4 << 10
 
 // upstreamErrorType returns the upstream error class from a bounded peek of
 // an error body, leaving that body readable in full afterwards so the
@@ -284,20 +298,76 @@ func upstreamErrorType(resp *http.Response) string {
 		return ""
 	}
 	original := resp.Body
-	data, readErr := io.ReadAll(io.LimitReader(original, maxCausePeek+1))
-	if len(data) > maxCausePeek || readErr != nil {
-		// Oversized or truncated peek: only the status is usable, so chain
-		// what was read back in front of the still-open original. A plain
-		// NopCloser here would either drop the remainder (truncating a
-		// passthrough) or swallow the network body (forfeiting connection
-		// reuse) — a prefixedBody propagates Close to the real body.
-		resp.Body = &prefixedBody{Reader: io.MultiReader(bytes.NewReader(data), original), body: original}
+	var prefix bytes.Buffer
+	typ, drained := peekCauseType(&prefix, original)
+	if drained {
+		// EOF with nothing left behind: the passthrough can be served from
+		// the peeked bytes alone, so the network body is closed here.
+		_ = original.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(prefix.Bytes()))
+		return typ
+	}
+	// Incomplete, oversized, truncated or classless peek: only what the
+	// classifier still finds in the bytes at hand is usable, so chain what was
+	// read back in front of the still-open original. A plain NopCloser here
+	// would either drop the remainder (truncating a passthrough) or swallow
+	// the network body (forfeiting connection reuse) — a prefixedBody
+	// propagates Close to the real body, and it is also the path a peek that
+	// stopped early takes, so stopping early never truncates anything.
+	resp.Body = &prefixedBody{Reader: io.MultiReader(bytes.NewReader(prefix.Bytes()), original), body: original}
+	return typ
+}
+
+// peekCauseType appends at most maxCausePeek+1 bytes of r to data and returns
+// the upstream error class as soon as what it holds is already a complete
+// error document; drained reports that r reached EOF, so nothing is left
+// behind in the network body.
+//
+// The read is chunked with an early exit rather than one io.ReadAll to the
+// bound, because an unknown-length body is a stream, not a file: reading on to
+// the bound (or to EOF) makes the node switch wait exactly as long as the
+// upstream takes to send 64 KB, while the class itself sits at the front of a
+// small document. The budget is unchanged otherwise — a body that never
+// completes a document still costs the whole bound plus the one byte that
+// proves it oversized, and every byte taken out of r is handed back by the
+// caller, so the peek stays invisible to the passthrough either way.
+func peekCauseType(data *bytes.Buffer, r io.Reader) (typ string, drained bool) {
+	limited := io.LimitReader(r, maxCausePeek+1)
+	buf := make([]byte, causePeekChunk)
+	// One byte past the bound is enough to know the document is oversized; the
+	// loop therefore never reads more than maxCausePeek+1 bytes in total.
+	for data.Len() <= maxCausePeek {
+		n, err := limited.Read(buf)
+		if n > 0 {
+			data.Write(buf[:n])
+			if t := errorTypeFromDocument(data.Bytes()); t != "" {
+				return t, errors.Is(err, io.EOF)
+			}
+		}
+		if err != nil {
+			// A body that ended (or died) before completing a document: the
+			// status alone carries the cause, exactly as before.
+			return "", errors.Is(err, io.EOF)
+		}
+	}
+	return "", false
+}
+
+// errorTypeFromDocument returns the error class of a complete JSON error
+// document, or "" when doc is not a complete document carrying one. A prefix
+// that has not parsed yet is not a document: that is what keeps the peek
+// reading until the value is whole (or the bound stops it) instead of trusting
+// a half-read class.
+func errorTypeFromDocument(doc []byte) string {
+	// A whole JSON value is }-terminated once trailing whitespace is dropped,
+	// and only an object can carry error.type at all. Rejecting the rest up
+	// front is what keeps the caller's per-chunk check from re-parsing every
+	// partial prefix of a body that never completes.
+	if doc = bytes.TrimRight(doc, " \t\r\n"); len(doc) == 0 || doc[len(doc)-1] != '}' {
 		return ""
 	}
-	_ = original.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(data))
 	var value map[string]any
-	if json.Unmarshal(data, &value) != nil {
+	if json.Unmarshal(doc, &value) != nil {
 		return ""
 	}
 	// Upstream-controlled string: bound it before it lands in the cooldown

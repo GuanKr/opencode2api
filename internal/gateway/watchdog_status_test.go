@@ -862,6 +862,248 @@ func TestWatchdogCauseOversizedBodyKeepsPayload(t *testing.T) {
 	}
 }
 
+// slowBodyTail is how much of a gated slow body follows its error document: far
+// beyond the 64 KB peek bound (and beyond the 256 KB one it replaced), so a
+// peek that reads on towards the bound has real bytes to wait for.
+const slowBodyTail = 1 << 20
+
+// gatedSlowBody is an upstream error body on a slow unknown-length pipe: the
+// first Read hands out a complete, small error document and every later Read
+// blocks until the test releases a slice of the tail. That is the shape the
+// label peek used to turn into dead waiting time — a slow body the peek read
+// past its useful prefix made the switch to the next exit node wait for the
+// whole budget, whatever the tail's size. Only waitFor ends a read the test
+// did not release, so "did the peek wait for the tail?" is a fact to assert
+// rather than a guess: blocked stays 0 and the elapsed time stays tiny only
+// when the peek stopped as soon as it had what it came for.
+type gatedSlowBody struct {
+	head    string
+	tail    string
+	tailPos int
+	closed  int
+	release chan struct{} // one buffered token = one slice of tail
+	blocked int           // reads that had to wait for a token
+	rushed  bool          // set once the test stops caring about the waiting
+	waitFor time.Duration
+}
+
+func (b *gatedSlowBody) Read(p []byte) (int, error) {
+	if b.head != "" {
+		head := b.head
+		b.head = ""
+		return copy(p, head), nil
+	}
+	if !b.rushed {
+		select {
+		case <-b.release:
+		default:
+			b.blocked++
+			timer := time.NewTimer(b.waitFor)
+			select {
+			case <-b.release:
+			case <-timer.C:
+			}
+			timer.Stop()
+			b.rushed = true
+		}
+	}
+	if b.tailPos >= len(b.tail) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.tail[b.tailPos:])
+	b.tailPos += n
+	return n, nil
+}
+
+func (b *gatedSlowBody) Close() error {
+	b.closed++
+	return nil
+}
+
+// releaseTail un-gates the body: after this the tail flows at full speed, so a
+// test can measure the peek's waiting first and then read the passthrough
+// without racing the fixture.
+func (b *gatedSlowBody) releaseTail() {
+	b.rushed = true
+}
+
+func newGatedSlowBody(head string) *gatedSlowBody {
+	return &gatedSlowBody{
+		head:    head,
+		tail:    strings.Repeat("t", slowBodyTail),
+		release: make(chan struct{}, 1),
+		waitFor: 2 * time.Second,
+	}
+}
+
+// A slow, unknown-length error body whose class sits at the front is the one
+// shape where peeking could make a node switch wait: the label needs the small
+// head, the tail only carries payload. The peek must stop at the head — both
+// the class must survive and the upstream's slow tail must not be waited for —
+// while the client still receives the document byte for byte.
+func TestWatchdogCauseStopsPeekAtTypeWithoutDrainingSlowBody(t *testing.T) {
+	const head = `{"error":{"type":"FreeUsageLimitError"},"message":"free quota burned"}`
+	body := newGatedSlowBody(head)
+	resp := watchdogChunkedResponse(http.StatusTooManyRequests, "application/json", body)
+
+	start := time.Now()
+	cause := watchdogCause(resp, nil)
+	elapsed := time.Since(start)
+
+	if body.blocked != 0 {
+		t.Fatalf("the peek must not wait for a tail the class does not need, it blocked %d read(s)", body.blocked)
+	}
+	if elapsed > 750*time.Millisecond {
+		t.Fatalf("labelling a slow body must not cost a wall-clock wait, took %v", elapsed)
+	}
+	if cause != "FreeUsageLimitError (upstream HTTP 429)" {
+		t.Fatalf("a slow chunked quota answer must still carry the upstream class, got %q", cause)
+	}
+	if got := classifyAnonymousVerdict(cause, true); got != "quota" {
+		t.Fatalf("stopping early must not cost the verdict, got %q", got)
+	}
+	// Everything the peek did not need still has to reach the client intact.
+	body.releaseTail()
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := head + body.tail; string(rest) != want {
+		t.Fatalf("the slow body must survive the peek byte for byte: got %d of %d bytes, first difference at %d", len(rest), len(want), firstMismatch(rest, []byte(want)))
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("closing the restored body must succeed, got %v", err)
+	}
+	if body.closed != 1 {
+		t.Fatalf("Close must reach the original exactly once, got %d", body.closed)
+	}
+}
+
+// drainBudgetBytes is what httpx.DrainAndClose charges a response the gateway
+// abandons without looking at it (its io.LimitReader body, 64<<10). The label
+// peek rides on that failure path, so its worst case must fit the same budget:
+// it is asserted here as a literal on purpose, because a test written against
+// maxCausePeek would follow the constant up and stop pinning anything.
+const drainBudgetBytes = 64 << 10
+
+// budgetBody is a non-JSON upstream error body (a giant HTML error page) whose
+// reads are metered while the peek runs: the shape that must read all the way
+// to the peek's bound, and therefore the worst case for how long a node switch
+// can wait. Past the drain budget plus the peek's own oversize probe byte it
+// refuses instead of serving more, so an over-reading peek cannot pass by
+// accident. The meter is scoped to the peek (stopMetering) because the
+// passthrough behind it is entitled to every remaining byte.
+type budgetBody struct {
+	data      string
+	served    int
+	metered   bool
+	overDrain bool
+	closed    int
+}
+
+func newBudgetBody(data string) *budgetBody {
+	return &budgetBody{data: data, metered: true}
+}
+
+func (b *budgetBody) Read(p []byte) (int, error) {
+	if b.metered && b.served > drainBudgetBytes+1 {
+		b.overDrain = true
+		return 0, errors.New("peek read past the drain budget")
+	}
+	if b.served >= len(b.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.served:])
+	b.served += n
+	return n, nil
+}
+
+func (b *budgetBody) stopMetering() {
+	b.metered = false
+}
+
+func (b *budgetBody) Close() error {
+	b.closed++
+	return nil
+}
+
+// The worst case of the peek is a body that never completes an error
+// document: there is nothing to stop early on, so the bound is all the budget
+// it may spend — one byte past the drain ceiling, which is the same oversize
+// probe the peek has always paid, and no more. The upstream document must
+// still arrive byte for byte behind the peeked prefix.
+func TestWatchdogCauseWorstCasePeekStaysWithinDrainBudget(t *testing.T) {
+	payload := strings.Repeat("<html>gateway said no</html>", 64<<10)
+	body := newBudgetBody(payload)
+	resp := watchdogChunkedResponse(http.StatusBadGateway, "text/html", body)
+
+	if got := watchdogCause(resp, nil); got != "upstream error (upstream HTTP 502)" {
+		t.Fatalf("a classless body must fall back to the status, got %q", got)
+	}
+	if body.overDrain {
+		t.Fatalf("the peek must never read past the drain budget")
+	}
+	if body.served > drainBudgetBytes+1 {
+		t.Fatalf("worst-case peek read %d bytes, budget is the %d-byte drain plus the oversize probe", body.served, drainBudgetBytes)
+	}
+	if body.served < drainBudgetBytes {
+		t.Fatalf("fixture must drive the peek to its bound, it read %d bytes", body.served)
+	}
+	body.stopMetering()
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rest) != payload {
+		t.Fatalf("the classless body must survive the peek byte for byte: got %d of %d bytes, first difference at %d", len(rest), len(payload), firstMismatch(rest, []byte(payload)))
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("closing the restored body must succeed, got %v", err)
+	}
+	if body.closed != 1 {
+		t.Fatalf("Close must reach the original exactly once, got %d", body.closed)
+	}
+}
+
+// End-to-end seam for that shape: a slow oversized 429 whose class is in the
+// first chunk must still land in the feed as quota with a switch
+// recommendation, and the node switch it recommends must not have waited on
+// the tail.
+func TestObserveAnonymousResultSlowBodyStillRecordsQuotaSwitch(t *testing.T) {
+	const head = `{"error":{"type":"FreeUsageLimitError","message":"no free credits left"}}`
+	transports, err := newTransportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := newAnonymousPool(true, transports, 15*time.Second)
+	g := watchdogTestGateway(transports, pool)
+	body := newGatedSlowBody(head)
+	upstream := watchdogChunkedResponse(http.StatusTooManyRequests, "application/json", body)
+
+	start := time.Now()
+	g.observeAnonymousResult(context.Background(), pool.nodes[0], upstream, nil)
+	elapsed := time.Since(start)
+
+	if body.blocked != 0 {
+		t.Fatalf("recording the verdict must not wait for the slow tail, it blocked %d read(s)", body.blocked)
+	}
+	if elapsed > 750*time.Millisecond {
+		t.Fatalf("labelling a slow body must not cost a wall-clock wait, took %v", elapsed)
+	}
+	resp := doWatchdogStatus(t, g)
+	if resp.Anonymous.Verdict != "quota" || !resp.RecommendSwitch {
+		t.Fatalf("slow 429 FreeUsageLimitError must surface as quota+switch, got verdict %q switch %v (cause %q)", resp.Anonymous.Verdict, resp.RecommendSwitch, resp.Anonymous.Cause)
+	}
+	body.releaseTail()
+	rest, err := io.ReadAll(upstream.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := head + body.tail; string(rest) != want {
+		t.Fatalf("the passthrough body must survive the label: got %d of %d bytes, first difference at %d", len(rest), len(want), firstMismatch(rest, []byte(want)))
+	}
+}
+
 func TestWatchdogCauseNeverReadsStreamOrSuccess(t *testing.T) {
 	stream := watchdogErrorResponse(http.StatusTooManyRequests, "text/event-stream", "")
 	if got := watchdogCause(stream, nil); got != "upstream error (upstream HTTP 429)" {
