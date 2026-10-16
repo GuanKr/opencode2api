@@ -120,7 +120,7 @@ func TestOutboundDumpRecordsTheShapedBytesSentUpstream(t *testing.T) {
 		`"parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]}`)
 
 	resp, _, _, err := g.doUpstreamTiers(context.Background(), chatDumpRoute(),
-		map[config.Tier][]byte{config.TierZen: client}, identity.RequestIDs{Request: "req-dump"}, 0)
+		map[config.Tier][]byte{config.TierZen: client}, identity.RequestIDs{Request: "req-dump"}, 0, "")
 	if err != nil {
 		t.Fatalf("anonymous attempt: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestOutboundDumpShapedMatchesClientWhenShapingIsANoOp(t *testing.T) {
 	}
 
 	resp, _, _, err := g.doUpstreamTiers(context.Background(), chatDumpRoute(),
-		map[config.Tier][]byte{config.TierZen: alreadyShaped}, identity.RequestIDs{Request: "req-dump"}, 0)
+		map[config.Tier][]byte{config.TierZen: alreadyShaped}, identity.RequestIDs{Request: "req-dump"}, 0, "")
 	if err != nil {
 		t.Fatalf("anonymous attempt: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestOutboundDumpStaysSilentWhenDisabled(t *testing.T) {
 	g.cfg.Logging.DumpRequestBodies = false
 	resp, _, _, err := g.doUpstreamTiers(context.Background(), chatDumpRoute(),
 		map[config.Tier][]byte{config.TierZen: []byte(`{"model":"probe-free","messages":[{"role":"user","content":"hi"}]}`)},
-		identity.RequestIDs{Request: "req-dump"}, 0)
+		identity.RequestIDs{Request: "req-dump"}, 0, "")
 	if err != nil {
 		t.Fatalf("anonymous attempt: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestOutboundDumpRecordsShapedBytesOnTheKeyLane(t *testing.T) {
 	plain := chatDumpRoute()
 	plain.Anonymous = false
 	keyed, _, _, err := g.doUpstreamTiers(context.Background(), plain,
-		map[config.Tier][]byte{config.TierZen: body}, identity.RequestIDs{Request: "req-dump-2"}, 0)
+		map[config.Tier][]byte{config.TierZen: body}, identity.RequestIDs{Request: "req-dump-2"}, 0, "")
 	if err != nil {
 		t.Fatalf("key tier attempt: %v", err)
 	}

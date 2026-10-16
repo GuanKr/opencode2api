@@ -9,6 +9,7 @@ let csrf = "",
   eventSource = null,
   paused = false,
   monitorTimer = null,
+  secondaryTimer = null,
   logRenderPending = false,
   toastTimer = null;
 const pages = {
@@ -56,7 +57,7 @@ function showLogin() {
   if (eventSource) eventSource.close();
   eventSource = null;
   clearInterval(monitorTimer);
-  clearInterval(quotaTimer);
+  clearInterval(secondaryTimer);
   clearCreatedKey();
   $("#api-key-value").value = "";
 }
@@ -99,10 +100,20 @@ $("#logout").onclick = async () => {
     showLogin();
   }
 };
+// 次级页集合 —— 这些页的数据只由各自的 async loader 拉取并自行绘制，不进
+// refreshMonitor 的 3s 同步重绘路径。停留时只有手动按钮才更新数据（当前模型、
+// 状态、剩余额度、key 列表会静默变旧），所以给它们补一把统一的 60s 轮询。
+// 主页面（overview / usage / diagnostics 等）不在此列：它们由 monitorTimer +
+// refreshMonitor 自带节奏驱动，usage 另在 refreshMonitor 里按 lastUsageFetch
+// 30s 节流，进来只会双刷同一接口。
+const SECONDARY_PAGES = new Set(["model-quotas", "rotation", "availability", "api-keys"]),
+  SECONDARY_REFRESH_MS = 60000;
 function openPage(page) {
   if (!pages[page]) return;
   history.replaceState(null, "", `#${page}`);
-  clearInterval(quotaTimer);
+  // 全局唯一的清理点：任何切页（含切去主页面）都先收掉上一把次级页定时器，
+  // 否则离开页面后还会按旧页面继续发请求，切多次还会叠加出多把表。
+  clearInterval(secondaryTimer);
   if (page !== "api-keys") clearCreatedKey();
   $$(".nav button").forEach((button) =>
     button.classList.toggle("active", button.dataset.page === page),
@@ -114,20 +125,32 @@ function openPage(page) {
   $("#page-sub").textContent = meta[2];
   if (page === "access") renderAccessExamples();
   if (page === "usage") fetchUsage();
-  if (page === "model-quotas") {
-    loadModelQuotas();
-    quotaTimer = setInterval(() => {
-      if (!document.hidden) loadModelQuotas();
-    }, 60000);
+  if (SECONDARY_PAGES.has(page)) {
+    refreshSecondaryPage(page);
+    secondaryTimer = setInterval(() => {
+      // 后台标签停手（document.hidden）；页面已切走也停，别把结果画到隐藏页上。
+      if (document.hidden || location.hash.slice(1) !== page) return;
+      // 轮转页有用户未保存的输入（两组别名 / 首字超时）：自动重画会冲掉正在编辑
+      // 的字段，连 rotationDirty 一起清成 false，之后连「刷新」按钮的提示都不再
+      // 触发。与该按钮用同一把守卫——有未保存改动就跳过这一轮，保存后下一次定时
+      // 自然续上。守卫只加在定时这一侧：进入页面时仍旧无条件加载（既有语义）。
+      if (page === "rotation" && rotationDirty) return;
+      refreshSecondaryPage(page);
+    }, SECONDARY_REFRESH_MS);
   }
-  if (page === "rotation") loadRotation();
-  if (page === "availability") loadAvailability();
-  if (page === "api-keys") loadAPIKeys();
   if (page === "playground" && !debugData) loadDebugModels();
   if (page === "diagnostics") {
     loadDebugModels();
     renderDiagnostics();
   }
+}
+// 次级页刷新只做「分发」到各自的 loader，绘制与 loading 守卫都留在 loader 内，
+// 这样手动按钮、进入页面、定时刷新三条路走的是同一段取数与重画代码。
+function refreshSecondaryPage(page) {
+  if (page === "model-quotas") loadModelQuotas();
+  else if (page === "rotation") loadRotation();
+  else if (page === "availability") loadAvailability();
+  else if (page === "api-keys") loadAPIKeys();
 }
 $$(".nav button").forEach((button) => (button.onclick = () => openPage(button.dataset.page)));
 async function loadConfig() {
@@ -1818,7 +1841,6 @@ $("#log-pause").onclick = () => {
   if (!paused) renderLogs();
 };
 let quotaData = null,
-  quotaTimer = null,
   quotaLoading = false,
   createdKey = "",
   apiKeysLoading = false;

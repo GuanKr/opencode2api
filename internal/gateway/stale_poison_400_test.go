@@ -140,7 +140,7 @@ func poisonTurn(t *testing.T, ctx context.Context, g *Gateway, route models.Rout
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, _, err := g.doUpstream(ctx, route, map[config.Tier][]byte{config.TierZen: raw}, ids)
+	resp, _, err := g.doUpstream(ctx, route, map[config.Tier][]byte{config.TierZen: raw}, ids, "")
 	if err != nil {
 		t.Fatal(err)
 	}

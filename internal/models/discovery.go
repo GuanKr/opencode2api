@@ -121,7 +121,8 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 		return Capabilities{}, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", httpx.UserAgent())
+	// Catalog fetch, not inference: identify as the gateway, never as the CLI.
+	req.Header.Set("User-Agent", httpx.GatewayUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return Capabilities{}, err
@@ -193,7 +194,8 @@ func FetchProtocolDocs(ctx context.Context, client *http.Client, endpoint string
 		return nil, err
 	}
 	req.Header.Set("Accept", "text/plain, text/markdown, */*")
-	req.Header.Set("User-Agent", httpx.UserAgent())
+	// Docs fetch, not inference: identify as the gateway, never as the CLI.
+	req.Header.Set("User-Agent", httpx.GatewayUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -274,7 +276,8 @@ func FetchModels(ctx context.Context, client *http.Client, baseURL, key string) 
 		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("User-Agent", httpx.UserAgent())
+	// Model list fetch, not inference: identify as the gateway, never as the CLI.
+	req.Header.Set("User-Agent", httpx.GatewayUserAgent())
 	req.Header.Set("x-opencode-client", "cli")
 	resp, err := client.Do(req)
 	if err != nil {

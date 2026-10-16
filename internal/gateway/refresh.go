@@ -290,7 +290,9 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 			g.anonymous.markRefreshSuccess(node)
 			return models
 		}
-		g.anonymous.MarkFailure(node, nil, err)
+		// Background catalog refresh: no client payload to fingerprint, so the
+		// cooldown stays unscoped (blocks every request) exactly as before.
+		g.anonymous.MarkFailure(node, nil, err, "")
 		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", config.RedactURL(base), "attempt", attempt, "proxy", config.RedactURL(node.proxy.name), "error", err)
 	}
 	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", config.RedactURL(base))

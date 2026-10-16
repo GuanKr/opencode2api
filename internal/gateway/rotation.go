@@ -175,7 +175,10 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		copyPayload[k] = v
 	}
 	copyPayload["model"] = route.ID
-	bodies, err := g.prepareRouteBodies(external, route, copyPayload)
+	// nil raw: copyPayload already has the alias replaced by the concrete model, so
+	// the client's original bytes no longer describe it and cannot be forwarded
+	// verbatim.
+	bodies, err := g.prepareRouteBodies(external, route, copyPayload, nil)
 	if err != nil {
 		result.err = err
 		result.reason = "request_conversion_error"

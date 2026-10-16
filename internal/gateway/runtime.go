@@ -295,6 +295,7 @@ func (m *RuntimeManager) applyLocked(candidate config.Config, persist bool) (App
 	previous := m.current.Swap(next)
 	if previous != nil {
 		previous.cancel()
+		previous.gateway.transports.closeIdleConnections()
 	}
 	m.logger.Info("configuration applied", "component", "config", "event", "config_applied", "restart_required", result.RestartRequired, "restart_fields", result.RestartFields)
 	return result, nil

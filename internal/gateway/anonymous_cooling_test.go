@@ -204,7 +204,9 @@ func TestAnonymousCooldownStaysUnderTheCeiling(t *testing.T) {
 					resp = &http.Response{StatusCode: http.StatusTooManyRequests,
 						Header: http.Header{"Retry-After": []string{tc.retryAfter}}}
 				}
-				pool.startCooldown(node, resp, nil, "FreeUsageLimitError (upstream HTTP 429)")
+				// Unscoped (fingerprint ""): this case pins the backoff ladder, not the
+				// request scope.
+				pool.startCooldown(node, resp, nil, "FreeUsageLimitError (upstream HTTP 429)", "")
 			}
 			got := time.Until(time.Unix(0, node.cooldownUntil.Load()))
 			if got > tc.want {
@@ -233,7 +235,7 @@ func TestSystemOneCooldownAnswers429Too(t *testing.T) {
 	// whatever the upstream stub happens to answer first.
 	g.anonymous.startCooldown(g.anonymous.nodes[0],
 		&http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}}, nil,
-		"FreeUsageLimitError (upstream HTTP 429)")
+		"FreeUsageLimitError (upstream HTTP 429)", "")
 
 	handler := telemetry.Middleware(g.monitor, g.logger, http.HandlerFunc(g.handleSystemOne))
 	rec := httptest.NewRecorder()

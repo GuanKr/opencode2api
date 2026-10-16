@@ -46,6 +46,15 @@ type anonymousNode struct {
 	proxy         *proxyTransport
 	failures      atomic.Uint32
 	cooldownUntil atomic.Int64
+	// coolHash is the fingerprint of the request that triggered the current
+	// cooldown (see identity.RequestFingerprint). Empty means the cooldown is
+	// not request-scoped (background refresh, or a caller that had no payload
+	// to fingerprint) and therefore blocks every request.
+	//
+	// It is what makes the cooldown request-scoped rather than per-proxy: a
+	// turn that was rate-limited must not also block an unrelated one, or a
+	// single quota event freezes the whole anonymous lane for the window.
+	coolHash atomic.Value
 	// coolCause is a short summary of what triggered the current cooldown
 	// (e.g. "FreeUsageLimitError (upstream HTTP 429)"), stored next to
 	// cooldownUntil so the watchdog feed can report remaining seconds and
@@ -113,6 +122,8 @@ func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
 }
 
 // Next visits each healthy, non-cooling proxy at most once per cursor.
+// It never bypasses cooldown and is used by background catalog refresh,
+// whose behavior must stay identical with or without request scoping.
 func (c *anonymousCursor) Next() *anonymousNode {
 	if c.pool == nil || len(c.pool.nodes) == 0 {
 		return nil
@@ -122,6 +133,33 @@ func (c *anonymousCursor) Next() *anonymousNode {
 		node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
 		c.offset++
 		if node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now {
+			return node
+		}
+	}
+	return nil
+}
+
+// NextForRequest behaves like Next, except a cooling node still serves a
+// request whose fingerprint differs from the one that triggered the cooldown.
+// Retries replay identical bodies, so different content means a new turn that
+// deserves one real upstream attempt (for example after the operator switched
+// the exit IP behind a shared proxy endpoint). Transport-unhealthy proxies are
+// always skipped, fingerprint or not.
+func (c *anonymousCursor) NextForRequest(fingerprint string) *anonymousNode {
+	if c.pool == nil || len(c.pool.nodes) == 0 {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	for c.offset < len(c.pool.nodes) {
+		node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
+		c.offset++
+		if !node.proxy.healthy.Load() {
+			continue
+		}
+		if node.cooldownUntil.Load() <= now {
+			return node
+		}
+		if stored, _ := node.coolHash.Load().(string); stored != "" && stored != fingerprint {
 			return node
 		}
 	}
@@ -237,8 +275,10 @@ func anonymousCooldownCeiling(base time.Duration) time.Duration {
 // as it always was; the watchdog feed records nothing, because a
 // models-endpoint probe must neither fake a user-traffic failure age nor cast
 // a stale transport vote that would send the watchdog switching nodes.
-func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
-	p.startCooldown(node, resp, err, "")
+// fingerprint scopes the cooldown to one request (see anonymousNode.coolHash);
+// pass "" to block every request, which is what background work wants.
+func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error, fingerprint string) {
+	p.startCooldown(node, resp, err, "", fingerprint)
 }
 
 // markUserFailure is MarkFailure for a real inference turn: besides the same
@@ -246,15 +286,16 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 // label classifyAnonymousVerdict parses (see watchdogCause); it is never empty
 // on this path, and its presence is what makes the failure count as user
 // traffic (lastFailure plus the TTL-bounded stale transport memory).
-func (p *anonymousPool) markUserFailure(node *anonymousNode, resp *http.Response, err error, cause string) {
-	p.startCooldown(node, resp, err, cause)
+func (p *anonymousPool) markUserFailure(node *anonymousNode, resp *http.Response, err error, cause, fingerprint string) {
+	p.startCooldown(node, resp, err, cause, fingerprint)
 }
 
 // startCooldown applies the anonymous cooldown for one failed attempt and
 // stores the watchdog cause label that belongs to it. An empty cause means
 // "no user traffic": the cooldown still happens, only the watchdog memory is
-// skipped.
-func (p *anonymousPool) startCooldown(node *anonymousNode, resp *http.Response, err error, cause string) {
+// skipped. An empty fingerprint means "not request-scoped": the cooldown then
+// blocks every request through this proxy, not just the one that failed.
+func (p *anonymousPool) startCooldown(node *anonymousNode, resp *http.Response, err error, cause, fingerprint string) {
 	if node == nil {
 		return
 	}
@@ -272,6 +313,11 @@ func (p *anonymousPool) startCooldown(node *anonymousNode, resp *http.Response, 
 	// shortens the ladder (the > comparison above), and a long one can never
 	// outlive the anonymous lane's local-outage budget.
 	delay = min(delay, anonymousCooldownCeiling(p.cooldown))
+	// Scope the cooldown to the request that triggered it. Retries of this
+	// turn replay the same fingerprint and are blocked; a different turn is
+	// still served. Storing "" (background refresh) keeps the old
+	// block-everything behavior, which is what that caller wants.
+	node.coolHash.Store(fingerprint)
 	node.coolCause.Store(cause)
 	until := time.Now().Add(delay).UnixNano()
 	node.cooldownUntil.Store(until)
@@ -330,6 +376,58 @@ func (p *anonymousPool) maxCooldownSnapshot() (time.Duration, string) {
 		}
 	}
 	return longest, cause
+}
+
+// coolingFor reports whether any proxy blocks this fingerprint only because
+// of time-based anonymous cooldown (as opposed to transport health), plus
+// the longest remaining delay. It mirrors the skip logic in NextForRequest, so
+// the answer is exactly "can NextForRequest find nothing".
+func (p *anonymousPool) coolingFor(fingerprint string) (bool, time.Duration) {
+	if p == nil {
+		return false, 0
+	}
+	now := time.Now().UnixNano()
+	blocked := false
+	var longest time.Duration
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() || node.cooldownUntil.Load() <= now {
+			continue
+		}
+		if stored, _ := node.coolHash.Load().(string); stored != "" && stored != fingerprint {
+			continue
+		}
+		blocked = true
+		if remain := time.Duration(node.cooldownUntil.Load() - now); remain > longest {
+			longest = remain
+		}
+	}
+	return blocked, longest
+}
+
+// coolCauseFor returns the stored trigger of the longest fingerprint-matching
+// cooldown (e.g. "FreeUsageLimitError (upstream HTTP 429)"), or "" when
+// nothing cooling matches. It mirrors the skip logic in coolingFor so the
+// reported cause always belongs to the block the caller just hit.
+func (p *anonymousPool) coolCauseFor(fingerprint string) string {
+	if p == nil {
+		return ""
+	}
+	now := time.Now().UnixNano()
+	var longest time.Duration
+	cause := ""
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() || node.cooldownUntil.Load() <= now {
+			continue
+		}
+		if stored, _ := node.coolHash.Load().(string); stored != "" && stored != fingerprint {
+			continue
+		}
+		if remain := time.Duration(node.cooldownUntil.Load() - now); remain > longest {
+			longest = remain
+			cause, _ = node.coolCause.Load().(string)
+		}
+	}
+	return cause
 }
 
 // staleCauseSnapshot returns the most recently expired transport cause
@@ -396,12 +494,32 @@ func (p *anonymousPool) successFailureAges() (successAge, failureAge time.Durati
 }
 
 func (p *transportPool) hasHealthy() bool {
+	if p == nil {
+		return false
+	}
 	for _, proxy := range p.items {
 		if proxy.healthy.Load() {
 			return true
 		}
 	}
 	return false
+}
+
+// closeIdleConnections releases pooled keep-alive connections. Called on
+// superseded runtimes after a hot-reload swap so old Transports do not hold
+// idle conns until IdleConnTimeoutSeconds.
+func (p *transportPool) closeIdleConnections() {
+	if p == nil {
+		return
+	}
+	for _, proxy := range p.items {
+		if proxy == nil || proxy.client == nil {
+			continue
+		}
+		if transport, ok := proxy.client.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+	}
 }
 
 func (p *transportPool) healthCounts() (total, healthy int) {
@@ -458,6 +576,9 @@ type proxyHealthResult struct {
 // from the test URL proves that the route is reachable; only a timeout or
 // connection refusal keeps the proxy unhealthy.
 func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout time.Duration) []proxyHealthResult {
+	if p == nil {
+		return nil
+	}
 	results := make(chan proxyHealthResult, len(p.items))
 	checks := 0
 	for _, proxy := range p.items {
@@ -489,7 +610,9 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 	defer cancel()
 	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target, nil)
 	if err == nil {
-		req.Header.Set("User-Agent", httpx.UserAgent())
+		// Proxy liveness probe, not an inference turn: this must not claim to
+		// be the opencode CLI (see httpx.GatewayUserAgent).
+		req.Header.Set("User-Agent", httpx.GatewayUserAgent())
 		resp, requestErr := proxy.client.Do(req)
 		err = requestErr
 		if resp != nil {

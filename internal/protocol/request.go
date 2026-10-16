@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -26,6 +27,43 @@ func PrepareRequest(from, to Protocol, input map[string]any, upstreamURL string)
 	}
 	normalizeToolReasoningHistory(to, jsonutil.StringAt(output, "model"), upstreamURL, output)
 	return output, nil
+}
+
+// PrepareRequestBytes is the byte-oriented form of PrepareRequest. It exists so
+// large same-protocol requests avoid a full JSON round-trip (ConvertRequest's
+// CloneMap plus the caller's re-marshal): when target normalization leaves the
+// payload untouched, the client's original bytes are already in upstream shape
+// and are returned as-is. Reusing them is also more faithful than re-encoding,
+// since a map round-trip can reshape large numbers.
+//
+// Callers must pass the exact bytes input was decoded from; nil raw always
+// takes the re-encode path. input may be mutated in place on the same-protocol
+// path, so callers that need the pre-normalization map (e.g. the anonymous
+// cooling fingerprint) must read it first.
+//
+// raw may be reused at most once per call set: after any in-place repair the
+// client's pre-repair bytes no longer describe the normalized body. Later tiers
+// must re-encode. Callers therefore pass raw for the primary tier only.
+func PrepareRequestBytes(from, to Protocol, input map[string]any, raw []byte, upstreamURL string) ([]byte, error) {
+	if from == to && len(raw) > 0 {
+		// The Responses floor is a rewrite, not a no-op, so a client body below
+		// the minimum cannot be forwarded verbatim.
+		if to == Responses {
+			if n, ok := input["max_output_tokens"].(float64); ok && n > 0 && n < minResponsesMaxOutputTokens {
+				input["max_output_tokens"] = float64(minResponsesMaxOutputTokens)
+				return json.Marshal(input)
+			}
+		}
+		if !normalizeToolReasoningHistory(to, jsonutil.StringAt(input, "model"), upstreamURL, input) {
+			return raw, nil
+		}
+		return json.Marshal(input)
+	}
+	upstreamPayload, err := PrepareRequest(from, to, input, upstreamURL)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(upstreamPayload)
 }
 
 // ForcedEffort applies an operator-configured thinking level to a prepared

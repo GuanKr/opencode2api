@@ -222,14 +222,52 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 	return result
 }
 
+// modelUnavailableMarkers are the machine-readable upstream codes that mean the
+// model itself is gone. Prose phrasings ("unknown model", "model does not
+// exist", ...) are deliberately not matched: a single substring hit is enough to
+// take a working model out of service for FailedModelCheckInterval, and an
+// upstream 4xx body routinely echoes request content. Losing a true positive
+// only means a retired model keeps returning its own upstream 4xx.
+var modelUnavailableMarkers = []string{
+	"model_not_found",
+	"model_not_available",
+	"model_retired",
+	"model_deprecated",
+}
+
+// isModelUnavailable reports whether a 4xx response says the model is gone.
+// A structured JSON error is matched only against its own type/code/message
+// fields, so an echoed request body elsewhere in the document cannot trigger a
+// disable; a non-JSON body is matched as plain text, the only signal there.
 func isModelUnavailable(status int, body string) bool {
 	if status != 400 && status != 404 && status != 410 && status != 422 {
 		return false
 	}
-	text := strings.ToLower(body)
-	for _, marker := range []string{"model_not_found", "model_not_available", "model_retired", "model_deprecated", "unknown model", "model does not exist", "model has been retired", "model is no longer available"} {
-		if strings.Contains(text, marker) {
-			return true
+	var document map[string]any
+	if err := json.Unmarshal([]byte(body), &document); err == nil {
+		errObj := jsonutil.MapAt(document, "error")
+		return containsAnyMarker([]string{
+			jsonutil.StringAt(errObj, "type"),
+			jsonutil.StringAt(errObj, "code"),
+			jsonutil.StringAt(errObj, "message"),
+			jsonutil.StringAt(document, "type"),
+			jsonutil.StringAt(document, "code"),
+			jsonutil.StringAt(document, "message"),
+		}, modelUnavailableMarkers)
+	}
+	return containsAnyMarker([]string{body}, modelUnavailableMarkers)
+}
+
+func containsAnyMarker(fields, markers []string) bool {
+	for _, field := range fields {
+		if field == "" {
+			continue
+		}
+		text := strings.ToLower(field)
+		for _, marker := range markers {
+			if strings.Contains(text, marker) {
+				return true
+			}
 		}
 	}
 	return false

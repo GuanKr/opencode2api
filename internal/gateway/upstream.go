@@ -55,7 +55,10 @@ func debugKeyOverrideFrom(ctx context.Context) (DebugKeyOverride, bool) {
 	return override, ok && override.KeyID != ""
 }
 
-func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs) (*http.Response, models.Route, error) {
+// fingerprint is the client payload's semantic hash (identity.RequestFingerprint),
+// captured before any shaping. It scopes anonymous cooldown: a retry of the same
+// turn is blocked, a different turn still gets one real attempt.
+func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, fingerprint string) (*http.Response, models.Route, error) {
 	// Diagnostic requests (Playground auto mode included) must neither see
 	// a pre-stripped shape nor leave traces in production memory: they
 	// exercise the real request shape and never write production pool
@@ -137,7 +140,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 			}
 		}
 	}
-	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0)
+	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0, fingerprint)
 	if attempts == 0 && prestripped {
 		// Nothing was actually transmitted (no healthy anonymous node or
 		// key tier accepted the request before any attempt): the prestrip
@@ -202,7 +205,10 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 			return resp, effectiveRoute, nil
 		}
 		g.logger.Info("selective prestrip still rejected; falling back to full strip", "component", "upstream", "event", "reasoning_reference_fallback", "request_id", ids.Request, "session_id", ids.Session, "model", route.ID, "tier", effectiveRoute.Tier, "attempt_offset", attempts)
-		retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, ids, attempts)
+		// The stale-reasoning self-heal replays the SAME client turn with reasoning
+		// references stripped, so it keeps the original fingerprint on purpose: a
+		// same-turn retry must stay inside the cooldown scope that blocked it.
+		retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, ids, attempts, fingerprint)
 		if retryErr != nil || retryResp == nil || retryResp.StatusCode/100 != 2 {
 			retryStatus := 0
 			if retryResp != nil {
@@ -241,7 +247,10 @@ func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map
 	// the reply from the chain the client still holds; the stale references are
 	// already removed from the payload itself.
 	g.logger.Info("retrying upstream without stale reasoning references", "component", "upstream", "event", "reasoning_reference_retry", "request_id", ids.Request, "model", route.ID, "tier", effectiveRoute.Tier, "attempt_offset", attempts)
-	retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, ids, attempts)
+	// The stale-reasoning self-heal replays the SAME client turn with reasoning
+	// references stripped, so it keeps the original fingerprint on purpose: a
+	// same-turn retry must stay inside the cooldown scope that blocked it.
+	retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, ids, attempts, fingerprint)
 	if retryErr != nil || retryResp == nil || retryResp.StatusCode/100 != 2 {
 		retryStatus := 0
 		if retryResp != nil {
@@ -532,7 +541,7 @@ func summarizeReplayedReasoning(body []byte) string {
 		jsonutil.StringAt(payload, "previous_response_id"))
 }
 
-func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, models.Route, int, error) {
+func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int, fingerprint string) (*http.Response, models.Route, int, error) {
 	var lastResponse *http.Response
 	var lastErr error
 	effectiveRoute := route
@@ -543,7 +552,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 		return resp, route, used, err
 	}
 	if route.Anonymous {
-		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts)
+		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts, fingerprint)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			return resp, route, attempts, nil
@@ -606,7 +615,11 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 // failure, including an HTTP error response, advances to the next proxy. Only a
 // successful response ends the anonymous phase; exhausting the proxy cursor
 // returns control to the preferred authenticated tiers.
-func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
+//
+// fingerprint scopes cooldown to this request: a cooling node still serves a
+// turn whose content differs from the one that triggered it, so one quota event
+// no longer freezes unrelated traffic on the same proxy.
+func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int, fingerprint string) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
 	cursor := g.anonymous.CursorFor(ids.Session)
@@ -633,7 +646,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			}
 			break
 		}
-		node := cursor.Next()
+		node := cursor.NextForRequest(fingerprint)
 		if node == nil {
 			break
 		}
@@ -664,7 +677,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			}
 			break
 		}
-		g.observeAnonymousResult(ctx, node, resp, err)
+		g.observeAnonymousResult(ctx, node, resp, err, fingerprint)
 		g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
@@ -683,13 +696,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	}
 	if lastErr == nil {
 		// No attempt was made, so the cursor was empty. Distinguish an active
-		// cooldown — every healthy node sitting in its backoff window, which is
-		// a "come back later" the client must be told about — from a genuinely
-		// unusable route, where the 502 is the honest answer. maxCooldownSnapshot
-		// only counts healthy nodes, so an all-unhealthy pool reports no
-		// cooldown and keeps the transport wording.
-		if remain, cause := g.anonymous.maxCooldownSnapshot(); remain > 0 {
-			lastErr = errAnonymousCooling{retryAfter: remain, cause: cause}
+		// cooldown — every healthy node sitting in its backoff window for THIS
+		// request, which is a "come back later" the client must be told about —
+		// from a genuinely unusable route, where the 502 is the honest answer.
+		// coolingFor mirrors NextForRequest's skip logic exactly, so this can
+		// only fire when that scan genuinely found nothing; it only counts
+		// healthy nodes, so an all-unhealthy pool reports no cooldown and keeps
+		// the transport wording.
+		if blocked, remain := g.anonymous.coolingFor(fingerprint); blocked && remain > 0 {
+			lastErr = errAnonymousCooling{retryAfter: remain, cause: g.anonymous.coolCauseFor(fingerprint)}
 		} else {
 			lastErr = errors.New("no healthy anonymous proxies available")
 			// Nothing explains this but an unusable route, so kick one immediate
@@ -1448,7 +1463,7 @@ func (g *Gateway) observeKeyResult(ctx context.Context, nodes *nodePool, node *u
 	}
 }
 
-func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNode, resp *http.Response, err error) {
+func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNode, resp *http.Response, err error, fingerprint string) {
 	if isDiagnosticRequest(ctx) {
 		return
 	}
@@ -1460,7 +1475,7 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 		// watchdogCause only labels the failure for the watchdog feed; the
 		// upstream error document itself is still passed through untouched
 		// (the label peeks the body at most and puts it back byte for byte).
-		g.anonymous.markUserFailure(node, resp, err, watchdogCause(resp, err))
+		g.anonymous.markUserFailure(node, resp, err, watchdogCause(resp, err), fingerprint)
 	}
 }
 

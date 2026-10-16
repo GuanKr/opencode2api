@@ -109,7 +109,7 @@ func watchdogCoolingPool(t *testing.T, cause string) (*anonymousPool, *anonymous
 	proxy.healthy.Store(true)
 	node := &anonymousNode{proxy: proxy}
 	pool := &anonymousPool{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
-	pool.markUserFailure(node, watchdogCool429(), nil, cause)
+	pool.markUserFailure(node, watchdogCool429(), nil, cause, "")
 	if remain, _ := pool.maxCooldownSnapshot(); remain <= 0 {
 		t.Fatalf("setup must leave active cooling, got %v", remain)
 	}
@@ -264,7 +264,7 @@ func staleTestPool(t *testing.T, cause string) (*anonymousPool, *anonymousNode) 
 	proxy.healthy.Store(true)
 	node := &anonymousNode{proxy: proxy}
 	pool := &anonymousPool{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
-	pool.markUserFailure(node, nil, errors.New("dial failed"), cause)
+	pool.markUserFailure(node, nil, errors.New("dial failed"), cause, "")
 	node.cooldownUntil.Store(time.Now().Add(-time.Second).UnixNano())
 	if remain, _ := pool.maxCooldownSnapshot(); remain != 0 {
 		t.Fatalf("setup must leave expired active cooling, got %v", remain)
@@ -538,7 +538,7 @@ func TestBackgroundMarkFailureRecordsNoUserEvidence(t *testing.T) {
 	proxy.healthy.Store(true)
 	node := &anonymousNode{proxy: proxy}
 	pool := &anonymousPool{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
-	pool.MarkFailure(node, nil, errors.New("dial failed"))
+	pool.MarkFailure(node, nil, errors.New("dial failed"), "")
 	remain, cause := pool.maxCooldownSnapshot()
 	if remain <= 0 {
 		t.Fatalf("background failure must still cool the node, got %v", remain)
@@ -1082,7 +1082,7 @@ func TestObserveAnonymousResultSlowBodyStillRecordsQuotaSwitch(t *testing.T) {
 	upstream := watchdogChunkedResponse(http.StatusTooManyRequests, "application/json", body)
 
 	start := time.Now()
-	g.observeAnonymousResult(context.Background(), pool.nodes[0], upstream, nil)
+	g.observeAnonymousResult(context.Background(), pool.nodes[0], upstream, nil, "")
 	elapsed := time.Since(start)
 
 	if body.blocked != 0 {
@@ -1130,7 +1130,7 @@ func TestObserveAnonymousResultRecordsQuotaVerdict(t *testing.T) {
 	freezeProxyHealth(g)
 	node := pool.nodes[0]
 	upstream := watchdogErrorResponse(http.StatusTooManyRequests, "application/json", payload)
-	g.observeAnonymousResult(context.Background(), node, upstream, nil)
+	g.observeAnonymousResult(context.Background(), node, upstream, nil, "")
 
 	resp := doWatchdogStatus(t, g)
 	if resp.Anonymous.Verdict != "quota" || !resp.RecommendSwitch {
@@ -1165,7 +1165,7 @@ func TestObserveAnonymousResultSkipsDiagnostic(t *testing.T) {
 	freezeProxyHealth(g)
 	node := pool.nodes[0]
 	ctx := WithDiagnosticRequest(context.Background())
-	g.observeAnonymousResult(ctx, node, watchdogErrorResponse(http.StatusTooManyRequests, "application/json", `{"error":{"type":"FreeUsageLimitError"}}`), nil)
+	g.observeAnonymousResult(ctx, node, watchdogErrorResponse(http.StatusTooManyRequests, "application/json", `{"error":{"type":"FreeUsageLimitError"}}`), nil, "")
 	if remain, _ := pool.maxCooldownSnapshot(); remain != 0 {
 		t.Fatalf("diagnostic request must not cool the lane, got %v", remain)
 	}
