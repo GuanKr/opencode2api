@@ -757,14 +757,23 @@ function Test-GatewayNode {
     if ($info.Status -eq 429 -and $body.Contains('opencode2api:')) { $class = 'cooling' }
     elseif ($info.Status -eq 403 -and $body.Contains('FreeTierError')) { $class = 'cooling' }
     elseif ($info.Status -eq 401 -or $info.Status -eq 403 -or $info.Status -eq 404 -or $info.Status -eq 400) { $class = 'config' }
+    # 503 ModelUnavailable（模型被可用性探针禁用）同样是网关侧目录状态，与出口 IP
+    # 无关：换节点只会拿到同一个 503。不摘出的话它会掉进下面的 502/503/504 → transport
+    # 分支，逐候选切一遍再回滚——改动前它答 400，走的正是上面那条 config（立即停轮）。
+    elseif ($info.Status -eq 503 -and $body.Contains('ModelUnavailable')) { $class = 'config' }
     elseif ($body.Contains('FreeUsageLimit') -or $body.Contains('BlackUsageLimit')) { $class = 'quota' }
     elseif ($info.Status -eq 502 -or $info.Status -eq 503 -or $info.Status -eq 504 -or $body.Contains('gateway_transport')) {
       $class = 'transport'
     }
     $raSecs = 0
-    if ($retryAfter -ne '') {
+    # 必须取 $info.RetryAfter：$retryAfter 是 Get-HttpErrorInfo 内部的局部变量，
+    # 在这里恒为 $null。pwsh 里 $null -ne '' 为 True 会让分支照进，但 TryParse('')
+    # 恒 False，于是 raSecs 永远是 0，静默期退回固定 RoundCooldownMinutes(5min)
+    # 而不是网关给的 15s 窗口。
+    $ra = [string]$info.RetryAfter
+    if ($ra -ne '') {
       $parsed = 0
-      if ([int]::TryParse(($retryAfter -split ',')[0].Trim(), [ref]$parsed) -and $parsed -gt 0) { $raSecs = $parsed }
+      if ([int]::TryParse(($ra -split ',')[0].Trim(), [ref]$parsed) -and $parsed -gt 0) { $raSecs = $parsed }
     }
     return @{ Ok = $false; Status = $info.Status; Class = $class; Body = $body; Backoff = $backoff; RetryAfter = $raSecs }
   }
