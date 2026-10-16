@@ -13,8 +13,12 @@ import (
 	"time"
 
 	"opencode2api/internal/buildinfo"
+	"opencode2api/internal/config"
 	"opencode2api/internal/httpx"
+	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
+	wire "opencode2api/internal/protocol"
+	"opencode2api/internal/telemetry"
 )
 
 // Local: watchdog (read-only Clash decision feed).
@@ -114,6 +118,261 @@ func (g *Gateway) handleWatchdogStatus(w http.ResponseWriter, _ *http.Request) {
 		resp.RecommendSwitch = true
 	}
 	httpx.WriteJSON(w, http.StatusOK, resp)
+}
+
+// Local: the watchdog's forced probe. The status feed above answers "what does
+// the gateway remember"; this answers "what does THIS exit node do right now",
+// which is the only question worth asking after the operator switched nodes.
+//
+// It exists because the ordinary path cannot answer it. A request that finds no
+// transport-healthy proxy, or one sitting in a cooldown, never reaches the
+// upstream: it comes back as a locally synthesized 502 ("all upstream attempts
+// failed", see anonymous_errors.go for why that is not a 429) carrying no
+// information about the node — and the watchdog reads 502 as "this node is
+// broken, switch", so a stale transport-health mark left over from a dial that
+// timed out while Clash was re-routing made it burn its whole candidate pool
+// against a gate that no node switch can clear.
+
+// watchdogProbeResponse is the result of one forced anonymous attempt. It is a
+// measurement, not a snapshot: attempted says whether anything was actually
+// transmitted, and every other field describes that attempt.
+//
+// The upstream's error document is deliberately not echoed. The watchdog acts on
+// the verdict; returning the body would re-couple the script to error text that
+// the gateway rewrites on the client-facing passthrough path (see
+// neutralizeForgedGatewayPrefix and passthrough_guards_test.go), and the probe
+// runs over the network like the rest of this feed.
+type watchdogProbeResponse struct {
+	// Probe names the lane that was measured. Always "anonymous": the watchdog
+	// switches exit nodes to escape the free tier's per-IP allowance, so a
+	// probe answered by a paid key would be answering a question nobody asked.
+	Probe string `json:"probe"`
+	Model string `json:"model,omitempty"`
+	// Attempted is false only when no request could be built or sent (no
+	// anonymous proxy configured, model not served by the anonymous lane,
+	// request construction failed). Those are gateway-side states and always
+	// carry verdict "config"; they must never be reported as a node verdict.
+	Attempted bool `json:"attempted"`
+	// Status is the upstream HTTP status, or 0 when the attempt died in
+	// transport (in which case Transport carries the short reason).
+	Status int `json:"status"`
+	// Verdict uses the same vocabulary as the status feed (see
+	// classifyAnonymousVerdict), plus "config" for states no node switch can
+	// change and "cooling" only if the forced path itself short-circuited,
+	// which is a bug rather than an outcome.
+	Verdict    string `json:"verdict"`
+	Cause      string `json:"cause,omitempty"`
+	Transport  string `json:"transport,omitempty"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+const (
+	// maxWatchdogProbeBody bounds the probe request itself: the payload is one
+	// short ping, so anything larger is a mistake worth rejecting.
+	maxWatchdogProbeBody = 8 << 10
+	// watchdogProbeTimeout bounds the single attempt. Same budget
+	// probeAttempt gives the availability probe: long enough for a cold dial
+	// on a freshly switched node, short enough that the script's own
+	// -VerifyTimeoutSeconds is not the only thing bounding a dead node.
+	watchdogProbeTimeout = 60 * time.Second
+)
+
+// handleWatchdogProbe serves POST /v1/watchdog/probe (server-key auth, like
+// the status feed). It always answers 200 once a verdict exists, including for
+// a failed upstream: the HTTP status would otherwise encode a second, coarser
+// opinion about the same answer, and the script would be back to parsing bodies.
+func (g *Gateway) handleWatchdogProbe(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWatchdogProbeBody))
+	if err != nil {
+		wire.WriteError(w, wire.Chat, http.StatusBadRequest, "probe body is too large or unreadable", "invalid_request_error", "")
+		return
+	}
+	var input struct {
+		Model string `json:"model"`
+	}
+	if len(bytes.TrimSpace(body)) > 0 {
+		if err := json.Unmarshal(body, &input); err != nil {
+			wire.WriteError(w, wire.Chat, http.StatusBadRequest, "probe body must be a JSON object", "invalid_request_error", "")
+			return
+		}
+	}
+	model := strings.TrimSpace(input.Model)
+	if model == "" {
+		wire.WriteError(w, wire.Chat, http.StatusBadRequest, "model is required", "invalid_request_error", "")
+		return
+	}
+	// Diagnostic context: a probe is not user traffic. The path below calls the
+	// upstream client directly and writes no pool state, so this is belt and
+	// braces against a future refactor routing probes through doUpstream.
+	result := g.runWatchdogProbe(WithDiagnosticRequest(r.Context()), model)
+	// A finished probe answers 200 whatever the upstream said, so the monitor's
+	// success/error split has to come from the verdict rather than the status.
+	// Model and Tier stay unset on purpose: telemetry.Record only files a
+	// request into the usage layer (cost, tokens, the 24h detail ring) when a
+	// tier is present, which keeps probes off the usage page while leaving them
+	// visible as requests with a truthful outcome.
+	if meta := telemetry.MetaFromRequest(r); meta != nil && result.Verdict != "ok" {
+		meta.Outcome = "watchdog_probe_" + result.Verdict
+	}
+	httpx.WriteJSON(w, http.StatusOK, result)
+}
+
+// runWatchdogProbe sends exactly one request down the anonymous lane, ignoring
+// the transport-health gate and every cooldown (anonymousCursor.NextProbe), and
+// classifies the answer with the status feed's own vocabulary, so the two can
+// never drift apart.
+//
+// It writes no pool state whatsoever: no cooldown, no health verdict, no
+// lastSuccess/lastFailure, no stale-reasoning memo, and it never triggers a
+// background proxy check. The node is left exactly as the pool found it, which
+// is what makes the bypass free — and what keeps the feed's "user traffic only"
+// contract intact, so a probe can never fake the recovery evidence the script
+// waits for.
+func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogProbeResponse {
+	result := watchdogProbeResponse{Probe: "anonymous", Model: model}
+	proxyName := ""
+	// One Info line per probe, including the config answers that never leave the
+	// process. The status feed records nothing for a probe by design, and
+	// telemetry/http.go only logs "request routed" once a channel is set, so
+	// without this the operator's own node switching is only visible in the
+	// script log. Nothing sensitive is echoed: the proxy URL is redacted and the
+	// cause is the upstream's own error class, already bounded to 64 runes.
+	defer func() {
+		g.logger.Info("watchdog probe finished", "component", "upstream", "event", "watchdog_probe",
+			"model", model, "verdict", result.Verdict, "status", result.Status,
+			"attempted", result.Attempted, "duration_ms", result.DurationMS,
+			"proxy", proxyName, "cause", result.Cause, "transport", result.Transport)
+	}()
+	if !g.cfg.Anonymous {
+		result.Verdict = "config"
+		result.Cause = "anonymous lane is disabled"
+		return result
+	}
+	// Only models the anonymous lane actually serves are probeable. A paid
+	// model, a disabled one, or an unknown one is gateway-side state: report it
+	// as config instead of spending an attempt that could not be routed.
+	route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
+	if err != nil {
+		result.Verdict = "config"
+		result.Cause = err.Error()
+		return result
+	}
+	if !route.Anonymous {
+		result.Verdict = "config"
+		result.Cause = "model is not served by the anonymous lane"
+		return result
+	}
+	protocol := route.ProtocolFor(config.TierZen)
+	// probePayload routes the body through prepareAnonymousBody, so the probe
+	// carries the forced stream:true and the genuine core tool definitions —
+	// the same agent shape real anonymous traffic sends, which is what the free
+	// tier's gate judges.
+	payload, err := probePayload(model, protocol, "")
+	if err != nil {
+		result.Verdict = "config"
+		result.Cause = "probe request could not be built"
+		return result
+	}
+	// Round-robin across transports (empty affinity) rather than pinning one per
+	// model: with several proxies a permanently broken one would otherwise own
+	// every probe and poison the verdict forever. The usual single-Clash-proxy
+	// setup is unaffected — there is only one node to pick.
+	//
+	// CursorFor returns a value and NextProbe has a pointer receiver, so the
+	// cursor needs a name (same reason as nextFor in the cooling tests).
+	cursor := g.anonymous.CursorFor("")
+	node := cursor.NextProbe()
+	if node == nil {
+		result.Verdict = "config"
+		result.Cause = "no anonymous proxy is configured"
+		return result
+	}
+	proxyName = config.RedactURL(node.proxy.name)
+	ids := identity.RequestIDs{
+		Session: identity.CanonicalSessionID("watchdog:" + model),
+		Project: "opencode2api:default-project",
+		Request: identity.RandomID("probe", 16),
+	}
+	ctx, cancel := context.WithTimeout(ctx, watchdogProbeTimeout)
+	defer cancel()
+	req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Anonymous, protocol, payload, ids, anonymousZenKey)
+	if err != nil {
+		result.Verdict = "config"
+		result.Cause = "probe request could not be created"
+		return result
+	}
+	started := time.Now()
+	resp, err := node.proxy.client.Do(req)
+	result.Attempted = true
+	result.DurationMS = time.Since(started).Milliseconds()
+	if err != nil {
+		if resp != nil {
+			httpx.DrainAndClose(resp.Body)
+		}
+		result.Transport = transportCauseShort(err)
+		result.Cause = watchdogCause(nil, err)
+		result.Verdict = classifyAnonymousVerdict(result.Cause, false)
+		return result
+	}
+	result.Status = resp.StatusCode
+	if resp.StatusCode/100 == 2 {
+		// The free lane answers as a stream; all the watchdog needs to know is
+		// that this node was willing to serve it.
+		httpx.DrainAndClose(resp.Body)
+		result.Verdict = "ok"
+		return result
+	}
+	// Same peeking path an ordinary failure takes, guards included: the
+	// isEventStream and known-length bounds are exactly what keep a non-2xx event
+	// stream or a multi-megabyte WAF page from being read to the bound.
+	// upstreamErrorType puts the bytes back into resp.Body, so the drain below is
+	// what actually closes the connection.
+	result.Cause = watchdogCauseLabel(upstreamErrorType(resp), result.Status, nil)
+	httpx.DrainAndClose(resp.Body)
+	result.Verdict = classifyAnonymousVerdict(result.Cause, false)
+	if result.Verdict == "ok" {
+		result.Verdict = probeFallbackVerdict(result.Status)
+	}
+	return result
+}
+
+// probeFallbackVerdict classifies the non-2xx statuses whose cause carries no
+// class at all (empty, non-JSON, or oversized error body), where
+// classifyAnonymousVerdict can only answer "ok" — which for a probe would read
+// as "this node is fine" about a request the upstream just refused.
+//
+// For a classless body the table follows watchdog-clash.ps1's classification of
+// the very statuses: 401/400/404 stop the round as gateway config, 429 waits,
+// everything else moves on to the next candidate. Two deliberate differences
+// remain, and they only ever make the script try MORE candidates, never fewer:
+//
+//   - 403 is fingerprint, not config. The gateway never authors a 403 (its own
+//     rejections are 401/400/429/503-ModelUnavailable/499/502/504), so a 403 seen
+//     by a probe came from the upstream: the FreeTierError gate, or an edge/WAF
+//     challenge page on that exit IP. Legacy mapped it to config, which made
+//     Invoke-Failover break out of the candidate loop, roll back to the original
+//     node and sleep — one challenged exit IP could void a whole round. The
+//     script already treats a FreeTier 403 that way (fingerprint: log it, try the
+//     next candidate), so this only removes the difference between the two kinds
+//     of upstream 403.
+//   - where a status and a class disagree (400/403 carrying a quota class), the
+//     class wins here and the status won in legacy: the probe reports quota and
+//     keeps switching, where legacy stopped the round. That is the point of the
+//     change — a burned per-IP allowance is fixed by changing exit IP.
+//
+// What the table does replace is the one case legacy could not classify at all:
+// a synthesized 502 with attempts=0, where nothing was ever sent.
+func probeFallbackVerdict(status int) string {
+	if status == http.StatusTooManyRequests {
+		return "ratelimit"
+	}
+	switch status {
+	case http.StatusUnauthorized, http.StatusBadRequest, http.StatusNotFound:
+		return "config"
+	case http.StatusForbidden:
+		return "fingerprint"
+	}
+	return "transport"
 }
 
 // classifyAnonymousVerdict maps the stored anonymous cooldown cause (see
@@ -226,20 +485,29 @@ func watchdogCause(resp *http.Response, err error) string {
 		// anyway so a future caller cannot label a success as an error.
 		return fmt.Sprintf("upstream HTTP %d", status)
 	}
-	if typ := upstreamErrorType(resp); typ != "" {
+	return watchdogCauseLabel(upstreamErrorType(resp), status, err)
+}
+
+// watchdogCauseLabel renders the same label from an already-extracted upstream
+// error class, so the watchdog probe (which reads the error body itself and has
+// no passthrough to preserve) and the ordinary failure path produce
+// byte-identical strings and therefore identical verdicts.
+func watchdogCauseLabel(typ string, status int, err error) string {
+	switch {
+	case typ != "":
 		return fmt.Sprintf("%s (upstream HTTP %d)", typ, status)
-	}
-	if err != nil {
+	case err != nil:
 		// A transport failure that still carries a response: keep the
 		// transport prefix (it outranks the status in the classifier).
 		return fmt.Sprintf("transport (%s) (upstream HTTP %d)", transportCauseShort(err), status)
+	default:
+		// No error class in the body (empty, non-JSON, unreadable, oversized):
+		// the status tail still has to be parenthesized, because that is where
+		// classifyAnonymousVerdict reads it. A bare "upstream HTTP 502" would
+		// parse as no status at all and degrade a server-side wobble into
+		// "unknown cause, just wait" instead of the transport verdict it is.
+		return fmt.Sprintf("upstream error (upstream HTTP %d)", status)
 	}
-	// No error class in the body (empty, non-JSON, unreadable, oversized):
-	// the status tail still has to be parenthesized, because that is where
-	// classifyAnonymousVerdict reads it. A bare "upstream HTTP 502" would parse
-	// as no status at all and degrade a server-side wobble into "unknown
-	// cause, just wait" instead of the transport verdict it is.
-	return fmt.Sprintf("upstream error (upstream HTTP %d)", status)
 }
 
 // transportCauseShort classifies a transport failure into the fixed short

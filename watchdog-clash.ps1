@@ -7,7 +7,7 @@
     1) 当前 Selector 节点在 Mihomo 侧 alive=false / 消失        → 刷新后原地复测一次，仍坏才切换
     2) 网关 /v1/watchdog/status 报 proxies.all_down=true（传输全坏） → 刷新后原地复测一次，仍坏才切换
     3) 网关 /v1/watchdog/status 报 anonymous.verdict=transport（传输坏，常见为 cause=transport (connection failed) 网络抖动） → 累计 TransportConfirmRounds 轮（默认 3）仍坏才刷新，刷新后原地复测一次，仍坏才切换（单个 ok/限流轮不再清零，连续 4 轮非 transport 才衰减；网关冷却过期后 5 分钟内仍报 transport，防“两次失败→过期→误报恢复”死循环）
-    4) 网关 /v1/watchdog/status 报 anonymous.verdict=quota（额度尽） → 与上面三类同样先刷新，刷新后原地复测一次（刷新换的是同名节点背后的出口 IP，额度可能已恢复），仍坏才切换；且 quota 轮探针必然先吃匿名 429、再由网关回退付费 key 才拿到 200，复测 200 不等于恢复，要复查 verdict 翻离 quota 才算恢复
+    4) 网关 /v1/watchdog/status 报 anonymous.verdict=quota（额度尽） → 与上面三类同样先刷新，刷新后原地复测一次（刷新换的是同名节点背后的出口 IP，额度可能已恢复），仍坏才切换；探针走网关的 /v1/watchdog/probe 时只测匿名通道、不回退付费 key，复测 200 就等于这条出口 IP 的匿名通道真恢复了（旧探针 legacy 才需要再复查 verdict 翻离 quota）
   verdict=ratelimit/cooling（纯限流/普通冷却）只记日志，不刷新、不切换、不验证；verdict=ok 且有 transport 前科未验证时只打一次节流验证探针（5 分钟一次），无前科的 ok 轮不验证。
   切换前不再为确认 verdict 打探针：verdict 已由网关内部分类给出原因，不花配额；
   仅订阅刷新成功后打一次恢复复测（见下），恢复则跳过切换。
@@ -15,9 +15,15 @@
   其余轮次静默计数；异常/切换/限流/冷却不受影响仍每轮打印，恢复正常后立即补一条。
   节流只对常驻循环有效（-Once 每次新进程首轮必打）；若超过 NormalLogMinutes 仍无任何日志
   且无“进入故障切换”行，即视为看门狗异常（正常静默不会超过心跳周期）。
-  切换后用网关真实路由打一次 big-pickle (每次换新 nonce，绕开按内容指纹的本地冷却)，
-  成功即结束，失败则按延迟从低到高试下一个候选，最多 MaxCandidates 个。
-  注意最坏单轮耗时：MaxCandidates(默认20) × VerifyTimeoutSeconds(默认120s) + SwitchGapSeconds ≈ 40 分钟；
+  切换后打一次 big-pickle 探针，默认走网关的 POST /v1/watchdog/probe：它保证请求真的
+  发到上游（忽略代理传输健康闸门与冷却——这两样挂在新节点上时，旧探针会拿到本地合成的
+  502「all upstream attempts failed」，而 502 又被判成 transport，整池候选就被烧在一个
+  换节点根本解不开的闸门上）、不写任何池状态（不自造退避、不伪造恢复证据）、并直接回
+  机器可读的 verdict（quota/transport/ratelimit/fingerprint/config/ok）。
+  网关没有该端点（404）时自动回落旧的 /v1/chat/completions 探针，也可用 -ProbeEndpoint legacy 强制。
+  探针通过即结束，失败则按延迟从低到高试下一个候选，最多 MaxCandidates 个。
+  注意最坏单轮耗时：MaxCandidates(默认20) × VerifyTimeoutSeconds(默认120s) + SwitchGapSeconds ≈ 40 分钟，
+  外加每个候选最多 ProxyReadySeconds(默认5s)+10s（闸门等待里最后一次 status 调用自身带 10s 超时）；
   刷新后的原地复测另加最多 1 × VerifyTimeoutSeconds（quota 轮现在也计入），刷新本身还有下载+校验+热重载，
   同步阻塞巡检循环属设计如此（不是卡死），调参前请知悉。
   进入切换前先刷新一次订阅(受 RefreshCooldownMinutes 节流，每轮最多 1 次)，
@@ -37,7 +43,9 @@
   10-14 更正（勿再按旧文案“优化”回去）：早期版本按“quota 刷新不变 IP，复测必败”跳过了刷新后的原地复测，
   与本段实证直接矛盾——刷新换的正是同名节点背后的出口 IP，原 IP 额度烧尽不代表新 IP 也用尽；
   已改为四类触发统一走刷新 + 原地复测。
-  网关侧仅新增脚本专用只读 decision 接口（server_keys 鉴权，不动路由与配置结构）：切换 Selector 即换出口 IP，网关零重启生效。
+  网关侧新增两个脚本专用接口（server_keys 鉴权，不动路由与配置结构）：
+  GET /v1/watchdog/status 是只读 decision 快照；POST /v1/watchdog/probe 是强制真发上游的探针
+  （忽略代理健康闸门与冷却、只测匿名通道、不写任何池状态）。切换 Selector 即换出口 IP，网关零重启生效。
 
   并发与密钥说明：脚本用全局命名互斥保证单实例（双开时后者直接退出），避免并发写三文件与重复切换；
   网关 server key 与推理 key 同权（可打全量推理），脚本只放网关本机、config.json 用文件 ACL 收紧，长期考虑只读 token 或回环绑定。
@@ -93,6 +101,22 @@
   省略的键不受影响。deprioritize 的两个键在显式传同名命令行参数时以命令行优先，
   exclude_contains 没有对应参数、写错只能改文件或换路径。只在启动时读一次，改完需重启看门狗。
 
+.PARAMETER ProbeEndpoint
+  验证探针走哪条通道。auto（默认）= 打网关的 POST /v1/watchdog/probe：它保证请求真的发到上游
+  （忽略代理传输健康闸门与冷却）、不写任何池状态、并直接给出机器可读的 verdict；网关还没有这个
+  端点时本进程自动回落旧的 /v1/chat/completions 探针并打一条 WARN。legacy = 强制旧探针。
+  旧探针拿到的 502「all upstream attempts failed」无法区分「网关根本没发」和「发了被拒」，
+  新探针则两种情况都能如实分类。
+  已知副作用（探针通道独有）：网关自撰的冷却 429 永远不出现，所以「网关在退避 → 贴 Retry-After
+  早退」这条路在探针通道下不可达；全候选失败只能退回 RoundCooldownMinutes(默认5分钟) 静默，
+  而匿名冷却封顶才 15s。这是刻意的——探针的 429 一定是上游的，换出口 IP 才是唯一解法。
+
+.PARAMETER ProxyReadySeconds
+  切完节点、真正打探针之前，最多等多少秒让网关恢复代理传输健康闸门
+  （/v1/watchdog/status 的 proxies.healthy 回到 proxies.total 就立刻继续）。只在闸门确实关着时
+  花时间，默认 5，0 = 不等。注意这不是「探针能不能发出去」的前提——探针会穿透闸门；它只是少让
+  「切换后首次拨号超时被判坏」的瞬时状态白烧一个候选和一次额度。
+
 .EXAMPLE
   pwsh -NoProfile -ExecutionPolicy Bypass -File watchdog-clash.ps1 -DryRun
   pwsh -NoProfile -ExecutionPolicy Bypass -File watchdog-clash.ps1
@@ -113,6 +137,16 @@ param(
   [ValidateRange(1, 25)][int]$MaxCandidates = 20,
   [ValidateRange(0, 300)][int]$SwitchGapSeconds = 15,
   [ValidateRange(5, 600)][int]$VerifyTimeoutSeconds = 120,
+  # 探针通道。auto = 优先打网关的 /v1/watchdog/probe：它保证请求真的发到上游
+  # （忽略代理健康闸门与冷却）、不写任何池状态、并直接回机器可读的 verdict；
+  # 网关还没有这个端点（404）时本进程自动回落旧的 /v1/chat/completions 探针。
+  # legacy = 强制旧探针（旧行为：可能被网关本地短路，且 502 无法区分原因）。
+  [ValidateSet('auto', 'legacy')][string]$ProbeEndpoint = 'auto',
+  # 切完节点、真正打探针之前，最多等多少秒让网关把代理传输健康闸门恢复
+  # （/v1/watchdog/status 的 proxies.healthy 回到 proxies.total 就立刻继续，不等满）。
+  # 只在闸门确实关着时才花时间，0 = 不等。探针本身已经能穿透闸门，所以这一项
+  # 只是少误伤、少烧配额，不是探针能发出去的前提。
+  [ValidateRange(0, 30)][int]$ProxyReadySeconds = 5,
   [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$SubscriptionUid = 'RYni6JpVUPX8',
   [string]$SubscriptionUA = 'clash-verge/v2.5.2',
   [int]$RefreshCooldownMinutes = 5,
@@ -162,6 +196,10 @@ $script:Selector = $Selector
 $script:GatewayBase = $GatewayBase.TrimEnd('/')
 $script:GatewayKey = $GatewayKey
 $script:VerifyModel = $VerifyModel
+$script:ProbeEndpoint = $ProbeEndpoint
+# 运行时可降级：探针端点 404 一次就把本进程永久切回旧探针，不必每轮再试。
+$script:ProbeSupported = ($ProbeEndpoint -ne 'legacy')
+$script:ProxyReadySeconds = $ProxyReadySeconds
 $script:QuotaFailMemoryMinutes = $QuotaFailMemoryMinutes
 $script:DeprioritizeContains = $DeprioritizeContains
 $script:DeprioritizePenaltyMs = $DeprioritizePenaltyMs
@@ -719,7 +757,99 @@ function Get-DemoteMark {
   return ''
 }
 
-function Test-GatewayNode {
+function ConvertFrom-WatchdogProbe {
+  # 探针端点的 verdict 直接就是网关自己的分类（与 /v1/watchdog/status 同一词表，
+  # 同一套 classifyAnonymousVerdict），脚本不再对正文做子串判定：
+  #   ok          → 该出口 IP 的匿名通道可用（真发上游拿到了 2xx）
+  #   quota       → 该出口 IP 额度烧尽（FreeUsageLimit/BlackUsageLimit 类）→ 换节点
+  #   transport   → 出口路由坏（真发了上游，传输层失败）→ 换节点
+  #   ratelimit   → 普通限流，等
+  #   fingerprint → 上游拒的是请求身份本身（403 FreeTierError），换节点无解
+  #   config      → 网关侧状态（模型不在目录/未启用匿名/模型被禁用）→ 停轮
+  #   cooling     → 强制探针被短路了，这是网关 bug，必须记 ERROR 而不是当退避早退
+  # attempted 与 cause 只进日志：上游错误正文一律不回传（回传就得重新做子串判定，
+  # 也就重新绑回网关对正文里 opencode2api: 前缀的中和逻辑）。
+  # 参数刻意不加 [string]：加了就会在绑定期把 byte[] 变成 "System.Byte[]"，
+  # 正好毁掉下面那次显式解码。Content-Type 不保证是 JSON 时 pwsh 的 .Content 是
+  # byte[]，直接字符串化会静默退化成 other（= 白白换节点）。
+  param($Content)
+  if ($Content -is [byte[]]) { $Content = [Text.Encoding]::UTF8.GetString($Content) }
+  $Content = [string]$Content
+  $verdict = ''
+  $cause = ''
+  $transport = ''
+  $attempted = $false
+  # 拿到 verdict 时这才是上游真答的状态码；解析失败退回 0（= 没有上游应答）。
+  # 千万别丢：所有失败日志都打 status=，硬编码 200 会把「上游 429」打成一串
+  # 自相矛盾的 status=200 class=quota，而排障第一眼要看的恰恰是这个。
+  $status = 0
+  try {
+    $doc = ConvertFrom-Json $Content -ErrorAction Stop
+    $status = [int](Get-Prop $doc 'status')
+    $verdict = [string](Get-Prop $doc 'verdict')
+    $cause = [string](Get-Prop $doc 'cause')
+    $transport = [string](Get-Prop $doc 'transport')
+    $attempted = [bool](Get-Prop $doc 'attempted')
+  } catch {
+    Write-WdLog "探针响应不是 JSON，无法分类：$(Shorten $Content 200)" 'ERROR'
+  }
+  if ([string]::IsNullOrWhiteSpace($verdict)) { $verdict = 'other' }
+  $class = switch ($verdict) {
+    'ok' { 'ok' }
+    'quota' { 'quota' }
+    'transport' { 'transport' }
+    'ratelimit' { 'ratelimit' }
+    'fingerprint' { 'fingerprint' }
+    'cooling' { 'cooling' }
+    'config' { 'config' }
+    default { 'other' }
+  }
+  $body = "attempted=$attempted status=$status verdict=$verdict cause=$cause transport=$transport"
+  return @{ Ok = ($verdict -eq 'ok'); Status = $status; Class = $class; Body = $body; Backoff = $false; RetryAfter = 0; Verdict = $verdict }
+}
+
+function Invoke-WatchdogProbe {
+  # 网关专用探针端点 POST /v1/watchdog/probe。与普通推理请求的三点差别，正是
+  # 看门狗需要的：
+  #   1) 保证发出——忽略代理传输健康闸门与任何冷却。切完节点后要回答的是「这个
+  #      出口 IP 现在到底答什么」，而不是「网关这一秒愿不愿意发」；旧探针在这里
+  #      会拿到本地合成的 502（attempts=0），而 502 又被判成 transport，于是整池
+  #      候选被烧在一个换节点根本解不开的闸门上。
+  #   2) 不写池状态——不动冷却/健康/last_success/last_failure。旧探针每次都会给
+  #      用户流量重新点着一次冷却（quota 轮那两段 verdict 复查就是在跟它搏斗）。
+  #   3) 机器可读——verdict 字段即判据，正文不回传。
+  param([string]$Nonce, [int]$TimeoutSec)
+  $key = Resolve-GatewayKey
+  $uri = $script:GatewayBase + '/v1/watchdog/probe'
+  $payload = @{ model = $script:VerifyModel; nonce = $Nonce } | ConvertTo-Json -Compress
+  $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+  try {
+    $r = Invoke-WebRequest -Uri $uri -Method Post -Headers @{ Authorization = "Bearer $key" } `
+      -Body $bytes -ContentType 'application/json; charset=utf-8' -TimeoutSec $TimeoutSec -UseBasicParsing
+    return ConvertFrom-WatchdogProbe $r.Content
+  } catch {
+    $info = Get-HttpErrorInfo $_
+    $status = [int](Get-Prop $info 'Status')
+    if ($status -eq 404) {
+      # 老网关没有这个端点：永久回落旧探针，不必每轮再试一次。
+      $script:ProbeSupported = $false
+      Write-WdLog '网关没有 /v1/watchdog/probe（404），本进程回落旧探针 /v1/chat/completions（重启看门狗或升级网关后恢复）' 'WARN'
+      return Test-GatewayNodeLegacy -Nonce $Nonce -TimeoutSec $TimeoutSec
+    }
+    # 探针端点只要拿到 verdict 就回 200；这里的非 200 是网关自己拒绝了这个请求
+    # （鉴权 401、参数 400）或网关异常 5xx，按旧口径分类：4xx 配置错、5xx 传输侧。
+    $class = 'other'
+    if ($status -eq 401 -or $status -eq 403 -or $status -eq 404 -or $status -eq 400) { $class = 'config' }
+    elseif ($status -ge 500) { $class = 'transport' }
+    # Verdict 一并给空串：两条返回路径的键集保持一致，省得调用方以后点访问踩坑。
+    return @{ Ok = $false; Status = $status; Class = $class; Body = (Shorten ([string](Get-Prop $info 'Body')) 200); Backoff = $false; RetryAfter = 0; Verdict = '' }
+  }
+}
+
+# Test-GatewayNodeLegacy 是切换探针之前的实现，逐字保留：它仍要在 -ProbeEndpoint
+# legacy 下可用，也是探针端点 404 时的回落目标。注意它区分不了「网关没发」和
+# 「发了被拒」——两者都是 502 all upstream attempts failed。
+function Test-GatewayNodeLegacy {
   param([string]$Nonce, [int]$TimeoutSec)
   $key = Resolve-GatewayKey
   $uri = $script:GatewayBase + '/v1/chat/completions'
@@ -777,6 +907,46 @@ function Test-GatewayNode {
     }
     return @{ Ok = $false; Status = $info.Status; Class = $class; Body = $body; Backoff = $backoff; RetryAfter = $raSecs }
   }
+}
+
+function Test-GatewayNode {
+  # 统一入口：能用探针端点就用（保证真发上游 + 机器可读 verdict），否则回落旧探针。
+  param([string]$Nonce, [int]$TimeoutSec)
+  if ($script:ProbeSupported) { return Invoke-WatchdogProbe -Nonce $Nonce -TimeoutSec $TimeoutSec }
+  return Test-GatewayNodeLegacy -Nonce $Nonce -TimeoutSec $TimeoutSec
+}
+
+function Wait-GatewayProxyReady {
+  # 切完节点、真正打探针之前，最多等 ProxyReadySeconds 秒，让网关把代理传输健康
+  # 闸门恢复（/v1/watchdog/status 的 proxies.healthy 回到 proxies.total 即立刻继续，
+  # 不等满）。只在闸门确实关着时花时间。
+  #
+  # 这一项**不是**探针能发出去的前提——探针会穿透闸门真发上游；它只是少让一次
+  # 「切换后首次拨号超过 connect_timeout 被判坏」的瞬时状态白烧一个候选和一次额度。
+  # 返回 $true 表示「可以打探针了」（含放弃等待）：探针无论如何都会真发，
+  # 所以这里永远不该阻塞切换流程。
+  param([int]$TimeoutSec)
+  if ($TimeoutSec -le 0) { return $true }
+  $deadline = (Get-Date).AddSeconds($TimeoutSec)
+  do {
+    $healthy = 0
+    $total = 0
+    try {
+      $wd = Get-WatchdogStatus
+      $prox = Get-Prop $wd 'proxies'
+      $total = [int](Get-Prop $prox 'total')
+      $healthy = [int](Get-Prop $prox 'healthy')
+    } catch {
+      return $true
+    }
+    # 读不到代理数据（total<=0）与「读不到 status」同等对待：等下去也不会变好，
+    # 而探针反正会穿透闸门真发上游，所以立刻放行，绝不阻塞切换流程。
+    if ($total -le 0) { return $true }
+    if ($healthy -ge $total) { return $true }
+    Start-Sleep -Milliseconds 700
+  } while ((Get-Date) -lt $deadline)
+  Write-WdLog "代理传输健康闸门 $TimeoutSec s 内未恢复（healthy/total 未齐），继续打探针：探针会穿透闸门真发上游" 'INFO'
+  return $true
 }
 
 function Update-SelectedNow {
@@ -1226,6 +1396,7 @@ function Invoke-Failover {
       } elseif (-not $aliveFast) {
         Write-WdLog "刷新后当前节点仍 alive=false（now=$nowFast），继续切换" 'WARN'
       } else {
+        Wait-GatewayProxyReady -TimeoutSec $script:ProxyReadySeconds | Out-Null
         $nonceFast = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-' + (Get-Random -Maximum 999999)
         $vrFast = Test-GatewayNode -Nonce $nonceFast -TimeoutSec $VerifyTimeoutSeconds
         if ((Get-Prop $vrFast 'Ok')) {
@@ -1236,7 +1407,10 @@ function Invoke-Failover {
           # 有额度的出口 IP；读不到或仍是 quota/transport 一律当没恢复，继续进切换循环。
           # 否则既白花一次真实付费推理，又把“已恢复”记成假账。
           $recovered = $true
-          if ($Verdict -eq 'quota') {
+          # 探针端点只测匿名通道（网关不拿付费 key 回退），所以 verdict=ok 就是这条
+          # 出口 IP 的匿名通道真答了，不需要再复查 verdict——旧探针经付费 key 回退
+          # 才拿到 200 的那个坑在探针上不存在。旧探针（legacy 或 404 回落）仍要复查。
+          if ($Verdict -eq 'quota' -and -not $script:ProbeSupported) {
             $verdictFast = ''
             try {
               $wdFast = Get-WatchdogStatus
@@ -1333,6 +1507,7 @@ function Invoke-Failover {
     }
     $script:LastSwitch = Get-Date
     Start-Sleep -Seconds 2
+    Wait-GatewayProxyReady -TimeoutSec $script:ProxyReadySeconds | Out-Null
     $nonce = (Get-Date).ToString('yyyyMMdd-HHmmss') + '-' + (Get-Random -Maximum 999999)
     $vr = Test-GatewayNode -Nonce $nonce -TimeoutSec $VerifyTimeoutSeconds
     $tried += $c.Name
@@ -1611,11 +1786,13 @@ function Invoke-WatchIteration {
       } else {
         $script:RoundCooldownUntil = (Get-Date).AddMinutes($RoundCooldownMinutes)
       }
-    } else {
+    } elseif (-not $script:ProbeSupported) {
       # 验证成功可能经付费 key 回退（网关匿名失败后自动走 KeyTiers），此时匿名
       # 通道并未恢复；复查一次 verdict，若同类 verdict 仍在冷却中则加一段短冷却
       # 再观察，避免下轮 15s 后空转切换（每次切换还会断开全部连接）。
       # 经匿名成功的请求会清冷却，复查为 ok，本分支不触发，不影响正常路径。
+      # 探针端点只测匿名通道、且探针不写池状态，所以「经付费 key 回退才 200」在
+      # 探针上不存在，这段复查只对旧探针有意义。
       try {
         $wdAfter = Get-WatchdogStatus
         $anonAfter = Get-Prop $wdAfter 'anonymous'
@@ -1762,7 +1939,7 @@ try {
   $regionKeysForLog = @($script:DeprioritizeContains | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
   if ($script:DeprioritizePenaltyMs -gt 0 -and @($regionKeysForLog).Count -gt 0) { $regionCfg = "$($regionKeysForLog -join '/')+$($script:DeprioritizePenaltyMs)ms" }
   $excludeCfg = if (@($script:ExcludeContains).Count -gt 0) { @($script:ExcludeContains) -join '/' } else { '已关闭' }
-  Write-WdLog "看门狗启动：selector=$Selector 网关=$($script:GatewayBase) 模型=$VerifyModel 轮询=${PollSeconds}s 正常心跳=${NormalLogMinutes}分钟 quota记忆=${QuotaFailMemoryMinutes}分钟 transport连续确认=${TransportConfirmRounds}轮 地区降权=${regionCfg} 子串排除=${excludeCfg}"
+  Write-WdLog "看门狗启动：selector=$Selector 网关=$($script:GatewayBase) 模型=$VerifyModel 轮询=${PollSeconds}s 正常心跳=${NormalLogMinutes}分钟 quota记忆=${QuotaFailMemoryMinutes}分钟 transport连续确认=${TransportConfirmRounds}轮 探针通道=$(if ($script:ProbeSupported) { 'watchdog-probe' } else { 'legacy' }) 闸门等待=${ProxyReadySeconds}s 地区降权=${regionCfg} 子串排除=${excludeCfg}"
   if ($DryRun) {
     Invoke-DryRun -Uid $SubscriptionUid
     exit 0

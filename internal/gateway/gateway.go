@@ -113,6 +113,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(wire.Anthropic)))
 	mux.HandleFunc("POST /v1/systemone", g.authenticate(g.handleSystemOne))
 	mux.HandleFunc("GET /v1/watchdog/status", g.authenticate(g.handleWatchdogStatus))
+	mux.HandleFunc("POST /v1/watchdog/probe", g.authenticate(g.handleWatchdogProbe))
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	return telemetry.Recover(g.logger, mux)
 }

@@ -166,6 +166,30 @@ func (c *anonymousCursor) NextForRequest(fingerprint string) *anonymousNode {
 	return nil
 }
 
+// NextProbe returns the next proxy in rotation order regardless of transport
+// health and cooldown, and it is the ONLY path allowed to do so. It exists for
+// the watchdog's forced probe (watchdog.go), whose whole purpose is to measure
+// the exit node that is live right now:
+//
+//   - a transport-unhealthy mark usually means a dial timed out while Clash was
+//     re-routing a node switch, not that the new node cannot reach the upstream;
+//   - a residual cooldown belongs to some earlier fingerprint (or to the
+//     unscoped background catalog refresh) and says nothing about what this
+//     node would answer now.
+//
+// Ordinary traffic must keep using NextForRequest. Widening this to every
+// request would turn the anonymous backoff into a no-op, and the probe it
+// serves writes no pool state at all (see handleWatchdogProbe), so bypassing
+// those gates costs nothing a later turn cannot restore on its own.
+func (c *anonymousCursor) NextProbe() *anonymousNode {
+	if c.pool == nil || c.offset >= len(c.pool.nodes) {
+		return nil
+	}
+	node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
+	c.offset++
+	return node
+}
+
 // MarkSuccess records a successful anonymous inference turn: it clears the
 // cooldown and, as the only positive recovery proof the watchdog feed accepts,
 // drops the stale transport memory and stamps the success moment.
