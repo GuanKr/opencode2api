@@ -6,7 +6,7 @@
   每隔 PollSeconds 秒做一次只读巡检，只在命中以下信号时才动作：
     1) 当前 Selector 节点在 Mihomo 侧 alive=false / 消失        → 刷新后原地复测一次，仍坏才切换
     2) 网关 /v1/watchdog/status 报 proxies.all_down=true（传输全坏） → 刷新后原地复测一次，仍坏才切换
-    3) 网关 /v1/watchdog/status 报 anonymous.verdict=transport（传输坏，常见为 cause=transport (connection failed) 网络抖动） → 累计 TransportConfirmRounds 轮（默认 3）仍坏才刷新，刷新后原地复测一次，仍坏才切换（单个 ok/限流轮不再清零，连续 4 轮非 transport 才衰减；网关冷却过期后 5 分钟内仍报 transport，防“两次失败→过期→误报恢复”死循环）
+    3) 网关 /v1/watchdog/status 报 anonymous.verdict=transport（传输坏，常见为 cause=transport (connection failed) 网络抖动） → 累计 TransportConfirmRounds 轮（默认 2）仍坏才刷新，刷新后原地复测一次，仍坏才切换（单个 ok/限流轮不再清零，连续 4 轮非 transport 才衰减；网关冷却过期后 5 分钟内仍报 transport，防“两次失败→过期→误报恢复”死循环）
     4) 网关 /v1/watchdog/status 报 anonymous.verdict=quota（额度尽） → 与上面三类同样先刷新，刷新后原地复测一次（刷新换的是同名节点背后的出口 IP，额度可能已恢复），仍坏才切换；探针走网关的 /v1/watchdog/probe 时只测匿名通道、不回退付费 key，复测 200 就等于这条出口 IP 的匿名通道真恢复了（旧探针 legacy 才需要再复查 verdict 翻离 quota）
   verdict=ratelimit/cooling（纯限流/普通冷却）只记日志，不刷新、不切换、不验证；verdict=ok 且有 transport 前科未验证时只打一次节流验证探针（5 分钟一次），无前科的 ok 轮不验证。
   切换前不再为确认 verdict 打探针：verdict 已由网关内部分类给出原因，不花配额；
@@ -158,7 +158,7 @@ param(
   [ValidateRange(0, 60)][int]$RefreshSettleSeconds = 5,
   # transport 连续确认轮数：verdict=transport（多为网络抖动，如 transport (connection failed)）需连续 N 轮仍坏才刷新切换；
   # quota/all_down/节点失效不受此限制，仍立即动作。
-  [ValidateRange(1, 10)][int]$TransportConfirmRounds = 3,
+  [ValidateRange(1, 10)][int]$TransportConfirmRounds = 2,
   # 看门狗专用配置文件路径（默认脚本同目录 watchdog.json）。只读、从不写回。
   # 存 exclude_contains（子串排除）与 deprioritize（地区降权）两项，见脚本头 .DESCRIPTION。
   # 文件不存在 = 全部用内置默认值；解析失败直接报错（静默回退等于悄悄丢掉排除规则）。
@@ -1561,7 +1561,7 @@ function Invoke-WatchIteration {
     [int]$SwitchGapSeconds, [int]$VerifyTimeoutSeconds,
     [string]$Uid, [int]$RoundCooldownMinutes,
     [int]$NormalLogMinutes = 20, [int]$RefreshSettleSeconds = 5,
-    [ValidateRange(1, 10)][int]$TransportConfirmRounds = 3
+    [ValidateRange(1, 10)][int]$TransportConfirmRounds = 2
   )
   $wd = $null
   try { $wd = Get-WatchdogStatus }
