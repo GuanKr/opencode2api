@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"opencode2api/internal/config"
@@ -60,6 +61,11 @@ type Gateway struct {
 	// attemptTimeout bounds a whole upstream attempt (dial + write + headers +
 	// first event), not just the header wait. Zero keeps the legacy behavior.
 	attemptTimeout time.Duration
+	// lastProxyKick throttles on-demand proxy re-probes (see
+	// kickProxyRecheck): without it an all-down spike would spawn one
+	// short-lived probe goroutine per request while the per-proxy CAS only
+	// dedupes overlapping probes, not goroutine creation.
+	lastProxyKick atomic.Int64
 }
 
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*Gateway, error) {
@@ -240,13 +246,18 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				wire.WriteError(w, external, statusClientClosedRequest, "client closed request", "client_canceled", ids.Request)
 				return
 			}
-			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
 			// An exhausted request budget is a timeout, not a bad gateway: the
-			// distinction matters to clients that retry on 502.
+			// distinction matters to clients that retry on 502. Checked before the
+			// cooldown hook so a request that lost its budget can never be
+			// answered "come back later" for a lane that is in fact fine.
 			if errors.Is(err, context.DeadlineExceeded) {
 				wire.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 				return
 			}
+			if g.writeCoolingResponse(w, external, err, meta, ids.Request, string(finalTier)) {
+				return
+			}
+			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
 			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}
@@ -414,11 +425,17 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 			wire.WriteError(w, wire.SystemOne, statusClientClosedRequest, "client closed request", "client_canceled", ids.Request)
 			return
 		}
-		g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+		// Same ordering as handleInference: an exhausted budget is a timeout, and it
+		// must be decided before the cooldown hook can answer 429 for a lane
+		// that is actually fine.
 		if errors.Is(err, context.DeadlineExceeded) {
 			wire.WriteError(w, wire.SystemOne, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 			return
 		}
+		if g.writeCoolingResponse(w, wire.SystemOne, err, meta, ids.Request, string(finalTier)) {
+			return
+		}
+		g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
 		wire.WriteError(w, wire.SystemOne, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 		return
 	}

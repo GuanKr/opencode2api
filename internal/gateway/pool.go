@@ -207,14 +207,30 @@ func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
 	return cleared
 }
 
-// maxAnonymousRetryAfterMultiplier bounds an upstream Retry-After on the
-// anonymous lane to the same 8x ceiling as its exponential backoff. The lane
-// is rate limited per exit IP and, unlike key lanes, has no earliest-expiry
-// fallback: a quota response asking for hours would keep the exit skipped long
-// after a network change gave it a fresh allowance. Key lanes keep honoring
-// Retry-After in full, since their cursor already falls back to the node that
-// recovers first.
-const maxAnonymousRetryAfterMultiplier = 8
+// maxAnonymousCooldown caps how long any single anonymous-lane cooldown may
+// last, whichever rule produced it — the exponential ladder below or an
+// upstream Retry-After. It is an absolute duration rather than a multiple of
+// the base cooldown so that changing failure_cooldown_seconds cannot silently
+// drag the ceiling along with it.
+//
+// The lane is rate limited per exit IP and, unlike key lanes, has no
+// earliest-expiry fallback: a quota response asking for hours would keep the
+// exit skipped long after a network change gave it a fresh allowance. Key
+// lanes keep honoring Retry-After in full, since their cursor already falls
+// back to the node that recovers first.
+//
+// It also bounds the client-visible damage. The cooldown is held on the proxy
+// transport, not on the Clash node, so while it runs every request is refused
+// locally and no node switch can shorten it — a long ceiling turns one upstream
+// 429 into a long local outage.
+const maxAnonymousCooldown = 15 * time.Second
+
+// anonymousCooldownCeiling is the effective cap for one pool: never below the
+// configured base, so a ceiling smaller than the base cannot shorten even the
+// first failure's wait below what the operator asked for.
+func anonymousCooldownCeiling(base time.Duration) time.Duration {
+	return max(maxAnonymousCooldown, base)
+}
 
 // MarkFailure cools the node down after a failure that carries no user traffic
 // in context (the background catalog refresh). The cooldown itself is exactly
@@ -249,9 +265,13 @@ func (p *anonymousPool) startCooldown(node *anonymousNode, resp *http.Response, 
 	delay := p.cooldown * time.Duration(1<<min(failures-1, 3))
 	if resp != nil {
 		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > delay {
-			delay = min(retryAfter, p.cooldown*maxAnonymousRetryAfterMultiplier)
+			delay = retryAfter
 		}
 	}
+	// One ceiling for both rules above: a short Retry-After still never
+	// shortens the ladder (the > comparison above), and a long one can never
+	// outlive the anonymous lane's local-outage budget.
+	delay = min(delay, anonymousCooldownCeiling(p.cooldown))
 	node.coolCause.Store(cause)
 	until := time.Now().Add(delay).UnixNano()
 	node.cooldownUntil.Store(until)
@@ -267,8 +287,9 @@ func (p *anonymousPool) startCooldown(node *anonymousNode, resp *http.Response, 
 
 // staleCauseTTL bounds how long an expired transport cause keeps voting in
 // the watchdog feed after its cooldown lapses with no new success. It must
-// comfortably exceed the worst active wall (8x base, 120s at the default
-// failure_cooldown_seconds=15) plus the script's TransportConfirmRounds window
+// comfortably exceed the worst active wall — anonymousCooldownCeiling(base),
+// i.e. 15s by default, or the base itself when the operator raises it above
+// that — plus the script's TransportConfirmRounds window
 // (3x15s poll = 45s), or the "two failures then expiry looks like recovery"
 // resonance simply moves from ~15s to TTL. Five minutes keeps a real outage
 // voting long enough to switch while capping the collateral of a transient

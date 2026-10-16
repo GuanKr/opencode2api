@@ -593,6 +593,12 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	if lastErr == nil {
 		lastErr = errors.New("no usable upstream route")
 	}
+	if ctx.Err() == nil {
+		// Same on-demand re-probe as the anonymous lane (throttled inside):
+		// a just-fixed proxy recovers on the next request instead of waiting
+		// for the degraded ticker. No-op while anything is healthy.
+		g.kickProxyRecheck(ctx)
+	}
 	return nil, effectiveRoute, attempts, lastErr
 }
 
@@ -676,7 +682,23 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		return lastResponse, nil, attempts
 	}
 	if lastErr == nil {
-		lastErr = errors.New("no healthy anonymous proxies available")
+		// No attempt was made, so the cursor was empty. Distinguish an active
+		// cooldown — every healthy node sitting in its backoff window, which is
+		// a "come back later" the client must be told about — from a genuinely
+		// unusable route, where the 502 is the honest answer. maxCooldownSnapshot
+		// only counts healthy nodes, so an all-unhealthy pool reports no
+		// cooldown and keeps the transport wording.
+		if remain, cause := g.anonymous.maxCooldownSnapshot(); remain > 0 {
+			lastErr = errAnonymousCooling{retryAfter: remain, cause: cause}
+		} else {
+			lastErr = errors.New("no healthy anonymous proxies available")
+			// Nothing explains this but an unusable route, so kick one immediate
+			// async re-probe: a just-fixed proxy (e.g. the Clash node was
+			// switched after the failure) recovers on the next request instead
+			// of waiting out the degraded ticker. Throttled inside, and a no-op
+			// while anything is healthy.
+			g.kickProxyRecheck(ctx)
+		}
 	}
 	return nil, lastErr, attempts
 }
