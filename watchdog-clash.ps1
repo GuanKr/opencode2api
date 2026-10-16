@@ -490,6 +490,7 @@ function Get-HttpErrorInfo {
   param($Err)
   $status = $null
   $body = ''
+  $retryAfter = ''
   try {
     if ($Err.ErrorDetails -ne $null -and $Err.ErrorDetails.Message -ne $null -and $Err.ErrorDetails.Message -ne '') {
       $body = [string]$Err.ErrorDetails.Message
@@ -499,6 +500,20 @@ function Get-HttpErrorInfo {
     $resp = $Err.Exception.Response
     if ($resp -ne $null) {
       try { $status = [int]$resp.StatusCode } catch { }
+      try {
+        # 网关冷却 429 带 Retry-After（本轮把匿名冷却封顶压到 15s，这个值通常就是
+        # 它），拿它决定「退避早退后等多久再巡检」，比固定 RoundCooldownMinutes 贴合得多。
+        $hdrs = Get-Prop $resp 'Headers'
+        if ($hdrs -ne $null) {
+          $vals = $null
+          if ($hdrs -is [System.Net.Http.Headers.HttpHeaders]) {
+            if ($hdrs.TryGetValues('Retry-After', [ref]$vals)) { $retryAfter = (@($vals) -join ',') }
+          } else {
+            $raw = $hdrs['Retry-After']
+            if ($raw -ne $null) { $retryAfter = [string](@($raw) -join ',') }
+          }
+        }
+      } catch { }
       if ($body -eq '') {
         # pwsh7 的 Response 是 HttpResponseMessage（无 GetResponseStream），优先读 Content。
         try {
@@ -521,7 +536,7 @@ function Get-HttpErrorInfo {
       }
     }
   } catch { }
-  return @{ Status = $status; Body = $body }
+  return @{ Status = $status; Body = $body; RetryAfter = $retryAfter }
 }
 
 function Invoke-ClashGet {
@@ -718,7 +733,7 @@ function Test-GatewayNode {
   try {
     $r = Invoke-WebRequest -Uri $uri -Method Post -Headers @{ Authorization = "Bearer $key" } `
       -Body $bytes -ContentType 'application/json; charset=utf-8' -TimeoutSec $TimeoutSec -UseBasicParsing
-    return @{ Ok = $true; Status = [int]$r.StatusCode; Class = 'ok'; Body = '' }
+    return @{ Ok = $true; Status = [int]$r.StatusCode; Class = 'ok'; Body = ''; Backoff = $false; RetryAfter = 0 }
   } catch {
     $info = Get-HttpErrorInfo $_
     # Get-HttpErrorInfo 永远返回 @{Status;Body}（Body 缺失时为空串），这里点访问恒安全。
@@ -728,23 +743,30 @@ function Test-GatewayNode {
     # 否则一次指纹波动就会误判 config、中止整轮（22:39/22:41/23:12 三轮只试
     # 1~2 个候选即停即是此误杀）。
     $class = 'other'
-    # 网关冷却 429 正文同样携带触发类名（如 **FreeUsageLimitError**），先判配额
-    # 关键字再判通用冷却前缀，否则 quota 触发的冷却永远被标成 cooling。
+    # Backoff=true 表示「网关自己说在退避」而不是「这个节点有问题」。**前缀是判据的
+    # 必要条件，不能只看 429**：copyErrorResponse 只保留上游的 error.message 并把
+    # type 改写成 upstream_error，所以真上游 quota 429 透传给客户端的正文里既没有
+    # opencode2api: 也没有 FreeUsageLimit；网关冷却 429 则两个都有。只按状态码判会
+    # 把「真限流」误认成「网关退避」，结果 quota 轮里一个候选都不切、QuotaFailedAt 也
+    # 不记——而「按出口 IP 换节点逃 quota」正是免费层唯一有效的自救。
+    $backoff = ($info.Status -eq 429 -and $body.Contains('opencode2api:'))
+    # 网关冷却 429 优先于配额关键字：它描述的是网关状态，不是这个出口 IP 额度。
     # FreeTier-403 先于 config 摘出：与网关 verdict=fingerprint 对齐，只记日志、
     # 继续试下一个候选，绝不中止整轮（上游拒的是请求身份本身，换节点无解）。
     # class 只用于 config 中止与日志（切换决策只看服务端 verdict），顺序不影响流程。
-    if ($info.Status -eq 403 -and $body.Contains('FreeTierError')) {
-      $class = 'cooling'
-    }
-    elseif ($info.Status -eq 401 -or $info.Status -eq 403 -or $info.Status -eq 404 -or $info.Status -eq 400) {
-      $class = 'config'
-    }
+    if ($info.Status -eq 429 -and $body.Contains('opencode2api:')) { $class = 'cooling' }
+    elseif ($info.Status -eq 403 -and $body.Contains('FreeTierError')) { $class = 'cooling' }
+    elseif ($info.Status -eq 401 -or $info.Status -eq 403 -or $info.Status -eq 404 -or $info.Status -eq 400) { $class = 'config' }
     elseif ($body.Contains('FreeUsageLimit') -or $body.Contains('BlackUsageLimit')) { $class = 'quota' }
-    elseif ($info.Status -eq 429 -and $body.Contains('opencode2api:')) { $class = 'cooling' }
     elseif ($info.Status -eq 502 -or $info.Status -eq 503 -or $info.Status -eq 504 -or $body.Contains('gateway_transport')) {
       $class = 'transport'
     }
-    return @{ Ok = $false; Status = $info.Status; Class = $class; Body = $body }
+    $raSecs = 0
+    if ($retryAfter -ne '') {
+      $parsed = 0
+      if ([int]::TryParse(($retryAfter -split ',')[0].Trim(), [ref]$parsed) -and $parsed -gt 0) { $raSecs = $parsed }
+    }
+    return @{ Ok = $false; Status = $info.Status; Class = $class; Body = $body; Backoff = $backoff; RetryAfter = $raSecs }
   }
 }
 
@@ -1234,6 +1256,15 @@ function Invoke-Failover {
             Write-WdLog "网关配置错误（如 key/模型名不对），停止本轮：先修网关配置" 'ERROR'
             return @{ Ok = $false; Node = $null }
           }
+          if ([bool](Get-Prop $vrFast 'Backoff')) {
+            # 冷却挂在代理传输上，不是挂在 Clash 节点上：此刻换节点对冷却毫无影响，
+            # 只会把候选池白烧一遍（原实现因此在 10:23 一轮 12 秒内连试 8 个节点，
+            # 全部撞同一个 429）。正确动作是原地停手，等冷却到期后由下一轮巡检接手。
+            # RetryAfter 透传给调用方，让本轮静默期贴着网关给的窗口，而不是一律
+            # RoundCooldownMinutes（冷却封顶 15s 时后者会把可行动作压掉好几分钟）。
+            Write-WdLog "刷新后复测拿到 429：网关匿名通道正在退避（非节点故障），本轮不切换，Retry-After=$((Get-Prop $vrFast 'RetryAfter'))s" 'WARN'
+            return @{ Ok = $false; Node = $null; RetryAfter = [int](Get-Prop $vrFast 'RetryAfter') }
+          }
           Write-WdLog "刷新后复测仍失败：now=$nowFast status=$((Get-Prop $vrFast 'Status')) class=$((Get-Prop $vrFast 'Class')) $(Shorten ([string](Get-Prop $vrFast 'Body')) 200)，继续切换" 'WARN'
         }
       }
@@ -1302,6 +1333,17 @@ function Invoke-Failover {
       $script:LastSeenNow = $c.Name
       Write-WdLog "节点可用：$($c.Name)，big-pickle 验证通过" 'OK'
       return @{ Ok = $true; Node = $c.Name }
+    }
+    if ([bool](Get-Prop $vr 'Backoff')) {
+      # 与上面「刷新后复测」同一理由：429 说明是网关自己在退避，这个候选没有
+      # 被证明坏。此处早退而不落到底部的回滚块——回滚又是一次 Clash 切换，只会
+      # 在冷却期内继续制造连接抖动，且对冷却时长毫无帮助。候选本身 alive+有延迟、
+      # 未被证伪，留在它上面和留在任何其它节点上没有区别。
+      # LastSeenNow 必须更新：我们已经切到 $c.Name 了，不记的话下一轮会把它当成
+      # 「非本脚本切换」报一次疑似手动切换——而那条日志正是人工切换的取证依据。
+      $script:LastSeenNow = $c.Name
+      Write-WdLog "验证 [$($c.Name)] 拿到 429：网关匿名通道正在退避，该候选未被证伪，本轮停止切换后续候选（冷却挂在代理传输上，换节点无效），Retry-After=$((Get-Prop $vr 'RetryAfter'))s" 'WARN'
+      return @{ Ok = $false; Node = $null; RetryAfter = [int](Get-Prop $vr 'RetryAfter') }
     }
     if ([string](Get-Prop $vr 'Class') -eq 'quota' -and $script:QuotaFailMemoryMinutes -gt 0) {
       # 同一轮内连续 quota 说明该出口 IP 段额度已尽：记一笔，排后面的同名节点若同段也会被验证，
@@ -1548,7 +1590,18 @@ function Invoke-WatchIteration {
       -SwitchGapSeconds $SwitchGapSeconds -VerifyTimeoutSeconds $VerifyTimeoutSeconds `
       -Verdict $verdict -RefreshSettleSeconds $RefreshSettleSeconds
     if (-not (Get-Prop $r 'Ok')) {
-      $script:RoundCooldownUntil = (Get-Date).AddMinutes($RoundCooldownMinutes)
+      # 退避早退会带回 Retry-After：贴着它静默，别用固定的 RoundCooldownMinutes
+      # ——匿名冷却封顶已经是 15s，固定 5 分钟会把冷却结束后的可行动作压掉约
+      # 4 分 45 秒。其余失败路径（真切换过、全部候选失败）仍按分钟计。
+      $raHint = [int](Get-Prop $r 'RetryAfter')
+      if ($raHint -gt 0) {
+        $secs = $raHint + 5
+        if ($secs -gt ($RoundCooldownMinutes * 60)) { $secs = $RoundCooldownMinutes * 60 }
+        $script:RoundCooldownUntil = (Get-Date).AddSeconds($secs)
+        Write-WdLog "本轮因网关退避停手，静默 ${secs}s（Retry-After=${raHint}s + 5s 余量）" 'WARN'
+      } else {
+        $script:RoundCooldownUntil = (Get-Date).AddMinutes($RoundCooldownMinutes)
+      }
     } else {
       # 验证成功可能经付费 key 回退（网关匿名失败后自动走 KeyTiers），此时匿名
       # 通道并未恢复；复查一次 verdict，若同类 verdict 仍在冷却中则加一段短冷却
