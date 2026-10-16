@@ -739,18 +739,37 @@ textarea {
 .trend-chart {
   padding: 18px 4px 0;
 }
+/* 首尾两根柱的标签：标签是居中在"柱中心"上的（不是柱左边缘），探出
+   .trend-bars 的 overflow:hidden 边界的量 = labelW/2 − barW/2，labelW 实测
+   61px（11px JetBrains Mono），即 30.5 − barW/2。
+   修法是在溢出容器内部加左右内边距——overflow 在 padding box 处裁剪，等于把
+   裁剪边界相对首/末柱往外挪，标签保持居中即有余量；.trend-axis 必须给同样的
+   内边距，否则刻度整体错位（实测只给一边会偏 19.36px）。
+   Chromium 实测（1280/1366/1920/2560px × 24/30/31 柱）：改前每端被切
+   12.6~17.0px（1366px 档）；20px 内边距后全部为 0，最紧一档是 1280px×31 柱，
+   只余 1.1px。更窄的窗口仍会剩一点——≤1200px 且 30/31 柱时最多还差 2.7px
+   （1024px×31 柱）；要对任意柱数免疫需 30.5px（= labelW/2），代价是绘图区
+   再少 22px，本次不取。
+   代价（已实测）：柱距缩小 40/n，24/30/31 柱分别多叠 1.67/1.33/1.29px；
+   1920px×24 柱原本互不重叠，改后多叠 0.875px（换来的是两端各 1.1px 不再被裁）。
+   刻度盒中心与柱中心实测完全对齐（0.000px）；刻度"文字"偏心是既有缺陷
+   （Chromium 对超出盒宽的 text-align:center 行按左对齐排），本次只放大
+   0.83px，未处理。
+   曾考虑 :first-child/:last-child 把首尾标签整个钉进柱内——31 柱月视图下
+   首尾两根之间要叠 46px，比它修掉的裁剪更糟，故不采用。 */
 .trend-bars {
   height: 230px;
   display: flex;
   align-items: flex-end;
   gap: 3px;
+  padding: 0 20px;
   border-bottom: 1px solid var(--line);
   overflow: hidden;
 }
 .trend-axis {
   display: flex;
   gap: 3px;
-  padding-top: 6px;
+  padding: 6px 20px 0;
 }
 .trend-tick {
   flex: 1;
@@ -779,6 +798,17 @@ textarea {
   padding: 0 4px;
   border-radius: 3px;
   pointer-events: none;
+  /* 标签是 left:50% 的绝对定位元素，可用宽度就是柱宽，窄柱上"9030.8万"
+     会被折成两行（min-content 只到"9030.8"，万字前是可断点）。
+     代价是标签会溢出柱宽：Chromium 实测 11px JetBrains Mono 下标签恒为
+     61px，而 1366px 视口的 30 柱日视图柱距只有 31px —— 平滑走势时相邻
+     标签互相盖住约 30px（30 柱中 20 对相邻标签相撞），首尾两根还会被
+     .trend-bars 的 overflow:hidden 各切掉 12~17px（约两个字符，精确值仍可
+     从柱子的 title 查回）。改前换行版重叠 19px、标签高 35px，即 nowrap
+     用约 11px 的额外重叠换单行 + 标签高度减半；纯 ASCII 标签（"9,999"）
+     本来就没有断点、也一直在溢出，nowrap 只是让万/亿标签与它们一致。
+     要真正消掉重叠得改成隔 N 根才标或只留 hover，那是重设计，别在本次动。 */
+  white-space: nowrap;
 }
 .trend-bar {
   flex: 1;

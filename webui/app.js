@@ -482,15 +482,23 @@ const formatTokens = (value) => Number(value || 0).toLocaleString();
 // Local: Token 用量页 —— 紧凑数字/命中率/成本/耗时格式化分区。
 // 紧凑口径只服务本页：上面的 formatTokens 保持上游的纯千分位写法，
 // 元数据与 API Key 页的渲染不受影响。
+// 万/亿 只保留一位小数：柱顶标签的可用宽度就是柱宽，位数越多越容易换行；
+// 需要精确值的地方另有 formatTokensExact（表格 title / 行内提示）。
 const formatTokensCompact = (value) => {
   let n = Number(value || 0);
   if (Number.isNaN(n)) return "0";
   if (!isFinite(n)) return "∞";
   n = Math.round(n);
-  if (n >= 1e8 || Number((n / 1e4).toFixed(2)) >= 10000) return (n / 1e8).toFixed(2) + "亿";
-  if (n >= 1e4) return (n / 1e4).toFixed(2) + "万";
+  if (n >= 1e8 || Number((n / 1e4).toFixed(1)) >= 10000) return (n / 1e8).toFixed(1) + "亿";
+  if (n >= 1e4) return (n / 1e4).toFixed(1) + "万";
   return n.toLocaleString();
 };
+// Local: 请求路由表 Token 列（↓新输入 / ↑输出 / 缓存读）用的 k 口径。
+// 与用量页其它紧凑数字统一只留一位小数，并保留本函数原有的"抹掉末尾 0"
+// （1.0k → 1k、12.0k → 12k），所以显示位数是 0 或 1 位、不会超过一位。
+// 精确值仍在单元格悬停的 .tok-tip 里（appendTokenCell 用 formatTokensExact
+// 逐项列出）。唯一调用点是 appendTokenCell → renderUsageRequests，
+// 只服务用量页的请求明细表。
 const formatTokensK = (value) => {
   let n = Number(value || 0);
   if (Number.isNaN(n)) return "0";
@@ -498,7 +506,7 @@ const formatTokensK = (value) => {
   n = Math.round(n);
   const sign = n < 0 ? "-" : "";
   const a = Math.abs(n);
-  if (a >= 1000) return sign + (a / 1000).toFixed(2).replace(/\.?0+$/, "") + "k";
+  if (a >= 1000) return sign + (a / 1000).toFixed(1).replace(/\.?0+$/, "") + "k";
   return sign + a.toLocaleString();
 };
 const formatTokensExact = (value) => {
@@ -728,17 +736,28 @@ function renderUsage() {
       bar.style.height = Math.max(2, Math.round((value / maximum) * 100)) + "%";
       bar.title =
         usagePointLabel(point.start) +
+        // Local: 柱顶标签只剩一位小数，精确值在这里补齐——本页其它紧凑格
+        // （指标卡/模型表/Tier 行/端点表）都是"紧凑（精确）"成对出现，
+        // 趋势柱曾是这个组合里唯一的例外，改一位小数后就再也查不回原值了。
         " · input " +
         formatTokensCompact(point.tokens?.input_tokens) +
-        " · output " +
+        "（" +
+        formatTokensExact(point.tokens?.input_tokens) +
+        "） · output " +
         formatTokensCompact(point.tokens?.output_tokens) +
-        " · cached " +
+        "（" +
+        formatTokensExact(point.tokens?.output_tokens) +
+        "） · cached " +
         formatTokensCompact(point.tokens?.cached_tokens) +
-        " · 命中率 " +
+        "（" +
+        formatTokensExact(point.tokens?.cached_tokens) +
+        "） · 命中率 " +
         formatHitRate(point.tokens?.cached_tokens, point.tokens?.input_tokens) +
         " · total " +
         formatTokensCompact(value) +
-        " · " +
+        "（" +
+        formatTokensExact(value) +
+        "） · " +
         formatCost(point.cost_usd, point.unknown_cost) +
         (point.unknown_cost ? "（含未知价格模型）" : "");
       const tag = document.createElement("span");
