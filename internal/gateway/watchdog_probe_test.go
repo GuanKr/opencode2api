@@ -255,7 +255,11 @@ func TestWatchdogProbeVerdictVocabulary(t *testing.T) {
 		{"quota class", http.StatusTooManyRequests, `{"error":{"type":"FreeUsageLimitError"}}`, "quota"},
 		{"black quota class", http.StatusTooManyRequests, `{"error":{"type":"BlackUsageLimitError"}}`, "quota"},
 		{"plain rate limit class", http.StatusTooManyRequests, `{"error":{"type":"RateLimitError"}}`, "ratelimit"},
-		{"free tier gate", http.StatusForbidden, `{"error":{"type":"FreeTierError"}}`, "fingerprint"},
+		// The free tier's gate rejection is quota since 2026-10-17: the probe
+		// must report it as "switch and keep switching", not as a fingerprint
+		// no node change can clear. The classless-403 row further down still
+		// covers the WAF-challenge reading.
+		{"free tier gate", http.StatusForbidden, `{"error":{"type":"FreeTierError"}}`, "quota"},
 		{"server wobble outranks class", http.StatusServiceUnavailable, `{"error":{"type":"FreeUsageLimitError"}}`, "transport"},
 		{"classless 5xx", http.StatusBadGateway, `upstream exploded`, "transport"},
 		{"classless 429 waits", http.StatusTooManyRequests, `slow down`, "ratelimit"},

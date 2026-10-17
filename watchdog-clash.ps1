@@ -763,10 +763,14 @@ function ConvertFrom-WatchdogProbe {
   # 探针端点的 verdict 直接就是网关自己的分类（与 /v1/watchdog/status 同一词表，
   # 同一套 classifyAnonymousVerdict），脚本不再对正文做子串判定：
   #   ok          → 该出口 IP 的匿名通道可用（真发上游拿到了 2xx）
-  #   quota       → 该出口 IP 额度烧尽（FreeUsageLimit/BlackUsageLimit 类）→ 换节点
+  #   quota       → 该出口 IP 拒绝为这次匿名请求服务：额度烧尽（FreeUsageLimit/
+  #                 BlackUsageLimit 类），或免费层的门拒绝了它（FreeTierError，
+  #                 含只有 message 文案的变体）→ 换节点，新节点再报同一个错就继续换
   #   transport   → 出口路由坏（真发了上游，传输层失败）→ 换节点
   #   ratelimit   → 普通限流，等
-  #   fingerprint → 上游拒的是请求身份本身（403 FreeTierError），换节点无解
+  #   fingerprint → 上游拒了一个换节点解不开的东西：现在只有「探测回退」才会给出
+  #                 这个 verdict（403 且正文里没有任何可认的类，例如 WAF 挑战页；
+  #                 see probeFallbackVerdict）——网关状态流里免费层门已经改判 quota
   #   config      → 网关侧状态（模型不在目录/未启用匿名/模型被禁用）→ 停轮
   #   cooling     → 强制探针被短路了，这是网关 bug，必须记 ERROR 而不是当退避早退
   # attempted 与 cause 只进日志：上游错误正文一律不回传（回传就得重新做子串判定，
@@ -851,6 +855,27 @@ function Invoke-WatchdogProbe {
 # Test-GatewayNodeLegacy 是切换探针之前的实现，逐字保留：它仍要在 -ProbeEndpoint
 # legacy 下可用，也是探针端点 404 时的回落目标。注意它区分不了「网关没发」和
 # 「发了被拒」——两者都是 502 all upstream attempts failed。
+function Test-FreeTierGateMessage {
+  # 网关的免费层拒绝文案（"OpenCode's free tier can only be used from within
+  # OpenCode."）。上游把它放在嵌套 error.type=FreeTierError 里；顶层信封变体
+  # （{"code":null,"message":...,"type":"upstream_error"}）没有这个类，只能靠文案认。
+  # 锚点集合与网关侧 watchdog.go 的 freeTierGateText **逐字一致**（两个锚点、同样
+  # 大小写不敏感），两边增删锚点必须同步——只差一个锚点就会出现「Go 判门、脚本判
+  # config」的分叉，那正是本次要消灭的失效模式（例如尾句改写成
+  # "...can only be used from the official client." 时只有一个锚点必然漏判）。
+  # **但作用域比网关宽**：脚本这里只有整份响应正文（没有解析后的 JSON 文档），所以
+  # 任何位置出现该文案都命中——detail 字段、或「显式类 + 门文案」并存的正文（网关
+  # 侧此时返回显式类，不会走到文案兜底）、以及非 JSON 的正文（例如恰好含这句话的
+  # WAF 页面）。这就是 legacy 路径的残余差异：只会把更多 403 判成 quota（方向是
+  # 「多换节点」），不会反向漏判；别再写成「一一对应」或「判据完全相同」。
+  param([string]$Body)
+  if ([string]::IsNullOrEmpty($Body)) { return $false }
+  foreach ($gate in @('can only be used from within OpenCode', 'free tier can only be used')) {
+    if ($Body.IndexOf($gate, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+  }
+  return $false
+}
+
 function Test-GatewayNodeLegacy {
   param([string]$Nonce, [int]$TimeoutSec)
   $key = Resolve-GatewayKey
@@ -871,8 +896,8 @@ function Test-GatewayNodeLegacy {
     # Get-HttpErrorInfo 永远返回 @{Status;Body}（Body 缺失时为空串），这里点访问恒安全。
     $body = [string]$info.Body
     # 401/403/404/400 原则上是网关配置错误（key/模型名/参数），节点没问题，
-    # 绝不切换；但 403 + FreeTierError 是上游免费指纹门（可恢复），必须摘出，
-    # 否则一次指纹波动就会误判 config、中止整轮（22:39/22:41/23:12 三轮只试
+    # 绝不切换；但带免费层门文案的 403 是上游的免费层拒绝（可恢复），必须摘出，
+    # 否则一次门拒绝就会误判 config、中止整轮（22:39/22:41/23:12 三轮只试
     # 1~2 个候选即停即是此误杀）。
     $class = 'other'
     # Backoff=true 表示「网关自己说在退避」而不是「这个节点有问题」。**前缀是判据的
@@ -883,11 +908,18 @@ function Test-GatewayNodeLegacy {
     # 不记——而「按出口 IP 换节点逃 quota」正是免费层唯一有效的自救。
     $backoff = ($info.Status -eq 429 -and $body.Contains('opencode2api:'))
     # 网关冷却 429 优先于配额关键字：它描述的是网关状态，不是这个出口 IP 额度。
-    # FreeTier-403 先于 config 摘出：与网关 verdict=fingerprint 对齐，只记日志、
-    # 继续试下一个候选，绝不中止整轮（上游拒的是请求身份本身，换节点无解）。
-    # class 只用于 config 中止与日志（切换决策只看服务端 verdict），顺序不影响流程。
+    # 免费层 403（两个变体：嵌套 error.type=FreeTierError，或只有 message 文案）判 quota，
+    # 与网关 classifyAnonymousVerdict 现在的语义一致（2026-10-17 起 FreeTierError→quota）：
+    # quota 不是 config，候选循环不会 break，新节点再报同一个错就继续换下一个。
+    # 必须排在 config 之前：两者都是 403，顺序反了门拒绝又会把整轮停掉。
+    # class 不只用于日志：候选验证处按 `Class -eq 'quota'` 写 $script:QuotaFailedAt
+    # （见 Invoke-Failover），而 Get-RankedCandidates 据此给同名候选 +300000ms 的
+    # **排序**罚分（钳位 999998，只降权不排除，保底仍可选；记忆窗口
+    # -QuotaFailMemoryMinutes 后自动失效，绝不永久拉黑）。本次改动首次让「免费层门
+    # 403」走到这条分支：同轮里连续几次门 403 会把刚试过的候选降权，下一轮不再优先
+    # 重试它们。除此之外的分支先后不影响流程（切换决策仍只看服务端 verdict）。
     if ($info.Status -eq 429 -and $body.Contains('opencode2api:')) { $class = 'cooling' }
-    elseif ($info.Status -eq 403 -and $body.Contains('FreeTierError')) { $class = 'cooling' }
+    elseif ($info.Status -eq 403 -and ($body.Contains('FreeTierError') -or (Test-FreeTierGateMessage $body))) { $class = 'quota' }
     elseif ($info.Status -eq 401 -or $info.Status -eq 403 -or $info.Status -eq 404 -or $info.Status -eq 400) { $class = 'config' }
     # 503 ModelUnavailable（模型被可用性探针禁用）同样是网关侧目录状态，与出口 IP
     # 无关：换节点只会拿到同一个 503。不摘出的话它会掉进下面的 502/503/504 → transport
@@ -1407,6 +1439,8 @@ function Invoke-Failover {
           # 随后网关回退付费 key 才返回 200。所以 quota 轮必须复查 verdict：只有翻到
           # ok/ratelimit/cooling/fingerprint（本脚本对这几类一律只记日志、不切换）才算刷新真的换到了
           # 有额度的出口 IP；读不到或仍是 quota/transport 一律当没恢复，继续进切换循环。
+          # fingerprint 现在只是探测回退的 verdict（正文里认不出类的 403，如 WAF 挑战页），
+          # 网关状态流已经不会为免费层门给出它——门变 quota，所以「刷新没换到出口 IP」照样当没恢复。
           # 否则既白花一次真实付费推理，又把“已恢复”记成假账。
           $recovered = $true
           # 探针端点只测匿名通道（网关不拿付费 key 回退），所以 verdict=ok 就是这条

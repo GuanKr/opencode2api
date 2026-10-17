@@ -49,10 +49,12 @@ type watchdogStatusResponse struct {
 		Cause          string `json:"cause,omitempty"`
 		// Verdict classifies the current anonymous lane state for the
 		// watchdog: "ok" (no action), "transport" (proxy broken, switch),
-		// "quota" (free quota exhausted, switch), "ratelimit" (plain
-		// throttling, only wait), "fingerprint" (upstream rejected the
-		// request identity itself — switching nodes cannot help, see
-		// AGENTS.md on the FreeTierError gate), "cooling" (cooling with
+		// "quota" (this exit is refusing while the request shape is sound —
+		// the free allowance is burned, or the free tier's gate rejected the
+		// request from this exit IP; switch and, if the next node answers the
+		// same, keep switching), "ratelimit" (plain throttling, only wait),
+		// "fingerprint" (an upstream rejection that no exit node changes; the
+		// gate no longer lands here, see AGENTS.md), "cooling" (cooling with
 		// unknown cause).
 		// The verdict derives from a worst-case snapshot across all
 		// transport-healthy proxies, not from the next turn's own request:
@@ -70,8 +72,10 @@ type watchdogStatusResponse struct {
 	} `json:"anonymous"`
 	// RecommendSwitch is true for verdicts transport/quota, or when every
 	// proxy is down (AllDown). Plain ratelimit/fingerprint/cooling/ok never
-	// recommends: a fingerprint rejection is upstream's answer about the
-	// request, and no exit node changes it.
+	// recommends: those verdicts describe upstream answers about the request
+	// (or states) that no exit node changes. The free tier's gate rejection
+	// deliberately does NOT belong to them any more: it is reported as quota,
+	// so it recommends a switch (2026-10-17).
 	RecommendSwitch bool `json:"recommend_switch"`
 }
 
@@ -348,13 +352,16 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 //
 //   - 403 is fingerprint, not config. The gateway never authors a 403 (its own
 //     rejections are 401/400/429/503-ModelUnavailable/499/502/504), so a 403 seen
-//     by a probe came from the upstream: the FreeTierError gate, or an edge/WAF
-//     challenge page on that exit IP. Legacy mapped it to config, which made
-//     Invoke-Failover break out of the candidate loop, roll back to the original
-//     node and sleep — one challenged exit IP could void a whole round. The
-//     script already treats a FreeTier 403 that way (fingerprint: log it, try the
-//     next candidate), so this only removes the difference between the two kinds
-//     of upstream 403.
+//     by a probe came from the upstream: an edge/WAF challenge page on that exit
+//     IP (what is left for this row now), or the free tier's gate rejection.
+//     Legacy mapped the status to config, which made Invoke-Failover break out of
+//     the candidate loop, roll back to the original node and sleep — one
+//     challenged exit IP could void a whole round.
+//     A gate 403 no longer reaches this row: since 2026-10-17 the gate's message
+//     text is recognized as the FreeTierError class, so such a cause classifies
+//     as quota and this fallback is only the last resort for a body carrying no
+//     class at all. The two differ on purpose — "switch and keep switching" for
+//     the gate, "log and try the next candidate" for a challenge page.
 //   - where a status and a class disagree (400/403 carrying a quota class), the
 //     class wins here and the status won in legacy: the probe reports quota and
 //     keeps switching, where legacy stopped the round. That is the point of the
@@ -381,10 +388,19 @@ func probeFallbackVerdict(status int) string {
 // error classes mean the exit IP burned its free allowance (switch helps);
 // bare transport causes mean the route is broken (switch helps); plain rate
 // limiting only needs waiting (switch does not help).
+//
+// FreeTierError is quota, not a fingerprint (decided 2026-10-17, see
+// AGENTS.md): the free tier's gate rejection is treated like every other
+// per-exit refusal — switch nodes, and when the next node answers the same
+// thing, keep switching. It is listed in the quota keyword set below like any
+// other class; nothing here special-cases it any more.
 // The trailing "(upstream HTTP N)" status outranks keyword matching: a 5xx
 // is server-side wobble, never quota proof — e.g. "FreeUsageLimitError
 // (upstream HTTP 503)" classifies as transport, not quota, so one flapping
-// upstream cannot drive a node switch on a quota pretext.
+// upstream cannot drive a node switch on a quota pretext. The same holds for
+// "FreeTierError (upstream HTTP 503)", which matters here because the class on
+// that cause was recovered from a message: a 5xx wearing the gate's words must
+// not read as a quota proof either.
 func classifyAnonymousVerdict(cause string, cooling bool) string {
 	if cause == "" {
 		if cooling {
@@ -401,15 +417,7 @@ func classifyAnonymousVerdict(cause string, cooling bool) string {
 	if status := upstreamStatusFromCause(cause); status >= 500 {
 		return "transport"
 	}
-	// FreeTierError is upstream refusing the request itself, not the exit IP
-	// and not the proxy: the free lane demands the official client's identity,
-	// and no node switch can satisfy it. It is reported as its own verdict so
-	// the operator sees the real reason (and so a "wait for the cooldown to
-	// expire" reading never hides it), while still never recommending a switch.
-	if strings.Contains(lower, "freetier") {
-		return "fingerprint"
-	}
-	for _, quota := range []string{"freeusagelimit", "blackusagelimit", "usage_limit", "quota", "exhausted", "insufficient", "credit", "balance"} {
+	for _, quota := range []string{"freetier", "freeusagelimit", "blackusagelimit", "usage_limit", "quota", "exhausted", "insufficient", "credit", "balance"} {
 		if strings.Contains(lower, quota) {
 			return "quota"
 		}
@@ -474,7 +482,10 @@ func upstreamStatusFromCause(cause string) int {
 //
 // The class itself is the upstream's own error.type (e.g. "FreeTierError",
 // "FreeUsageLimitError", "RateLimitError") rather than a locally rewritten
-// name, so the vocabulary follows whatever the upstream calls itself.
+// name, so the vocabulary follows whatever the upstream calls itself — with
+// one addition: when there is no nested error.type, the free tier's gate text
+// is recognized as "FreeTierError" (see errorTypeFromDocument), because that
+// variant's top-level envelope names no class at all.
 func watchdogCause(resp *http.Response, err error) string {
 	if resp == nil {
 		return "transport (" + transportCauseShort(err) + ")"
@@ -553,6 +564,12 @@ func transportCauseShort(err error) string {
 // previous 256 KB bound covered (it degraded there too, just not here). A
 // console error payload is a small JSON document, so 64 KB stays orders of
 // magnitude more than the class field can need.
+//
+// The gate-text fallback (see errorTypeFromDocument) rides on the same budget
+// and degrades the same way — a gate 403 past the bound loses its class and
+// falls back to the classless reading — but a gate message is one short
+// sentence in a small JSON envelope, so that window is not reachable for it in
+// practice.
 const maxCausePeek = httpx.MaxDrainBytes
 
 // causePeekChunk is how much upstreamErrorType pulls between two "do I
@@ -567,7 +584,7 @@ const causePeekChunk = 4 << 10
 // passthrough is untouched. It returns "" — reading nothing more than what
 // fits the bound and restoring the rest — when the body is absent, already
 // consumed, an event stream, oversized, unreadable, not JSON, or carries no
-// error.type.
+// error.type and no free-tier gate text (see errorTypeFromDocument).
 func upstreamErrorType(resp *http.Response) string {
 	// Only a plain error response may be peeked: a 2xx has no EOF until the
 	// upstream finishes (reading it would buffer a whole stream), and an
@@ -582,7 +599,11 @@ func upstreamErrorType(resp *http.Response) string {
 	}
 	original := resp.Body
 	var prefix bytes.Buffer
-	typ, drained := peekCauseType(&prefix, original)
+	// The gate-text fallback is only enabled for 403: an upstream error message
+	// can mention the free tier for other reasons, and a message is far weaker
+	// evidence than a class. The caller holds the status, so the guard lives
+	// here rather than in the parser (which never sees a status).
+	typ, drained := peekCauseType(&prefix, original, resp.StatusCode == http.StatusForbidden)
 	if drained {
 		// EOF with nothing left behind: the passthrough can be served from
 		// the peeked bytes alone, so the network body is closed here.
@@ -606,6 +627,12 @@ func upstreamErrorType(resp *http.Response) string {
 // error document; drained reports that r reached EOF, so nothing is left
 // behind in the network body.
 //
+// gateFallback says whether a classless document may have its class recovered
+// from the free tier's gate text. It is the caller's status check — true only
+// for a 403 — passed in because a value extracted from a message is weaker
+// evidence than an explicit class, and the parser itself has no status to
+// judge that by.
+//
 // The read is chunked with an early exit rather than one io.ReadAll to the
 // bound, because an unknown-length body is a stream, not a file: reading on to
 // the bound (or to EOF) makes the node switch wait exactly as long as the
@@ -614,7 +641,7 @@ func upstreamErrorType(resp *http.Response) string {
 // completes a document still costs the whole bound plus the one byte that
 // proves it oversized, and every byte taken out of r is handed back by the
 // caller, so the peek stays invisible to the passthrough either way.
-func peekCauseType(data *bytes.Buffer, r io.Reader) (typ string, drained bool) {
+func peekCauseType(data *bytes.Buffer, r io.Reader, gateFallback bool) (typ string, drained bool) {
 	limited := io.LimitReader(r, maxCausePeek+1)
 	buf := make([]byte, causePeekChunk)
 	// One byte past the bound is enough to know the document is oversized; the
@@ -623,7 +650,7 @@ func peekCauseType(data *bytes.Buffer, r io.Reader) (typ string, drained bool) {
 		n, err := limited.Read(buf)
 		if n > 0 {
 			data.Write(buf[:n])
-			if t := errorTypeFromDocument(data.Bytes()); t != "" {
+			if t := errorTypeFromDocument(data.Bytes(), gateFallback); t != "" {
 				return t, errors.Is(err, io.EOF)
 			}
 		}
@@ -641,7 +668,22 @@ func peekCauseType(data *bytes.Buffer, r io.Reader) (typ string, drained bool) {
 // that has not parsed yet is not a document: that is what keeps the peek
 // reading until the value is whole (or the bound stops it) instead of trusting
 // a half-read class.
-func errorTypeFromDocument(doc []byte) string {
+//
+// When the document carries no nested error.type AND gateFallback is set, the
+// free tier's gate text is recognized instead (peekCauseGateType). That variant
+// is real: an ordinary 403 from /inference arrives as
+// {"code":null,"message":"OpenCode's free tier can only be used from within
+// OpenCode...","param":null,"type":"upstream_error"} — a top-level envelope
+// whose type says nothing about the cause. Reading the class off its message is
+// what lets classifyAnonymousVerdict see the gate at all. Only the text is
+// inspected, so nothing about the peek changes: the bytes still have to be a
+// whole document, the budget is still maxCausePeek, and the caller still hands
+// every byte back.
+//
+// gateFallback is the caller's status guard (see peekCauseType): the gate text
+// is only honored for a 403, so the same message arriving on a 400/404/429 does
+// not turn into a quota proof.
+func errorTypeFromDocument(doc []byte, gateFallback bool) string {
 	// A whole JSON value is }-terminated once trailing whitespace is dropped,
 	// and only an object can carry error.type at all. Rejecting the rest up
 	// front is what keeps the caller's per-chunk check from re-parsing every
@@ -653,11 +695,100 @@ func errorTypeFromDocument(doc []byte) string {
 	if json.Unmarshal(doc, &value) != nil {
 		return ""
 	}
+	return peekCauseGateType(value, gateFallback)
+}
+
+// peekCauseGateType reads the upstream error class out of a parsed error
+// document: the nested error.type when it is there, else — only when
+// gateFallback is set — the free tier's gate text from the document's message.
+//
+// The name is synthesized, not echoed: upstream's own class for this rejection
+// is "FreeTierError", so the label the watchdog feed publishes stays
+// byte-identical whichever variant arrived. Nothing else is mapped — a 403
+// without the gate text keeps its classless "upstream error (upstream HTTP
+// 403)" cause, which is what the WAF-challenge case needs (probeFallbackVerdict
+// still reads a bare 403 as fingerprint).
+//
+// This function has no status to look at, and that absence is exactly where the
+// widening would come from: a message is weaker evidence than a class, and
+// "free tier can only be used" is a phrase any upstream error could contain.
+// So the guard is not here — it is the gateFallback argument, decided by the
+// caller that holds the status. Without a status check, a 400/404/429 carrying
+// this sentence would be labelled a quota rejection.
+func peekCauseGateType(value map[string]any, gateFallback bool) string {
 	// Upstream-controlled string: bound it before it lands in the cooldown
 	// cause and the watchdog feed.
-	typ := jsonutil.StringAt(value, "error", "type")
+	typ := boundCauseClass(jsonutil.StringAt(value, "error", "type"))
+	if typ != "" {
+		// An explicit nested class always wins, whatever the status: upstream
+		// said what it meant, even if its message happens to mention the gate.
+		// This path stays status-independent on purpose, so a 5xx carrying
+		// FreeTierError still reaches the classifier's transport branch.
+		return typ
+	}
+	if !gateFallback {
+		return ""
+	}
+	for _, message := range []string{
+		jsonutil.StringAt(value, "message"),
+		jsonutil.StringAt(value, "error", "message"),
+	} {
+		if freeTierGateText(message) {
+			return boundCauseClass(freeTierErrorClass)
+		}
+	}
+	return ""
+}
+
+// freeTierErrorClass is the class name the free tier's gate rejection carries
+// in its nested form, and the one this gateway publishes when it only has the
+// message to go on. Spelled once so the two paths cannot drift into two labels
+// for one upstream error.
+const freeTierErrorClass = "FreeTierError"
+
+// freeTierGateText reports whether an upstream error message is the free tier's
+// gate rejection. Two spellings cover the observed variants, both matched
+// case-insensitively against the whole message:
+//
+//   - "can only be used from within opencode" — the full sentence, shared by
+//     every observed variant (nested error.type="FreeTierError" and the
+//     top-level envelope alike);
+//   - "free tier can only be used" — the prefix of the same sentence, kept as a
+//     second anchor for the tail rewrites the reviewer measured: upstream can
+//     end that sentence differently ("...from the official client."), and a
+//     single anchor would then miss it while the other side still matched.
+//
+// The match deliberately does not require the message to START with the text.
+// copyErrorResponse prefixes a class onto the message it serves to clients
+// ("FreeTierError: OpenCode's free tier ..."), and a future passthrough that
+// looks at that copy must not have to care where the gate text sits.
+//
+// Scope, measured rather than assumed: this function and the script's
+// Test-FreeTierGateMessage use the same anchor list, but they are NOT
+// equivalent. The script only has the raw response body (no parsed document),
+// so it matches anywhere in the whole body — a `detail` field, or a body that
+// carries an explicit class AND the gate sentence, matches there while this
+// function returns the class or nothing. Non-JSON bodies (a WAF HTML page that
+// happens to contain the sentence) are the other difference. Both widenings
+// only ever turn a plain 403 into quota, and the direction is deliberate (more
+// switching), but they are not "identical criteria" and must not be documented
+// as such.
+func freeTierGateText(message string) bool {
+	lower := strings.ToLower(message)
+	for _, gate := range []string{"can only be used from within opencode", "free tier can only be used"} {
+		if strings.Contains(lower, gate) {
+			return true
+		}
+	}
+	return false
+}
+
+// boundCauseClass bounds an upstream-controlled class name before it lands in
+// the cooldown cause and the watchdog feed. The 64-rune cap predates the gate
+// fallback and still guards every class that reaches the feed.
+func boundCauseClass(typ string) string {
 	if len([]rune(typ)) > 64 {
-		typ = string([]rune(typ)[:64])
+		return string([]rune(typ)[:64])
 	}
 	return typ
 }

@@ -36,12 +36,14 @@ func TestClassifyAnonymousVerdict(t *testing.T) {
 		{"quotaClassServerWobble", "FreeUsageLimitError (upstream HTTP 503)", true, "transport"},
 		{"ratelimit", "RateLimitError (upstream HTTP 429)", true, "ratelimit"},
 		{"ratelimitTooMany", "too many requests (upstream HTTP 429)", true, "ratelimit"},
-		// FreeTierError is upstream refusing the request identity, not the
-		// exit IP: it gets its own verdict and never a switch recommendation.
-		{"fingerprint", "FreeTierError (upstream HTTP 403)", true, "fingerprint"},
-		{"fingerprintNoCooling", "FreeTierError (upstream HTTP 403)", false, "fingerprint"},
-		// A 5xx tail still outranks it: a flapping upstream is transport.
-		{"fingerprintServerWobble", "FreeTierError (upstream HTTP 503)", true, "transport"},
+		// FreeTierError is the free tier's gate rejection. Since 2026-10-17 it
+		// is read like every other per-exit refusal: quota, so the watchdog
+		// switches nodes, and keeps switching while the next node says the same.
+		{"gate quota", "FreeTierError (upstream HTTP 403)", true, "quota"},
+		{"gate quota no cooling", "FreeTierError (upstream HTTP 403)", false, "quota"},
+		// A 5xx tail still outranks it: a flapping upstream is transport, even
+		// though this class may have been recovered from a message.
+		{"gateServerWobble", "FreeTierError (upstream HTTP 503)", true, "transport"},
 		{"coolingUnknown", "", true, "cooling"},
 		{"coolingUnknownCause", "upstream HTTP 503", true, "cooling"},
 		{"okIdle", "", false, "ok"},
@@ -199,17 +201,20 @@ func TestHandleWatchdogStatusRecommendSwitch(t *testing.T) {
 	}
 }
 
-// A fingerprint rejection is upstream's answer about the request identity, so
-// it must be visible as its own verdict while still never switching nodes.
-func TestHandleWatchdogStatusFingerprintNeverSwitches(t *testing.T) {
+// The gate rejection must recommend a switch like any other quota-class
+// refusal: the watchdog treats "this exit is refusing while the request shape
+// is sound" as "change exit IP" (2026-10-17 decision). It stays visible as its
+// own cause so the operator can still see what the upstream said; only the
+// recommended action changed.
+func TestHandleWatchdogStatusGateRejectionSwitches(t *testing.T) {
 	pool, _ := watchdogCoolingPool(t, "FreeTierError (upstream HTTP 403)")
 	g := watchdogTestGateway(watchdogTestTransports(true), pool)
 	resp := doWatchdogStatus(t, g)
-	if resp.Anonymous.Verdict != "fingerprint" {
-		t.Fatalf("FreeTierError must report the fingerprint verdict, got %q (cause %q)", resp.Anonymous.Verdict, resp.Anonymous.Cause)
+	if resp.Anonymous.Verdict != "quota" {
+		t.Fatalf("the gate rejection must report the quota verdict, got %q (cause %q)", resp.Anonymous.Verdict, resp.Anonymous.Cause)
 	}
-	if resp.RecommendSwitch {
-		t.Fatal("fingerprint rejection must never recommend a node switch")
+	if !resp.RecommendSwitch {
+		t.Fatal("the gate rejection must recommend a node switch")
 	}
 }
 
@@ -499,7 +504,7 @@ func TestRestoreProxyClearsStaleVoteAfterRefreshSuccess(t *testing.T) {
 // The premise that makes dropping a recovered proxy's cause memory safe: the
 // only causes that keep voting after their cooldown lapsed are the ones that
 // classify as transport (staleCauseSnapshot filters the rest), while a quota,
-// ratelimit or fingerprint residue never votes there — so a passing proxy
+// ratelimit or classless residue never votes there — so a passing proxy
 // health check, which proves the transport layer only, cannot be masking an
 // allowance problem. If this table ever starts voting a non-transport residue,
 // dropping the memory on restore would hide it and this test goes red.
@@ -780,6 +785,10 @@ func TestWatchdogCauseRateLimitAndFreeTier(t *testing.T) {
 	}{
 		{"rateLimit", http.StatusTooManyRequests, `{"error":{"type":"RateLimitError"}}`, "RateLimitError (upstream HTTP 429)"},
 		{"freeTier", http.StatusForbidden, `{"error":{"type":"FreeTierError"}}`, "FreeTierError (upstream HTTP 403)"},
+		// The same rejection as the row above, in the shape that carries no
+		// nested error.type at all: only the message names the gate. Both must
+		// produce one label, so the watchdog classifies them identically.
+		{"freeTierMessageOnly", http.StatusForbidden, freeTierGateEnvelope, "FreeTierError (upstream HTTP 403)"},
 	}
 	for _, tc := range cases {
 		if got := watchdogCause(watchdogErrorResponse(tc.status, "application/json", tc.body), nil); got != tc.want {
