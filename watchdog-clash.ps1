@@ -22,8 +22,8 @@
   机器可读的 verdict（quota/transport/ratelimit/fingerprint/config/ok）。
   网关没有该端点（404）时自动回落旧的 /v1/chat/completions 探针，也可用 -ProbeEndpoint legacy 强制。
   探针通过即结束，失败则按延迟从低到高试下一个候选，最多 MaxCandidates 个。
-  注意最坏单轮耗时：MaxCandidates(默认20) × VerifyTimeoutSeconds(默认120s) + SwitchGapSeconds ≈ 40 分钟，
-  外加每个候选最多 ProxyReadySeconds(默认5s)+10s（闸门等待里最后一次 status 调用自身带 10s 超时）；
+  注意最坏单轮耗时：MaxCandidates(默认40) × VerifyTimeoutSeconds(默认120s) + SwitchGapSeconds ≈ 80 分钟，
+  外加每个候选最多 ProxyReadySeconds(默认5s)+10s（闸门等待里最后一次 status 调用自身带 10s 超时）与候选间 2s 收敛等待：三笔合计真最坏 ≈ 94 分钟；
   刷新后的原地复测另加最多 1 × VerifyTimeoutSeconds（quota 轮现在也计入），刷新本身还有下载+校验+热重载，
   同步阻塞巡检循环属设计如此（不是卡死），调参前请知悉。
   进入切换前先刷新一次订阅(受 RefreshCooldownMinutes 节流，每轮最多 1 次)，
@@ -108,7 +108,7 @@
   旧探针拿到的 502「all upstream attempts failed」无法区分「网关根本没发」和「发了被拒」，
   新探针则两种情况都能如实分类。
   已知副作用（探针通道独有）：网关自撰的冷却 429 永远不出现，所以「网关在退避 → 贴 Retry-After
-  早退」这条路在探针通道下不可达；全候选失败只能退回 RoundCooldownMinutes(默认5分钟) 静默，
+  早退」这条路在探针通道下不可达；全候选失败只能退回 RoundCooldownMinutes(默认2分钟) 静默，
   而匿名冷却封顶才 15s。这是刻意的——探针的 429 一定是上游的，换出口 IP 才是唯一解法。
 
 .PARAMETER ProxyReadySeconds
@@ -134,7 +134,9 @@ param(
   [string]$GatewayKey = '',
   [string]$VerifyModel = 'big-pickle',
   [ValidateRange(5, 300)][int]$PollSeconds = 15,
-  [ValidateRange(1, 25)][int]$MaxCandidates = 20,
+  # 候选上限：默认 40（2026-10-17 由 20 上调）；上限 60 只挡明显笔误，别按「默认+5」
+  # 收回——实测当前订阅候选池 44 个，45 会让「显式试完整池」的覆盖立刻被拒。
+  [ValidateRange(1, 60)][int]$MaxCandidates = 40,
   [ValidateRange(0, 300)][int]$SwitchGapSeconds = 15,
   [ValidateRange(5, 600)][int]$VerifyTimeoutSeconds = 120,
   # 探针通道。auto = 优先打网关的 /v1/watchdog/probe：它保证请求真的发到上游
@@ -150,7 +152,7 @@ param(
   [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$SubscriptionUid = 'RYni6JpVUPX8',
   [string]$SubscriptionUA = 'clash-verge/v2.5.2',
   [int]$RefreshCooldownMinutes = 5,
-  [int]$RoundCooldownMinutes = 5,
+  [int]$RoundCooldownMinutes = 2,
   # 近期 quota 失败记忆窗口（分钟）：验证时返回 quota 的节点在此窗口内候选降权，
   # 过期自动恢复——该机场同名背后会换 IP，永久拉黑会把已恢复的新 IP 挡在门外。
   # 0 = 关闭降权（不记录不降权）。
@@ -932,7 +934,7 @@ function Test-GatewayNodeLegacy {
     $raSecs = 0
     # 必须取 $info.RetryAfter：$retryAfter 是 Get-HttpErrorInfo 内部的局部变量，
     # 在这里恒为 $null。pwsh 里 $null -ne '' 为 True 会让分支照进，但 TryParse('')
-    # 恒 False，于是 raSecs 永远是 0，静默期退回固定 RoundCooldownMinutes(5min)
+    # 恒 False，于是 raSecs 永远是 0，静默期退回固定 RoundCooldownMinutes(2min)
     # 而不是网关给的 15s 窗口。
     $ra = [string]$info.RetryAfter
     if ($ra -ne '') {
@@ -1526,6 +1528,10 @@ function Invoke-Failover {
     return @{ Ok = $false; Node = $null }
   }
   $tried = @()
+  # 候选池不足 MaxCandidates 时 Select-Object -First 只返回池里的全部（不补齐、不报错），
+  # 所以「节点总数 < 40」的订阅就是这一轮把池子试一遍：池子大小见上一行的
+  # 「候选池：符合条件 N 个」，实际试了几个见失败行的「已试：」列表。
+  # 空池（含只有当前节点一个可用的情况，当前节点已被 -ExcludeNow 排除）在上面单独拦截。
   $pick = @($cands | Select-Object -First $MaxCandidates)
   foreach ($c in $pick) {
     # 间隔只在成功后等待（给新连接收敛）；验证失败立刻试下一个，不空烧
@@ -1811,8 +1817,8 @@ function Invoke-WatchIteration {
       -Verdict $verdict -RefreshSettleSeconds $RefreshSettleSeconds
     if (-not (Get-Prop $r 'Ok')) {
       # 退避早退会带回 Retry-After：贴着它静默，别用固定的 RoundCooldownMinutes
-      # ——匿名冷却封顶已经是 15s，固定 5 分钟会把冷却结束后的可行动作压掉约
-      # 4 分 45 秒。其余失败路径（真切换过、全部候选失败）仍按分钟计。
+      # ——匿名冷却封顶已经是 15s，固定 2 分钟会把冷却结束后的可行动作压掉约
+      # 1 分 45 秒。其余失败路径（真切换过、全部候选失败）仍按分钟计。
       $raHint = [int](Get-Prop $r 'RetryAfter')
       if ($raHint -gt 0) {
         $secs = $raHint + 5
