@@ -28,7 +28,7 @@
   同步阻塞巡检循环属设计如此（不是卡死），调参前请知悉。
   进入切换前先刷新一次订阅(受 RefreshCooldownMinutes 节流，每轮最多 1 次)，
   再基于最新节点列表選取，避免旧列表里只剩高延迟节点可换，
-  transport/all_down/节点失效/quota 四类在刷新成功后先等 RefreshSettleSeconds 秒，
+  transport/all_down/节点失效/quota 四类在刷新成功后先等 RefreshSettleSeconds 秒（默认 3），
   再原地复测一次当前节点：恢复则跳过切换（机场常在同名节点背后换 IP/凭证，
   刷新即可恢复；transport 需先连续 TransportConfirmRounds 轮确认才到这一步，见 3)；
   仍失败才进入切换循环。quota 同样走这条快捷路径：额度按出口 IP 计，
@@ -155,7 +155,9 @@ param(
   # 过期自动恢复——该机场同名背后会换 IP，永久拉黑会把已恢复的新 IP 挡在门外。
   # 0 = 关闭降权（不记录不降权）。
   [ValidateRange(0, 120)][int]$QuotaFailMemoryMinutes = 20,
-  [ValidateRange(0, 60)][int]$RefreshSettleSeconds = 5,
+  # 订阅刷新成功后、原地复测当前节点前的等待秒数（等内核把新 profile 热重载生效）；
+  # 0 = 不等直接复测。与 ProxyReadySeconds 无关，别混用。
+  [ValidateRange(0, 60)][int]$RefreshSettleSeconds = 3,
   # transport 连续确认轮数：verdict=transport（多为网络抖动，如 transport (connection failed)）需连续 N 轮仍坏才刷新切换；
   # quota/all_down/节点失效不受此限制，仍立即动作。
   [ValidateRange(1, 10)][int]$TransportConfirmRounds = 2,
@@ -1343,7 +1345,7 @@ function Refresh-Subscription {
 
 function Invoke-Failover {
   param([string]$Reason, [string]$Uid, [int]$MaxCandidates, [int]$SwitchGapSeconds, [int]$VerifyTimeoutSeconds,
-    [string]$Verdict = '', [int]$RefreshSettleSeconds = 5)
+    [string]$Verdict = '', [int]$RefreshSettleSeconds = 3)
   Write-WdLog "===== 进入故障切换（原因：$Reason） =====" 'WARN'
   # 先刷新订阅再决策：旧列表可能全是过期/高延迟节点，刷新后才有完整候选池。
   # 受 RefreshCooldownMinutes 节流（被节流/失败都用旧列表继续，不阻塞后续）。
@@ -1560,7 +1562,7 @@ function Invoke-WatchIteration {
     [int]$MaxCandidates,
     [int]$SwitchGapSeconds, [int]$VerifyTimeoutSeconds,
     [string]$Uid, [int]$RoundCooldownMinutes,
-    [int]$NormalLogMinutes = 20, [int]$RefreshSettleSeconds = 5,
+    [int]$NormalLogMinutes = 20, [int]$RefreshSettleSeconds = 3,
     [ValidateRange(1, 10)][int]$TransportConfirmRounds = 2
   )
   $wd = $null
@@ -1939,7 +1941,7 @@ try {
   $regionKeysForLog = @($script:DeprioritizeContains | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
   if ($script:DeprioritizePenaltyMs -gt 0 -and @($regionKeysForLog).Count -gt 0) { $regionCfg = "$($regionKeysForLog -join '/')+$($script:DeprioritizePenaltyMs)ms" }
   $excludeCfg = if (@($script:ExcludeContains).Count -gt 0) { @($script:ExcludeContains) -join '/' } else { '已关闭' }
-  Write-WdLog "看门狗启动：selector=$Selector 网关=$($script:GatewayBase) 模型=$VerifyModel 轮询=${PollSeconds}s 正常心跳=${NormalLogMinutes}分钟 quota记忆=${QuotaFailMemoryMinutes}分钟 transport连续确认=${TransportConfirmRounds}轮 探针通道=$(if ($script:ProbeSupported) { 'watchdog-probe' } else { 'legacy' }) 闸门等待=${ProxyReadySeconds}s 地区降权=${regionCfg} 子串排除=${excludeCfg}"
+  Write-WdLog "看门狗启动：selector=$Selector 网关=$($script:GatewayBase) 模型=$VerifyModel 轮询=${PollSeconds}s 正常心跳=${NormalLogMinutes}分钟 quota记忆=${QuotaFailMemoryMinutes}分钟 transport连续确认=${TransportConfirmRounds}轮 探针通道=$(if ($script:ProbeSupported) { 'watchdog-probe' } else { 'legacy' }) 闸门等待=${ProxyReadySeconds}s 刷新等待=${RefreshSettleSeconds}s 地区降权=${regionCfg} 子串排除=${excludeCfg}"
   if ($DryRun) {
     Invoke-DryRun -Uid $SubscriptionUid
     exit 0
