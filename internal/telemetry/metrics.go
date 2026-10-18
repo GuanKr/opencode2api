@@ -117,10 +117,50 @@ type UpstreamRequest struct {
 	Anonymous   bool      `json:"anonymous"`
 	Proxy       string    `json:"proxy_node,omitempty"`
 	Attempts    int       `json:"attempts"`
-	Status      int       `json:"status"`
-	DurationMS  int64     `json:"duration_ms"`
-	Success     bool      `json:"success"`
-	Outcome     string    `json:"outcome"`
+	// Prestripped marks a request whose first upstream attempt already went
+	// out pre-stripped because the session's stored history was remembered
+	// as poisoned (see gateway staleMemo). Such requests show attempts=1
+	// like a clean request, but the shape equals a self-heal retry body
+	// rather than the full client history.
+	Prestripped bool `json:"prestripped,omitempty"`
+	// PrestripMode is "selective" when only the snapshotted blacklist was
+	// removed and newer reasoning was kept, "full" when every reasoning
+	// reference was removed. Empty for non-pre-stripped requests; old
+	// pre-stripped records without a mode are full strips.
+	// It always describes the first-attempt shape, not the final successful
+	// body: a selective first attempt that needed an in-turn full fallback
+	// still records "selective" (see the attempts column title).
+	PrestripMode string `json:"prestrip_mode,omitempty"`
+	// PrestripIDs mirrors RequestMeta: stored blacklist size for the usage
+	// page (selective pre-strip or self-heal retry); omitted when zero.
+	PrestripIDs int    `json:"prestrip_ids,omitempty"`
+	Status      int    `json:"status"`
+	DurationMS  int64  `json:"duration_ms"`
+	Success     bool   `json:"success"`
+	Outcome     string `json:"outcome"`
+	// Endpoint is the inbound path the client called (/v1/messages, ...).
+	Endpoint string `json:"endpoint,omitempty"`
+	// Stream records the client-requested response shape as stated on the
+	// wire, recorded before routing: a failed stream must not be relabelled
+	// as a sync request.
+	//
+	// It is a pointer because all three states are meaningful. A plain bool
+	// decodes an absent key (a row persisted before this field existed) as
+	// false and then re-emits `"stream": false`, so the usage page could not
+	// tell "recorded as sync" from "never recorded" and would silently
+	// mislabel up to 24h of older history. nil marshals away under omitempty
+	// while &false still emits false, so all three survive the disk round trip.
+	Stream *bool `json:"stream,omitempty"`
+	// ReasoningEffort is the client-requested reasoning intensity label
+	// (see RequestMeta); omitted when the request stated none.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// FirstByteMS is client-observed TTFT, streams only; 0 otherwise.
+	FirstByteMS int64 `json:"first_byte_ms,omitempty"`
+	// Tokens and CostUSD are the per-request slice of the usage history:
+	// Tokens is the reported usage (zero when upstream reported none) and
+	// CostUSD is priced at record time with the models.dev price.
+	Tokens  TokenCounts `json:"tokens"`
+	CostUSD float64     `json:"cost_usd,omitempty"`
 }
 
 type attemptBucket struct {
@@ -139,6 +179,12 @@ const (
 	monitorRecentRequestCapacity = 10000
 	monitorRecentAttemptCapacity = 20000
 	monitorRecentOutputLimit     = 500
+	// The request detail table keeps a full day: capacity bounds memory
+	// while upstreamRequestRetention bounds age. Attempts stay hourly.
+	// Snapshot/Save cap both lists at monitorRecentOutputLimit (newest);
+	// the diagnostics page shows the newest 100 of each, the usage page
+	// the newest 500 requests.
+	upstreamRequestRetention = 24 * time.Hour
 )
 
 type upstreamRequestRing struct {
@@ -188,6 +234,34 @@ func (ring *upstreamRequestRing) Snapshot(cutoff time.Time, limit int) []Upstrea
 		result = result[len(result)-limit:]
 	}
 	return result
+}
+
+// SnapshotWithin returns the newest-first, capped entries inside [from, to).
+// It backs the per-request detail of GET /api/usage, which answers for the
+// range it was asked about instead of a fixed wall-clock window.
+func (ring *upstreamRequestRing) SnapshotWithin(from, to time.Time, limit int) []UpstreamRequest {
+	if limit < 1 || ring.count == 0 {
+		return nil
+	}
+	result := make([]UpstreamRequest, 0, min(ring.count, limit))
+	for offset := ring.count - 1; offset >= 0 && len(result) < limit; offset-- {
+		value := ring.items[(ring.start+offset)%len(ring.items)]
+		if !value.Time.Before(from) {
+			result = append(result, value)
+		}
+	}
+	// Entries older than `from` can only sit in the tail of the slice just
+	// collected, so an in-place forward filter is safe here.
+	trimmed := result[:0]
+	for _, value := range result {
+		if value.Time.Before(to) {
+			trimmed = append(trimmed, value)
+		}
+	}
+	if len(trimmed) == 0 {
+		return nil
+	}
+	return trimmed
 }
 
 type upstreamAttemptRing struct {
@@ -254,6 +328,27 @@ type Monitor struct {
 	attemptBuckets  [60]attemptBucket
 	recentRequests  upstreamRequestRing
 	recentAttempts  upstreamAttemptRing
+	// usageHours is the persisted long-term usage history: one bucket per
+	// UTC hour, saved beside config.json and rolled up to Beijing
+	// day/week/month on query (see usage_history.go / usage_range.go).
+	usageHours map[int64]*usageHourBucket
+	// priceFunc returns the current models.dev price for a model so cost is
+	// captured at record time (see usage_cost.go).
+	priceFunc func(string) (ModelPrice, bool)
+	// usageDirty marks persisted structures (hour buckets, request ring)
+	// changed since the last SaveUsageHistory, so the periodic saver (see
+	// cmd/opencode2api: usageSaveInterval) skips the full
+	// snapshot+marshal+write when idle. Set only on paths that write
+	// persisted state; minute buckets stay memory-only.
+	usageDirty atomic.Bool
+	// loadFailed refuses SaveUsageHistory after a failed Load: the monitor
+	// is empty then, and persisting would overwrite the on-disk history
+	// (or its preserved .corrupt copy) with nothing.
+	loadFailed atomic.Bool
+	// historySaved records a completed first save so later idle ticks can
+	// skip the snapshot+write (the first save always runs to establish
+	// the file, even with no traffic yet).
+	historySaved atomic.Bool
 }
 
 func NewMonitor() *Monitor {
@@ -264,6 +359,7 @@ func NewMonitor() *Monitor {
 		attemptLifetime: newAttemptAggregate(),
 		recentRequests:  newUpstreamRequestRing(),
 		recentAttempts:  newUpstreamAttemptRing(),
+		usageHours:      make(map[int64]*usageHourBucket),
 	}
 }
 
@@ -283,7 +379,8 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 	} else {
 		m.errors.Add(1)
 	}
-	minute := time.Now().Unix() / 60
+	now := time.Now()
+	minute := now.Unix() / 60
 	m.mu.Lock()
 	bucket := &m.buckets[minute%60]
 	if bucket.minute != minute {
@@ -307,6 +404,9 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 	bucket.histogram[index]++
 	bucket.endpoints[endpoint]++
 	bucket.statuses[fmt.Sprint(status)]++
+	var hourTokens TokenCounts
+	var hourCost float64
+	hasHourUsage := false
 	if meta != nil {
 		if meta.Model != "" {
 			bucket.models[meta.Model]++
@@ -330,13 +430,34 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 			m.addLifetimeSessionLocked(meta.Session, tokens)
 			addServerKeyUsage(bucket.usageKeys, meta.ServerKeyID, ServerKeyUsage{Requests: 1, TokenCounts: tokens})
 			addServerKeyUsage(m.lifetimeUsage.ServerKeys, meta.ServerKeyID, ServerKeyUsage{Requests: 1, TokenCounts: tokens})
+			// Persisted history: the same tokens and the record-time cost
+			// feed the hour bucket; the per-request entry reuses both.
+			hourTokens = tokens
+			hourCost = m.recordHourUsage(now, endpoint, meta, tokens)
+			hasHourUsage = true
+			m.usageDirty.Store(true)
 		}
 		if meta.Request != "" && meta.Model != "" {
 			request := UpstreamRequest{
-				Time: time.Now().UTC(), RequestID: meta.Request, Session: meta.Session, ServerKeyID: meta.ServerKeyID, Model: meta.Model, Tier: meta.Tier,
+				Time: now.UTC(), RequestID: meta.Request, Session: meta.Session, ServerKeyID: meta.ServerKeyID, Model: meta.Model, Tier: meta.Tier,
 				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Proxy: meta.Proxy,
 				Attempts: meta.Attempts, Status: status, DurationMS: max(duration.Milliseconds(), 0),
-				Success: success,
+				Success:         success,
+				Endpoint:        endpoint,
+				ReasoningEffort: meta.ReasoningEffort, FirstByteMS: meta.FirstByteMS,
+				// Poisoned-history fast path: persisted so the usage page can
+				// mark a pre-stripped first attempt across restarts (see
+				// gateway staleMemo and UpstreamRequest).
+				Prestripped: meta.Prestripped, PrestripMode: meta.PrestripMode,
+				PrestripIDs: meta.PrestripIDs,
+			}
+			// Always a real pointer, sync included: nil would read back as
+			// "never recorded" in the usage page's 流式 column.
+			streamShape := meta.Stream
+			request.Stream = &streamShape
+			if hasHourUsage {
+				request.Tokens = hourTokens
+				request.CostUSD = hourCost
 			}
 			if request.Channel == "" {
 				request.Channel = "not_routed"
@@ -348,8 +469,9 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 			if meta.Outcome != "" {
 				request.Outcome = meta.Outcome
 			}
-			m.recentRequests.PruneBefore(request.Time.Add(-time.Hour))
+			m.recentRequests.PruneBefore(request.Time.Add(-upstreamRequestRetention))
 			m.recentRequests.Add(request)
+			m.usageDirty.Store(true)
 		}
 	}
 	m.mu.Unlock()
@@ -506,8 +628,14 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 	}
 	usageLifetime := cloneUsagePeriod(m.lifetimeUsage)
 	upstreamLifetime := cloneAttemptAggregate(m.attemptLifetime)
-	cutoff := time.Now().Add(-time.Hour)
-	m.recentRequests.PruneBefore(cutoff)
+	snapNow := time.Now()
+	cutoff := snapNow.Add(-time.Hour)
+	// The request ring keeps a whole day because GET /api/usage serves the
+	// detail for the range it is asked about; the monitor response stays on
+	// the upstream one-hour window. Pruning must use the ring's own
+	// retention here — cutting the ring to an hour would drop the day of
+	// history the usage page queries.
+	m.recentRequests.PruneBefore(snapNow.Add(-upstreamRequestRetention))
 	m.recentAttempts.PruneBefore(cutoff)
 	recentRequests = m.recentRequests.Snapshot(cutoff, monitorRecentOutputLimit)
 	recentAttempts = m.recentAttempts.Snapshot(cutoff, monitorRecentOutputLimit)

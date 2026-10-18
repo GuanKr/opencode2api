@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"opencode2api/internal/config"
@@ -43,7 +45,13 @@ const statusClientClosedRequest = 499
 
 // proxyUnavailableMessage is returned when every attempt died on the proxy
 // route itself, so operators look at their proxies instead of the upstream.
-const proxyUnavailableMessage = "all proxies are unavailable; the upstream could not be reached"
+//
+// The "opencode2api:" prefix is load-bearing: watchdog-clash.ps1 tells a
+// gateway-authored backoff apart from a real upstream error by that substring,
+// and this is a gateway-authored error. The wording must also stay clear of
+// "ModelUnavailable" — the script reads 503 + that word as a catalog verdict
+// and stops the whole failover round instead of switching nodes.
+const proxyUnavailableMessage = "opencode2api: **[gateway]** all proxies are unavailable; the upstream could not be reached"
 
 type Gateway struct {
 	rotation     *rotation.Manager
@@ -56,9 +64,19 @@ type Gateway struct {
 	catalog      *models.Catalog
 	monitor      *telemetry.Monitor
 	availability *models.AvailabilityStore
+	// staleMemo is embedded by value: never copy a Gateway after use, and
+	// note that hot-reload builds a fresh Gateway whose memo starts empty
+	// (the first post-reload turn on a poisoned history simply self-heals
+	// once, exactly as before this memory existed).
+	staleMemo staleMemo
 	// attemptTimeout bounds a whole upstream attempt (dial + write + headers +
 	// first event), not just the header wait. Zero keeps the legacy behavior.
 	attemptTimeout time.Duration
+	// lastProxyKick throttles on-demand proxy re-probes (see
+	// kickProxyRecheck): without it an all-down spike would spawn one
+	// short-lived probe goroutine per request while the per-proxy CAS only
+	// dedupes overlapping probes, not goroutine creation.
+	lastProxyKick atomic.Int64
 }
 
 func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Monitor) (*Gateway, error) {
@@ -104,9 +122,14 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/responses", g.authenticate(g.handleInference(wire.Responses)))
 	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(wire.Anthropic)))
 	mux.HandleFunc("POST /v1/systemone", g.authenticate(g.handleSystemOne))
+	mux.HandleFunc("GET /v1/watchdog/status", g.authenticate(g.handleWatchdogStatus))
+	mux.HandleFunc("POST /v1/watchdog/probe", g.authenticate(g.handleWatchdogProbe))
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	return telemetry.Recover(g.logger, mux)
 }
+
+// Local: watchdog (read-only Clash decision feed) lives in watchdog.go;
+// only the route hook stays here.
 
 func (g *Gateway) authenticate(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -161,9 +184,18 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		meta := telemetry.MetaFromRequest(r)
 		if meta != nil {
 			meta.Model = model
+			meta.ReasoningEffort = wire.ReasoningEffortLabel(external, payload)
+			// The client-requested shape is recorded up front: a spot past
+			// the non-2xx return mislabels failed streams as sync.
+			meta.Stream = jsonutil.BoolAt(payload, "stream")
 		}
+		// Derived before routing so every client-visible rejection can carry a
+		// real x-request-id for log/telemetry correlation. Previously these
+		// paths passed the literal "model" (or nothing), which produced
+		// `x-request-id: model`.
+		ids := identity.DeriveRequestIDs(r, payload)
 		if model == "" {
-			wire.WriteError(w, external, http.StatusBadRequest, "model is required", "invalid_request_error", "model")
+			wire.WriteError(w, external, http.StatusBadRequest, "model is required", "invalid_request_error", ids.Request)
 			return
 		}
 		if id := g.rotation.GroupID(model); id != "" {
@@ -171,7 +203,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			return
 		}
 		if !g.catalog.Supported(model) {
-			wire.WriteError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
+			wire.WriteError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", ids.Request)
 			return
 		}
 		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
@@ -181,7 +213,16 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			route, err = g.catalog.RouteForTier(model, override.Tier, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0)
 		}
 		if err != nil {
-			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
+			if errors.Is(err, models.ErrModelDisabled) {
+				// Script contract: watchdog-clash.ps1 classifies 503 +
+				// "ModelUnavailable" as config (stop this round). It must not
+				// fall through to the 502/503/504 transport branch, which would
+				// burn the whole candidate pool on a gateway-side catalog state
+				// that switching exit IPs cannot change.
+				writeModelUnavailable(w, external, err, ids.Request)
+				return
+			}
+			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", ids.Request)
 			return
 		}
 		if meta != nil {
@@ -201,12 +242,16 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			g.forwardSystemOne(w, r, body, payload, model, route)
 			return
 		}
-		bodies, err := g.prepareRouteBodies(external, route, payload)
+		// Fingerprint the client payload BEFORE any shaping or conversion, so
+		// the anonymous cooling scope describes what the caller asked for
+		// rather than the gateway-rewritten body. A retry of this turn hashes
+		// the same and stays blocked; a different turn is still served.
+		fingerprint := identity.RequestFingerprint(payload)
+		bodies, err := g.prepareRouteBodies(external, route, payload, body)
 		if err != nil {
 			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 			return
 		}
-		ids := identity.DeriveRequestIDs(r, payload)
 		if meta != nil {
 			meta.Request = ids.Request
 			meta.Session = ids.Session
@@ -214,7 +259,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		stream := jsonutil.BoolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
-		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
+		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids, fingerprint)
 		if err != nil {
 			finalTier := route.Tier
 			if meta != nil && meta.Tier != "" {
@@ -231,19 +276,29 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				wire.WriteError(w, external, statusClientClosedRequest, "client closed request", "client_canceled", ids.Request)
 				return
 			}
-			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
-			// The request never reached the upstream because the proxy route
-			// failed; report that instead of blaming the upstream with a 502.
-			if errors.Is(err, errProxyUnavailable) {
-				wire.WriteError(w, external, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
-				return
-			}
 			// An exhausted request budget is a timeout, not a bad gateway: the
-			// distinction matters to clients that retry on 502.
+			// distinction matters to clients that retry on 502. Checked before the
+			// cooldown hook so a request that lost its budget can never be
+			// answered "come back later" for a lane that is in fact fine, and
+			// before the proxy check because proxyUnavailableError unwraps to the
+			// dial error too — a budget burned on dialing satisfies both.
 			if errors.Is(err, context.DeadlineExceeded) {
 				wire.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 				return
 			}
+			if g.writeCoolingResponse(w, external, err, meta, ids.Request, string(finalTier)) {
+				return
+			}
+			// Nothing reached the upstream because the proxy route failed;
+			// report that instead of blaming the upstream with a 502. Must stay
+			// after the cooling hook: errAnonymousCooling is never wrapped in
+			// errProxyUnavailable, so a cooling lane can still answer 429 here.
+			if errors.Is(err, errProxyUnavailable) {
+				g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+				wire.WriteError(w, external, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
+				return
+			}
+			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
 			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}
@@ -300,12 +355,19 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			wire.WriteError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
 		}
-		if upstreamRoute.Anonymous || (meta != nil && meta.Shaped) {
+		if (upstreamRoute.Anonymous || (meta != nil && meta.Shaped)) &&
+			(isUpstreamSSE(resp.Header.Get("Content-Type")) || looksLikeSSE(responseBody)) {
 			// Key-tier shaped requests were force-streamed like the
 			// anonymous lane; collapse the same way.
 			// The anonymous lane is served streaming (see prepareAnonymousBody);
 			// collapse the events back into the single document this
 			// non-streaming client asked for.
+			//
+			// The content-type gate is load-bearing: an upstream 200 reply that
+			// is plain JSON rather than SSE must pass through untouched.
+			// Aggregating it unconditionally would fail to parse a perfectly
+			// good 200 and answer 502 — and the free/shaped lanes are exactly
+			// where that mislabelled shape is most likely to show up.
 			collapsed, err := wire.CollapseStream(bytes.NewReader(responseBody), upstreamRoute.Protocol, model)
 			if err != nil {
 				g.logger.Warn("anonymous stream collapse failed", "component", "conversion", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "source_protocol", upstreamRoute.Protocol, "error", err)
@@ -350,6 +412,11 @@ func (g *Gateway) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 	model := jsonutil.StringAt(payload, "model")
 	if meta := telemetry.MetaFromRequest(r); meta != nil {
 		meta.Model = model
+		// Same client-shape recording as handleInference (see gateway.go), so
+		// the usage page's 推理强度 / 流式 columns are not blank for traffic
+		// that arrives on this endpoint instead of the three message ones.
+		meta.ReasoningEffort = wire.ReasoningEffortLabel(wire.SystemOne, payload)
+		meta.Stream = jsonutil.BoolAt(payload, "stream")
 	}
 	if model == "" {
 		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "model is required", "invalid_request_error", "model")
@@ -359,9 +426,14 @@ func (g *Gateway) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
 		return
 	}
+	ids := identity.DeriveRequestIDs(r, payload)
 	route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
 	if err != nil {
-		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
+		if errors.Is(err, models.ErrModelDisabled) {
+			writeModelUnavailable(w, wire.SystemOne, err, ids.Request)
+			return
+		}
+		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, err.Error(), "invalid_request_error", ids.Request)
 		return
 	}
 	if route.Protocol != wire.SystemOne {
@@ -390,14 +462,17 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 	for _, tier := range route.KeyTiers {
 		bodies[tier] = body
 	}
+	// Same cooling scope as handleInference; for System One the decisive
+	// fields are state+questions, which RequestFingerprint hashes.
 	ids := identity.DeriveRequestIDs(r, payload)
 	if meta != nil {
 		meta.Request = ids.Request
 		meta.Session = ids.Session
 	}
+	fingerprint := identity.RequestFingerprint(payload)
 	requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 	defer cancel()
-	resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids)
+	resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids, fingerprint)
 	if err != nil {
 		finalTier := route.Tier
 		if meta != nil && meta.Tier != "" {
@@ -412,15 +487,22 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 			wire.WriteError(w, wire.SystemOne, statusClientClosedRequest, "client closed request", "client_canceled", ids.Request)
 			return
 		}
-		g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
-		if errors.Is(err, errProxyUnavailable) {
-			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
-			return
-		}
+		// Same ordering as handleInference: an exhausted budget is a timeout, and it
+		// must be decided before the cooldown hook can answer 429 for a lane
+		// that is actually fine, and before the proxy check for the same reason.
 		if errors.Is(err, context.DeadlineExceeded) {
 			wire.WriteError(w, wire.SystemOne, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
 			return
 		}
+		if g.writeCoolingResponse(w, wire.SystemOne, err, meta, ids.Request, string(finalTier)) {
+			return
+		}
+		if errors.Is(err, errProxyUnavailable) {
+			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
+			return
+		}
+		g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
 		wire.WriteError(w, wire.SystemOne, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 		return
 	}
@@ -436,6 +518,9 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 	}
 	if contentType := resp.Header.Get("Content-Type"); strings.HasPrefix(contentType, "text/event-stream") {
 		if meta != nil {
+			// Upstream decided the response is an event stream even if the
+			// client did not ask for one; the client really does receive a
+			// stream, so this is the accurate shape to record.
 			meta.Stream = true
 		}
 		w.Header().Set("Content-Type", contentType)
@@ -457,7 +542,9 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 	_, _ = w.Write(responseBody)
 }
 
-func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, input map[string]any) (map[config.Tier][]byte, error) {
+// raw is the exact client body the payload was decoded from; it lets a
+// same-protocol primary tier skip the re-encode. nil disables the shortcut.
+func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, input map[string]any, raw []byte) (map[config.Tier][]byte, error) {
 	tiers := make([]config.Tier, 0, len(route.KeyTiers)+1)
 	seen := make(map[config.Tier]bool, len(route.KeyTiers)+1)
 	addTier := func(tier config.Tier) {
@@ -475,25 +562,51 @@ func (g *Gateway) prepareRouteBodies(from wire.Protocol, route models.Route, inp
 		return nil, errors.New("no usable upstream tier")
 	}
 	bodies := make(map[config.Tier][]byte, len(tiers))
+	// rawReuse is spent by the first tier that can safely take the client's
+	// bytes verbatim. After that, a repair may have mutated input in place and
+	// the original bytes no longer describe it, so later tiers re-encode.
+	rawReuse := len(raw) > 0
+	skipTier := func(tier config.Tier, protocol wire.Protocol, err error) bool {
+		if tier == route.Tier {
+			return false
+		}
+		// A fallback tier may use a stricter wire format than the preferred
+		// tier. Do not reject a request before the preferred upstream has even
+		// been tried; that tier is attempted only if the request actually
+		// falls back.
+		g.logger.Debug("skipping fallback tier with incompatible request shape", "component", "conversion", "event", "fallback_tier_skipped", "model", jsonutil.StringAt(input, "model"), "tier", tier, "protocol", protocol, "error", err)
+		return true
+	}
 	for _, tier := range tiers {
 		protocol := route.ProtocolFor(tier)
 		baseURL := g.cfg.Upstream.Zen
 		if tier == config.TierGo {
 			baseURL = g.cfg.Upstream.Go
 		}
+		effort := g.resolvedEffort(jsonutil.StringAt(input, "model"), tier, protocol)
+		// Zero-copy is only valid when nothing downstream would rewrite the
+		// body: a forced effort mutates the payload, and any other tier than
+		// the one holding raw must not claim those bytes.
+		if rawReuse && effort == "" && tier == route.Tier {
+			encoded, err := wire.PrepareRequestBytes(from, protocol, input, raw, baseURL)
+			if err != nil {
+				if skipTier(tier, protocol, err) {
+					continue
+				}
+				return nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
+			}
+			rawReuse = false
+			bodies[tier] = encoded
+			continue
+		}
 		upstreamPayload, err := wire.PrepareRequest(from, protocol, input, baseURL)
 		if err != nil {
-			if tier != route.Tier {
-				// A fallback tier may use a stricter wire format than the
-				// preferred tier. Do not reject a request before the preferred
-				// upstream has even been tried; that tier is attempted only if
-				// the request actually falls back.
-				g.logger.Debug("skipping fallback tier with incompatible request shape", "component", "conversion", "event", "fallback_tier_skipped", "model", jsonutil.StringAt(input, "model"), "tier", tier, "protocol", protocol, "error", err)
+			if skipTier(tier, protocol, err) {
 				continue
 			}
 			return nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
 		}
-		if effort := g.resolvedEffort(jsonutil.StringAt(upstreamPayload, "model"), tier, protocol); effort != "" {
+		if effort != "" {
 			wire.ForcedEffort(protocol, upstreamPayload, effort)
 		}
 		encoded, err := json.Marshal(upstreamPayload)
@@ -512,8 +625,101 @@ func copyErrorResponse(w http.ResponseWriter, protocol wire.Protocol, resp *http
 	}
 	message := http.StatusText(resp.StatusCode)
 	var value map[string]any
+	upstreamType := ""
 	if json.Unmarshal(body, &value) == nil {
 		message = jsonutil.FirstString(jsonutil.StringAt(value, "error", "message"), jsonutil.StringAt(value, "message"), message)
+		// Preserve the upstream error class (only the nested error.type; the
+		// top-level "type" is just the envelope). Zen's 429 kinds share
+		// identical text, so without this FreeUsageLimitError vs
+		// RateLimitError vs BlackUsageLimitError are indistinguishable
+		// downstream.
+		upstreamType = jsonutil.StringAt(value, "error", "type")
 	}
-	wire.WriteError(w, protocol, resp.StatusCode, message, "upstream_error", requestID)
+	if upstreamType != "" && !strings.HasPrefix(message, upstreamType) {
+		message = upstreamType + ": " + message
+	}
+	// Neutralize a forged gateway prefix: upstream error text may echo
+	// client-controlled input, and a leading "opencode2api:" would make a
+	// passthrough indistinguishable from a gateway-originated error for
+	// prefix-based classifiers (dsh; the Anthropic shape has no code field as
+	// a second factor). Only a leading occurrence matters (classifiers match
+	// the strict prefix); the colon is replaced so the text stays readable but
+	// no longer matches.
+	message = neutralizeForgedGatewayPrefix(message)
+	kind := "upstream_error"
+	if protocol == wire.Anthropic && upstreamType != "" {
+		// The Anthropic shape has no code field, so error.type is the only
+		// machine-readable slot: carry the upstream class there instead of
+		// flattening every passthrough to "upstream_error". Gateway errors
+		// never pass through here, so a structured upstream class cannot be
+		// mistaken for a gateway verdict.
+		kind = sanitizeUpstreamErrorType(upstreamType)
+	}
+	wire.WriteError(w, protocol, resp.StatusCode, message, kind, requestID)
+}
+
+// writeModelUnavailable maps a routing failure caused by a confirmed
+// availability disable onto 503. It is a server-side condition, not a
+// malformed request: answering 400 made clients (and dsh) read a temporarily
+// disabled model as a bad request and never retry or fall back. Every entry
+// point that can hit this error shares this mapping so the two cannot drift
+// apart again.
+func writeModelUnavailable(w http.ResponseWriter, protocol wire.Protocol, err error, requestID string) {
+	detail := strings.TrimPrefix(err.Error(), models.ErrModelDisabled.Error()+": ")
+	wire.WriteError(w, protocol, http.StatusServiceUnavailable,
+		"opencode2api: **[gateway]** **ModelUnavailable** "+detail, "model_unavailable", requestID)
+}
+
+// neutralizeForgedGatewayPrefix defuses every "opencode2api:" occurrence in a
+// passthrough message so forged upstream text cannot pose as a
+// gateway-originated error. Upstream error text echoes client input, and the
+// consumer is a substring test, not a prefix test: watchdog-clash.ps1 decides
+// "the gateway is backing off" with $body.Contains('opencode2api:'). Defusing
+// only a leading occurrence would leave "invalid_request_error: opencode2api:…"
+// intact, because the upstream class is prepended above — and the script would
+// then read a genuine upstream 429 as a local cooldown and stop switching
+// nodes, which is the one recovery the free tier has. The colon becomes a
+// semicolon, so the text stays readable and the token no longer matches.
+func neutralizeForgedGatewayPrefix(message string) string {
+	const prefix = "opencode2api:"
+	if !strings.Contains(message, prefix) {
+		return message
+	}
+	return strings.ReplaceAll(message, prefix, "opencode2api;")
+}
+
+// sanitizeUpstreamErrorType keeps an upstream error class safe for the
+// structured Anthropic error.type slot: trimmed, length-bounded, and never
+// allowed to impersonate the gateway's own verdict namespace.
+func sanitizeUpstreamErrorType(upstreamType string) string {
+	trimmed := strings.TrimSpace(upstreamType)
+	if trimmed == "" || strings.HasPrefix(strings.ToLower(trimmed), "opencode2api") {
+		return "upstream_error"
+	}
+	if len([]rune(trimmed)) > 128 {
+		trimmed = string([]rune(trimmed)[:128])
+	}
+	return trimmed
+}
+
+// isUpstreamSSE reports whether an upstream content type is an SSE stream.
+// It parses the media type strictly so a JSON body that merely mentions the
+// token in a parameter cannot be misread as a stream.
+func isUpstreamSSE(contentType string) bool {
+	if mediatype, _, err := mime.ParseMediaType(contentType); err == nil {
+		return strings.ToLower(mediatype) == "text/event-stream"
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "text/event-stream")
+}
+
+// looksLikeSSE is the belt to isUpstreamSSE's braces. The content type alone
+// is not enough to trust: a mislabeled SSE body (Content-Type left at
+// application/json) would otherwise skip the collapse and be written to the
+// client verbatim as application/json, which the client cannot parse — a worse
+// failure than the 502 the gate was added to prevent. Body sniffing only ever
+// adds a collapse, and collapsing something that was not a stream still fails
+// loudly in the same place as before.
+func looksLikeSSE(body []byte) bool {
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	return bytes.HasPrefix(trimmed, []byte("data:")) || bytes.HasPrefix(trimmed, []byte("event:"))
 }

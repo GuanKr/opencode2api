@@ -58,6 +58,75 @@ type UpstreamConfig struct {
 	// moved keyless inference off /zen onto its own host, so the anonymous lane
 	// no longer shares the Zen base with the keyed lanes.
 	Anonymous string `json:"anonymous"`
+	// AnonymousLaneOrder lists the keyless free-tier bases in the order the
+	// gateway tries them, each applied with its own request shape and tool
+	// gate. "inference" is Upstream.Anonymous; "legacy" is the hardcoded
+	// models.LegacyZenBase (/zen/v1).
+	//
+	// It is a setting rather than a constant because the two lanes are not
+	// interchangeable and neither is proven: the local measurements recorded
+	// in AGENTS.md only ever saw /inference pass, so defaulting to legacy
+	// would put a doomed attempt in front of every anonymous request. Flip
+	// the default only after measuring the legacy lane. Empty or absent means
+	// ["inference","legacy"].
+	AnonymousLaneOrder []string `json:"anonymous_lane_order,omitempty"`
+}
+
+// Lane order tokens accepted by UpstreamConfig.AnonymousLaneOrder.
+const (
+	LaneInference = "inference"
+	LaneLegacy    = "legacy"
+)
+
+// DefaultAnonymousLaneOrder is ["inference"] alone, NOT ["inference","legacy"].
+//
+// Keeping legacy in the default list does not preserve the pre-merge behaviour,
+// it changes it on exactly the request that matters most: an exhausted free
+// quota. /inference answers 429, the gateway falls through to /zen/v1, that lane
+// rejects with the 403 gate text, and watchdogCause reads the text as
+// FreeTierError — so classifyAnonymousVerdict returns quota, recommend_switch
+// flips on, and watchdog-clash.ps1 starts changing exit nodes. No node switch
+// can fix an endpoint choice, so the whole candidate pool gets burned, once
+// per request, precisely when quota is already exhausted.
+//
+// Legacy stays fully wired and one config line away: set
+// "upstream": {"anonymous_lane_order": ["inference","legacy"]} once the lane
+// has actually been measured to pass (see the D1 notes in merge-analysis).
+func DefaultAnonymousLaneOrder() []string {
+	return []string{LaneInference}
+}
+
+// NormalizeLaneOrder trims, lowercases, validates and de-duplicates an
+// anonymous lane order, defaulting when it is absent or empty.
+//
+// An unknown token is a startup error rather than a silent drop: a typo that
+// quietly reordered or shortened the list would change which upstream every
+// anonymous request reaches, which is exactly the failure this setting exists
+// to make visible and reversible.
+func NormalizeLaneOrder(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return DefaultAnonymousLaneOrder(), nil
+	}
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, entry := range raw {
+		lane := strings.ToLower(strings.TrimSpace(entry))
+		if lane == "" {
+			continue
+		}
+		if lane != LaneInference && lane != LaneLegacy {
+			return nil, fmt.Errorf("upstream.anonymous_lane_order must contain only %q or %q, got %q", LaneInference, LaneLegacy, entry)
+		}
+		if seen[lane] {
+			continue
+		}
+		seen[lane] = true
+		out = append(out, lane)
+	}
+	if len(out) == 0 {
+		return DefaultAnonymousLaneOrder(), nil
+	}
+	return out, nil
 }
 
 type RetryConfig struct {
@@ -188,6 +257,11 @@ func Normalize(path string, cfg Config) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be an http or https URL", name)
 		}
 	}
+	order, err := NormalizeLaneOrder(cfg.Upstream.AnonymousLaneOrder)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Upstream.AnonymousLaneOrder = order
 	if len(cfg.ServerKeys) == 0 {
 		return Config{}, errors.New("server_keys must contain at least one local key")
 	}

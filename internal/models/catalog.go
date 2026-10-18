@@ -223,7 +223,7 @@ func (c *Catalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) 
 
 func (c *Catalog) routeLocked(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (Route, error) {
 	if c.availability != nil && c.availability.Disabled(model) {
-		return Route{}, fmt.Errorf("model %q is disabled after a failed availability check; restore it in the WebUI or wait for the next probe", model)
+		return Route{}, fmt.Errorf("%w: model %q is disabled after a failed availability check; restore it in the WebUI or wait for the next probe", ErrModelDisabled, model)
 	}
 	if err := c.freeOnlyErrorLocked(model); err != nil {
 		return Route{}, err

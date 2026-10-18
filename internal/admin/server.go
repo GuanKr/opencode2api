@@ -54,6 +54,7 @@ func (a *Server) Handler() http.Handler {
 	mux.Handle("POST /api/config/reveal", a.authenticate(a.csrf(http.HandlerFunc(a.handleReveal))))
 	mux.Handle("PUT /api/account", a.authenticate(a.csrf(http.HandlerFunc(a.handleAccount))))
 	mux.Handle("GET /api/monitor", a.authenticate(http.HandlerFunc(a.handleMonitor)))
+	mux.Handle("GET /api/usage", a.authenticate(http.HandlerFunc(a.handleUsage)))
 	mux.Handle("GET /api/debug/models", a.authenticate(http.HandlerFunc(a.handleDebugModels)))
 	mux.Handle("GET /api/models/availability", a.authenticate(http.HandlerFunc(a.handleAvailability)))
 	mux.Handle("POST /api/models/restore", a.authenticate(a.csrf(http.HandlerFunc(a.handleRestoreModel))))
@@ -81,6 +82,15 @@ func (a *Server) staticHandler() http.Handler {
 			writeAdminError(w, http.StatusNotFound, "not_found", "management endpoint not found")
 			return
 		}
+		// The console is embedded at compile time, so its asset names never
+		// change and embed.FS carries no validator to revalidate against. With
+		// no Cache-Control the browser is free to keep serving its own copy:
+		// a stale app.js then renders the old table against the new API and
+		// the page shows permanently blank columns after an upgrade. Refetch
+		// unconditionally; these are a few KB behind an authenticated admin
+		// port, and the alternative is a UI that silently disagrees with the
+		// backend it ships with.
+		w.Header().Set("Cache-Control", "no-cache, no-store")
 		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
 			if _, err := fs.Stat(assets, strings.TrimPrefix(r.URL.Path, "/")); err != nil {
 				r.URL.Path = "/"
@@ -251,6 +261,8 @@ func (a *Server) handleMonitor(w http.ResponseWriter, _ *http.Request) {
 		"version": buildinfo.Version, "metrics": metrics, "usage": metrics.Usage, "upstream": metrics.Upstream, "resources": a.manager.Resources(),
 	})
 }
+
+// Local: usage endpoint lives in usage.go; only the route hook stays here.
 
 func (a *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)

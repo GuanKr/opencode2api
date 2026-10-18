@@ -44,6 +44,9 @@
             <div class="nav-group-title" data-i18n="nav.group.runtime">运行</div>
             <button class="nav-item active" data-page="overview" data-i18n="nav.overview">概览</button>
             <button class="nav-item" data-page="diagnostics" data-i18n="nav.diagnostics">诊断</button>
+            <button class="nav-item" data-page="usage-records" data-i18n="nav.usage-records">
+              使用记录
+            </button>
           </div>
           <div class="nav-group">
             <div class="nav-group-title" data-i18n="nav.group.integration">接入</div>
@@ -443,6 +446,272 @@
                 </div>
               </section>
             </div>
+          </section>
+
+          <section id="page-usage-records" class="page hidden">
+            <div id="uq-history-warning" class="notice hidden" role="status" data-i18n="usage-records.history.off">
+              历史持久化已禁用
+            </div>
+            <section class="section">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title" data-i18n="usage-records.range.title">时间范围</h2>
+                  <p class="section-caption" data-i18n="usage-records.range.caption">
+                    北京时间自然对齐（整点 / 自然日 / 周一起 / 自然月）。成本为记录时按 models.dev
+                    价格估算（USD / 1M tokens），未知模型记 $0。端点分布与请求明细见下方。
+                  </p>
+                </div>
+                <div class="toolbar">
+                  <button class="btn btn-sm" data-uq-gran="hour" data-i18n="usage-records.gran.hour">小时</button>
+                  <button class="btn btn-sm" data-uq-gran="day" data-i18n="usage-records.gran.day">天</button>
+                  <button class="btn btn-sm" data-uq-gran="week" data-i18n="usage-records.gran.week">周</button>
+                  <button class="btn btn-sm" data-uq-gran="month" data-i18n="usage-records.gran.month">月</button>
+                </div>
+              </div>
+              <div class="toolbar">
+                <button id="uq-prev" class="btn btn-sm" data-i18n="usage-records.range.prev">← 上一页</button>
+                <span id="uq-range-label" class="mono uq-range">—</span>
+                <button id="uq-next" class="btn btn-sm" data-i18n="usage-records.range.next">下一页 →</button>
+              </div>
+            </section>
+            <div class="metrics">
+              <div class="metric">
+                <div class="metric-label" data-i18n="usage-records.metric.coverage">Usage coverage</div>
+                <div id="uq-coverage" class="metric-value">—</div>
+                <div class="metric-note" data-i18n="usage-records.metric.coverage.note">有 Token 回报 / 推理请求</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label" data-i18n="usage-records.metric.total">Total tokens</div>
+                <div id="uq-total" class="metric-value">—</div>
+                <div id="uq-total-note" class="metric-note">当前范围</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label" data-i18n="usage-records.metric.cost">Est. cost</div>
+                <div id="uq-cost" class="metric-value">—</div>
+                <div class="metric-note" data-i18n="usage-records.metric.cost.note">USD · 记录时价格估算</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label" data-i18n="usage-records.metric.requests">Requests</div>
+                <div id="uq-requests" class="metric-value">—</div>
+                <div class="metric-note" data-i18n="usage-records.metric.requests.note">当前范围推理请求</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label" data-i18n="usage-records.metric.cached">Cached tokens</div>
+                <div id="uq-cached" class="metric-value">—</div>
+                <div class="metric-note" data-i18n="usage-records.metric.cached.note">上游回报的缓存命中</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label" data-i18n="usage-records.metric.reasoning">Reasoning tokens</div>
+                <div id="uq-reasoning" class="metric-value">—</div>
+                <div class="metric-note" data-i18n="usage-records.metric.reasoning.note">上游回报的推理用量</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label" data-i18n="usage-records.metric.hitrate">Cache hit rate</div>
+                <div id="uq-hitrate" class="metric-value">—</div>
+                <div class="metric-note" data-i18n="usage-records.metric.hitrate.note">cached / input · 缓存命中率</div>
+              </div>
+            </div>
+            <section class="section">
+              <div class="section-head">
+                <div>
+                  <h2 id="uq-trend-title" class="section-title" data-i18n="usage-records.trend.title">
+                    Token 趋势
+                  </h2>
+                  <p id="uq-trend-caption" class="section-caption">
+                    柱顶数字为总量，下方时间轴对应各柱时间；悬停查看输入、输出、缓存、命中率与预估成本。
+                  </p>
+                </div>
+              </div>
+              <div id="uq-trend" class="uq-trend"></div>
+            </section>
+            <div class="split">
+              <section class="section">
+                <div class="section-head">
+                  <div>
+                    <h2 class="section-title" data-i18n="usage-records.models.title">模型分布</h2>
+                    <p class="section-caption" data-i18n="usage-records.models.caption">
+                      按 total_tokens 排序。donut 口径可在 Token / 成本间切换。
+                    </p>
+                  </div>
+                  <div class="toolbar">
+                    <button id="uq-metric-token" class="btn btn-sm" data-i18n="usage-records.models.byToken">按 Token</button>
+                    <button id="uq-metric-cost" class="btn btn-sm" data-i18n="usage-records.models.byCost">按成本</button>
+                  </div>
+                </div>
+                <div class="donut-row">
+                  <div id="uq-model-donut" class="donut"></div>
+                  <div id="uq-model-legend" class="donut-legend"></div>
+                </div>
+                <div class="table-wrap usage-table">
+                  <table class="table">
+                    <thead>
+                      <tr>
+                        <th data-i18n="usage-records.models.col.model">模型</th>
+                        <th class="num" data-i18n="usage-records.models.col.input">输入</th>
+                        <th class="num" data-i18n="usage-records.models.col.output">输出</th>
+                        <th class="num" data-i18n="usage-records.models.col.total">总量</th>
+                        <th data-i18n="usage-records.models.col.cost">预估成本</th>
+                      </tr>
+                    </thead>
+                    <tbody id="uq-models"></tbody>
+                  </table>
+                </div>
+              </section>
+              <section class="section">
+                <div class="section-head">
+                  <div>
+                    <h2 class="section-title" data-i18n="usage-records.endpoints.title">端点分布</h2>
+                    <p class="section-caption" data-i18n="usage-records.endpoints.caption">
+                      所选范围内的入站端点请求 / Token / 预估成本；范围无数据时回退为最近一小时计数。
+                    </p>
+                  </div>
+                </div>
+                <div class="donut-row">
+                  <div id="uq-endpoint-donut" class="donut"></div>
+                  <div id="uq-endpoint-legend" class="donut-legend"></div>
+                </div>
+                <div class="table-wrap usage-table">
+                  <table class="table">
+                    <thead>
+                      <tr>
+                        <th data-i18n="usage-records.endpoints.col.endpoint">端点</th>
+                        <th class="num" data-i18n="usage-records.endpoints.col.requests">请求</th>
+                        <th class="num" data-i18n="usage-records.endpoints.col.tokens">Token</th>
+                        <th data-i18n="usage-records.endpoints.col.cost">预估成本</th>
+                      </tr>
+                    </thead>
+                    <tbody id="uq-endpoints"></tbody>
+                  </table>
+                </div>
+              </section>
+            </div>
+            <div class="split">
+              <section class="section">
+                <div class="section-head">
+                  <div>
+                    <h2 class="section-title" data-i18n="usage-records.tiers.title">Tier 分布</h2>
+                    <p class="section-caption" data-i18n="usage-records.tiers.caption">
+                      Zen / Go 的 Token 与成本去向（成本按模型价格归集）。
+                    </p>
+                  </div>
+                </div>
+                <div id="uq-tiers"></div>
+              </section>
+              <section class="section">
+                <div class="section-head">
+                  <div>
+                    <h2 class="section-title" data-i18n="usage-records.channels.title">通道与状态</h2>
+                    <p class="section-caption" data-i18n="usage-records.channels.caption">
+                      最近一小时 anonymous / key 通道成功率与状态码。
+                    </p>
+                  </div>
+                </div>
+                <div id="uq-channels"></div>
+              </section>
+            </div>
+            <section class="section">
+              <div class="section-head">
+                <div>
+                  <h2 class="section-title" data-i18n="usage-records.requests.title">请求明细</h2>
+                  <p class="section-caption" data-i18n="usage-records.requests.caption">
+                    所选时间范围内实际路由的推理请求，仅展示最新 500 条。同一对话共享同一对话ID与颜色，点击可筛选；颜色仅为当前列表内辅助提示、以ID为准，对话ID取自客户端会话标识、必要时确定性重编码，仅用于同对话关联；Token
+                    与费用为上游回报口径、记录时价格估算；尝试为上游尝试次数（含匿名 lane 与 key 回退，>1 表示触发过重试/回退，含自愈）；首字为客户端观测的首字节耗时（TTFT，仅流式有效，非流式显示—）；耗时已减去首字时间（总耗时−首字，悬停查看原始值）；推理强度与端点取自客户端请求本身；仅显示
+                    Key 尾码，不记录客户端密钥与 IP。
+                  </p>
+                </div>
+                <div class="toolbar">
+                  <button id="uq-req-refresh" class="btn btn-sm" data-i18n="usage-records.requests.refresh">刷新</button>
+                  <button id="uq-req-reset" class="btn btn-sm btn-ghost" data-i18n="usage-records.requests.reset">重置</button>
+                </div>
+              </div>
+              <div class="usage-filters">
+                <div class="field">
+                  <label for="uq-f-model" data-i18n="usage-records.filter.model">模型</label>
+                  <select id="uq-f-model">
+                    <option value="">全部模型</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="uq-f-tier" data-i18n="usage-records.filter.tier">Tier</label>
+                  <select id="uq-f-tier">
+                    <option value="">全部 Tier</option>
+                    <option value="zen">zen</option>
+                    <option value="go">go</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="uq-f-channel" data-i18n="usage-records.filter.channel">通道</label>
+                  <select id="uq-f-channel">
+                    <option value="">全部通道</option>
+                    <option value="anonymous">anonymous</option>
+                    <option value="key">key</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="uq-f-status" data-i18n="usage-records.filter.status">状态</label>
+                  <select id="uq-f-status">
+                    <option value="">全部状态</option>
+                    <option value="ok" data-i18n="usage-records.filter.status.ok">成功 2xx–3xx</option>
+                    <option value="fail" data-i18n="usage-records.filter.status.fail">失败 4xx–5xx</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="uq-f-effort" data-i18n="usage-records.filter.effort">推理强度</label>
+                  <select id="uq-f-effort">
+                    <option value="">全部强度</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="uq-f-range" data-i18n="usage-records.filter.range">时间范围</label>
+                  <select id="uq-f-range">
+                    <option value="1h">最近1小时</option>
+                    <option value="6h">最近6小时</option>
+                    <option value="24h" selected>最近24小时</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="uq-f-q" data-i18n="usage-records.filter.query">搜索 Request ID / 对话ID / 模型</label>
+                  <input id="uq-f-q" placeholder="msg_ / ses_ / gpt-" />
+                </div>
+              </div>
+              <div class="table-wrap usage-table">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th data-i18n="usage-records.requests.col.time">时间</th>
+                      <th data-i18n="usage-records.requests.col.request">Request ID</th>
+                      <th data-i18n="usage-records.requests.col.model">模型</th>
+                      <th data-i18n="usage-records.requests.col.effort">推理强度</th>
+                      <th data-i18n="usage-records.requests.col.endpoint">端点</th>
+                      <th data-i18n="usage-records.requests.col.tier">Tier / 通道</th>
+                      <th data-i18n="usage-records.requests.col.key">Key 尾码</th>
+                      <th data-i18n="usage-records.requests.col.stream">流式</th>
+                      <th data-i18n="usage-records.requests.col.session">对话ID</th>
+                      <th data-i18n="usage-records.requests.col.tokens">Token</th>
+                      <th data-i18n="usage-records.requests.col.cost">费用</th>
+                      <th data-i18n="usage-records.requests.col.status">状态</th>
+                      <th data-i18n="usage-records.requests.col.attempts">尝试</th>
+                      <th class="num" data-i18n="usage-records.requests.col.firstByte">首字</th>
+                      <th class="num" data-i18n="usage-records.requests.col.duration">耗时(去首字)</th>
+                    </tr>
+                  </thead>
+                  <tbody id="uq-requests-body"></tbody>
+                </table>
+              </div>
+              <div class="req-foot">
+                <span id="uq-req-count" class="uq-range">—</span>
+                <span class="pager-right">
+                  <span class="uq-range" data-i18n="usage-records.requests.pageSize">每页：</span>
+                  <select id="uq-f-pagesize">
+                    <option value="10">10</option>
+                    <option value="20" selected>20</option>
+                    <option value="50">50</option>
+                    <option value="100">100</option>
+                  </select>
+                  <span id="uq-pager" class="pager"></span>
+                </span>
+              </div>
+            </section>
           </section>
 
           <section id="page-access" class="page hidden">

@@ -175,7 +175,10 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 		copyPayload[k] = v
 	}
 	copyPayload["model"] = route.ID
-	bodies, err := g.prepareRouteBodies(external, route, copyPayload)
+	// nil raw: copyPayload already has the alias replaced by the concrete model, so
+	// the client's original bytes no longer describe it and cannot be forwarded
+	// verbatim.
+	bodies, err := g.prepareRouteBodies(external, route, copyPayload, nil)
 	if err != nil {
 		result.err = err
 		result.reason = "request_conversion_error"
@@ -185,6 +188,10 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 	if meta := telemetry.MetaFromContext(parent); meta != nil {
 		meta.ToolAlias = toolAlias
 	}
+	// Both bytes are logged like every other lane: the client's own body and the
+	// one that goes on the wire. Equal digests mean this lane changed nothing.
+	g.dumpOutboundBody(route, config.TierGo, bodies[config.TierGo], ids, "client")
+	g.dumpOutboundBody(route, config.TierGo, body, ids, "shaped")
 	cursor := g.goNodes.CursorFor(ids.Session)
 	var node *upstreamNode
 	// Each group attempt is exactly one HTTP call. Key selection may change,

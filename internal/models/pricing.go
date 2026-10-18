@@ -178,7 +178,8 @@ func (store *PricingStore) fetch(ctx context.Context, client *http.Client) ([]by
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", httpx.UserAgent())
+	// Static cost table fetch, not inference: identify as the gateway.
+	req.Header.Set("User-Agent", httpx.GatewayUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

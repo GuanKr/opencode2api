@@ -49,6 +49,39 @@ type anonymousNode struct {
 	proxy         *proxyTransport
 	failures      atomic.Uint32
 	cooldownUntil atomic.Int64
+	// coolHash is the fingerprint of the request that triggered the current
+	// cooldown (see identity.RequestFingerprint). Empty means the cooldown is
+	// not request-scoped (background refresh, or a caller that had no payload
+	// to fingerprint) and therefore blocks every request.
+	//
+	// It is what makes the cooldown request-scoped rather than per-proxy: a
+	// turn that was rate-limited must not also block an unrelated one, or a
+	// single quota event freezes the whole anonymous lane for the window.
+	coolHash atomic.Value
+	// coolCause is a short summary of what triggered the current cooldown
+	// (e.g. "FreeUsageLimitError (upstream HTTP 429)"), stored next to
+	// cooldownUntil so the watchdog feed can report remaining seconds and
+	// cause from the same cooldown (see maxCooldownSnapshot in watchdog.go).
+	// Empty when the cooldown carries no user-traffic trigger.
+	coolCause atomic.Value
+	// lastCause remembers the most recent user-traffic failure cause even
+	// after its cooldown expires, so the watchdog can keep reporting
+	// transport until either a real user-traffic success lands or
+	// staleCauseTTL passes. Only transport causes are surfaced from here
+	// (see staleCauseSnapshot): only transport proves nothing recovered.
+	lastCause atomic.Value
+	// causeExpires is the UnixNano moment the stale lastCause stops being
+	// reported (cooldownUntil at failure time + staleCauseTTL). It is
+	// snapshotted at write time so read-only status polls can never extend it.
+	causeExpires atomic.Int64
+	// lastSuccess is the UnixNano moment of the most recent user-traffic
+	// MarkSuccess. Background catalog refresh uses markRefreshSuccess and
+	// must not touch it: a models-endpoint 200 proves less than a real
+	// inference turn (and would fake "recovered" overnight with zero traffic).
+	lastSuccess atomic.Int64
+	// lastFailure is the UnixNano moment of the most recent user-traffic
+	// MarkFailure, i.e. of the failures that carry a cause label.
+	lastFailure atomic.Int64
 }
 
 type anonymousCursor struct {
@@ -99,13 +132,22 @@ func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
 	return anonymousCursor{pool: p, start: start}
 }
 
-// Next visits each healthy, non-cooling static proxy at most once per cursor.
+// Next visits each healthy, non-cooling proxy at most once per cursor.
+// It never bypasses cooldown and is used by background catalog refresh,
+// whose behavior must stay identical with or without request scoping.
+//
 // When the pool contains rotating proxy-pool transports (#pool), it continues
 // cycling through them after the first pass so retry.max_attempts can draw a
-// fresh upstream connection (and new exit IP) on every attempt. If all static
-// proxies are currently cooling or marked unhealthy, Next falls back to the
-// earliest-expiring node not yet tried by this cursor instead of returning nil
-// immediately.
+// fresh upstream connection (and new exit IP) on every attempt.
+//
+// If every static proxy is cooling or unhealthy, Next makes one last-resort
+// pass over the TRANSPORT-UNHEALTHY nodes only, choosing the earliest-expiring
+// one. That set is deliberately narrow (merge decision D2): taking cooling
+// nodes here too would hand the very node that just answered 429 straight back
+// to the caller, cancel the 1x/2x/4x/8x backoff and burn free quota. Cooling
+// is a quota/transport verdict, not a broken route — only an unhealthy route
+// deserves a forced try. See NextForRequest for the fingerprint-scoped twin,
+// and coolingFor, which mirrors both skip rules.
 func (c *anonymousCursor) Next() *anonymousNode {
 	if c.pool == nil || len(c.pool.nodes) == 0 {
 		return nil
@@ -134,19 +176,23 @@ func (c *anonymousCursor) Next() *anonymousNode {
 			}
 		}
 	}
+	// Last-resort pass (merge decision D2): untried nodes whose TRANSPORT is
+	// unhealthy, earliest cooldown first. Cooling nodes are excluded on
+	// purpose — returning one here would cancel the backoff this cursor
+	// exists to enforce.
 	choice := -1
 	var earliest int64
-	choiceHealthy := false
 	for step := range n {
 		idx := (c.start + step) % n
 		if c.used[idx] {
 			continue
 		}
-		node := c.pool.nodes[idx]
-		healthy := node.proxy.healthy.Load()
-		until := node.cooldownUntil.Load()
-		if choice < 0 || (healthy && !choiceHealthy) || (healthy == choiceHealthy && until < earliest) {
-			choice, earliest, choiceHealthy = idx, until, healthy
+		if c.pool.nodes[idx].proxy.healthy.Load() {
+			continue
+		}
+		until := c.pool.nodes[idx].cooldownUntil.Load()
+		if choice < 0 || until < earliest {
+			choice, earliest = idx, until
 		}
 	}
 	if choice >= 0 {
@@ -156,18 +202,126 @@ func (c *anonymousCursor) Next() *anonymousNode {
 	return nil
 }
 
+// NextForRequest behaves like Next, except a cooling node still serves a
+// request whose fingerprint differs from the one that triggered the cooldown.
+// Retries replay identical bodies, so different content means a new turn that
+// deserves one real upstream attempt (for example after the operator switched
+// the exit IP behind a shared proxy endpoint). Transport-unhealthy proxies are
+// always skipped, fingerprint or not.
+func (c *anonymousCursor) NextForRequest(fingerprint string) *anonymousNode {
+	if c.pool == nil || len(c.pool.nodes) == 0 {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	for c.offset < len(c.pool.nodes) {
+		node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
+		c.offset++
+		if !node.proxy.healthy.Load() {
+			continue
+		}
+		if node.cooldownUntil.Load() <= now {
+			return node
+		}
+		if stored, _ := node.coolHash.Load().(string); stored != "" && stored != fingerprint {
+			return node
+		}
+	}
+	// nil here, and only here, is the signal: no healthy node is available for
+	// this turn. Two distinct situations produce it — every healthy node is
+	// cooling for THIS fingerprint, or none is healthy — and doAnonymousUpstream
+	// separates them with coolingFor, which counts healthy nodes only. That
+	// gives 429 + Retry-After for the first and 503 proxy_error for the second
+	// (merge decisions D2 and D3).
+	//
+	// There is deliberately no last-resort pass here, unlike Next. Returning a
+	// transport-unhealthy node to ordinary traffic would contradict the rule
+	// above and the case pinned by cooling_scope_test.go; and returning a node
+	// cooling for this fingerprint would hand the caller straight back the exit
+	// that just answered 429, voiding the 1x/2x/4x/8x ladder.
+	return nil
+}
+
+// NextProbe returns the next proxy in rotation order regardless of transport
+// health and cooldown, and it is the ONLY path allowed to do so. It exists for
+// the watchdog's forced probe (watchdog.go), whose whole purpose is to measure
+// the exit node that is live right now:
+//
+//   - a transport-unhealthy mark usually means a dial timed out while Clash was
+//     re-routing a node switch, not that the new node cannot reach the upstream;
+//   - a residual cooldown belongs to some earlier fingerprint (or to the
+//     unscoped background catalog refresh) and says nothing about what this
+//     node would answer now.
+//
+// Ordinary traffic must keep using NextForRequest. Widening this to every
+// request would turn the anonymous backoff into a no-op, and the probe it
+// serves writes no pool state at all (see handleWatchdogProbe), so bypassing
+// those gates costs nothing a later turn cannot restore on its own.
+func (c *anonymousCursor) NextProbe() *anonymousNode {
+	if c.pool == nil || c.offset >= len(c.pool.nodes) {
+		return nil
+	}
+	node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
+	c.offset++
+	return node
+}
+
+// MarkSuccess records a successful anonymous inference turn: it clears the
+// cooldown and, as the only positive recovery proof the watchdog feed accepts,
+// drops the stale transport memory and stamps the success moment.
 func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 	if node == nil {
 		return
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	node.coolCause.Store("")
+	node.lastCause.Store("")
+	node.causeExpires.Store(0)
+	node.lastSuccess.Store(time.Now().UnixNano())
+}
+
+// markRefreshSuccess heals active cooling after a background catalog fetch
+// without manufacturing recovery evidence: the stale transport cause stays
+// for the watchdog (a models-endpoint 200 does not prove inference turns
+// succeed) and lastSuccess keeps its user-traffic-only meaning. The cooldown
+// clearing is exactly what MarkSuccess does, unchanged.
+func (p *anonymousPool) markRefreshSuccess(node *anonymousNode) {
+	if node == nil {
+		return
+	}
+	node.failures.Store(0)
+	node.cooldownUntil.Store(0)
+	node.coolCause.Store("")
+}
+
+// hasCauseMemory reports whether the node still holds cause memory a snapshot
+// can surface: the active coolCause, the stale lastCause, or the deadline that
+// keeps that stale cause voting. Read-only, like the snapshot helpers.
+// markRefreshSuccess clears the cooldown without the stale pair, so a node can
+// reach RestoreProxy with zero failures and zero cooldown yet still be voting.
+func (n *anonymousNode) hasCauseMemory() bool {
+	active, _ := n.coolCause.Load().(string)
+	stale, _ := n.lastCause.Load().(string)
+	return active != "" || stale != "" || n.causeExpires.Load() != 0
 }
 
 // RestoreProxy clears cooldowns for anonymous nodes bound to a recovered
 // proxy, mirroring nodePool.RestoreProxy for key nodes. Without this, an
 // outage-era cooldown survives the proxy's recovery and the anonymous lane
 // stays skipped even though the route is healthy again.
+//
+// The cause memory goes with the cooldown. A proxy only turns unhealthy through
+// isProxyFailure (timeout / connection refused) and only comes back once an
+// HTTP round trip through it succeeds, so a restore is precisely the
+// transport-layer proof staleCauseSnapshot is waiting for: the only causes that
+// can still vote there classify as transport, while a quota or ratelimit
+// residue never votes at all (a proxy health check says nothing about the
+// upstream allowance), so dropping the memory cannot hide a real allowance
+// problem. Keeping it would instead leave the feed reporting transport with
+// recommend_switch for up to staleCauseTTL after the route is demonstrably
+// back, and the watchdog would switch a healthy node once for nothing.
+// lastSuccess and lastFailure stay untouched: they are user-traffic evidence,
+// so the script still has to see a real turn before it calls the node recovered.
 func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
 	if p == nil || proxy == nil {
 		return 0
@@ -177,26 +331,85 @@ func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
 		if node.proxy != proxy {
 			continue
 		}
-		if node.cooldownUntil.Load() == 0 && node.failures.Load() == 0 {
+		if node.cooldownUntil.Load() == 0 && node.failures.Load() == 0 && !node.hasCauseMemory() {
 			continue
 		}
 		node.failures.Store(0)
 		node.cooldownUntil.Store(0)
+		node.coolCause.Store("")
+		node.lastCause.Store("")
+		node.causeExpires.Store(0)
 		cleared++
 	}
 	return cleared
 }
 
-// maxAnonymousRetryAfterMultiplier bounds an upstream Retry-After on the
-// anonymous lane to the same 8x ceiling as its exponential backoff. The lane
-// is rate limited per exit IP and, unlike key lanes, has no earliest-expiry
-// fallback: a quota response asking for hours would keep the exit skipped long
-// after a network change gave it a fresh allowance. Key lanes keep honoring
-// Retry-After in full, since their cursor already falls back to the node that
-// recovers first.
-const maxAnonymousRetryAfterMultiplier = 8
+// maxAnonymousCooldown caps how long any single anonymous-lane cooldown may
+// last, whichever rule produced it — the exponential ladder below or an
+// upstream Retry-After. It is an absolute duration rather than a multiple of
+// the base cooldown so that changing failure_cooldown_seconds cannot silently
+// drag the ceiling along with it.
+//
+// The lane is rate limited per exit IP and, unlike key lanes, has no
+// earliest-expiry fallback: a quota response asking for hours would keep the
+// exit skipped long after a network change gave it a fresh allowance. Key
+// lanes keep honoring Retry-After in full, since their cursor already falls
+// back to the node that recovers first.
+//
+// It also bounds the client-visible damage. The cooldown is held on the proxy
+// transport, not on the Clash node, so while it runs every request is refused
+// locally and no node switch can shorten it — a long ceiling turns one upstream
+// 429 into a long local outage.
+const maxAnonymousCooldown = 15 * time.Second
 
-func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
+// anonymousCooldownCeiling is the effective cap for one pool: never below the
+// configured base, so a ceiling smaller than the base cannot shorten even the
+// first failure's wait below what the operator asked for.
+func anonymousCooldownCeiling(base time.Duration) time.Duration {
+	return max(maxAnonymousCooldown, base)
+}
+
+// MarkFailure cools the node down after a failure that carries no user traffic
+// in context (the background catalog refresh). The cooldown itself is exactly
+// as it always was; the watchdog feed records nothing, because a
+// models-endpoint probe must neither fake a user-traffic failure age nor cast
+// a stale transport vote that would send the watchdog switching nodes.
+// fingerprint scopes the cooldown to one request (see anonymousNode.coolHash);
+// pass "" to block every request, which is what background work wants.
+func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error, fingerprint string) {
+	p.startCooldown(node, resp, err, "", fingerprint)
+}
+
+// markUserFailure is MarkFailure for a real inference turn: besides the same
+// cooldown it records the watchdog feed's user-traffic evidence. cause is the
+// label classifyAnonymousVerdict parses (see watchdogCause); it is never empty
+// on this path, and its presence is what makes the failure count as user
+// traffic (lastFailure plus the TTL-bounded stale transport memory).
+func (p *anonymousPool) markUserFailure(node *anonymousNode, resp *http.Response, err error, cause, fingerprint string) {
+	p.startCooldown(node, resp, err, cause, fingerprint)
+}
+
+// startCooldown applies the anonymous cooldown for one failed attempt and
+// stores the watchdog cause label that belongs to it. An empty cause means
+// "no user traffic": the cooldown still happens, only the watchdog memory is
+// skipped. An empty fingerprint means "not request-scoped": the cooldown then
+// blocks every request through this proxy, not just the one that failed.
+//
+// Rotating proxy-pool transports (#pool) are exempt, and the exemption lives
+// HERE rather than in the two callers above so the cooldown, the cause memory
+// and the skip rules in NextForRequest/coolingFor/coolCauseFor cannot drift
+// apart. Such an entry rotates its own exit IP per connection, so cooling it
+// would punish every other exit behind the same endpoint, and voting on it
+// would send the watchdog switching nodes for a transport that is answering.
+//
+// The early return also skips lastFailure, and that is deliberate rather than
+// an omission: a pool entry that failed must not publish a transport-failure
+// age the watchdog would then weigh for a node switch, because it is exempt
+// from the very cooldown that would justify one. Recovery evidence is
+// unaffected — MarkSuccess stamps lastSuccess independently of this function,
+// so the feed still sees a pool entry being used and does not read its
+// silence as death.
+func (p *anonymousPool) startCooldown(node *anonymousNode, resp *http.Response, err error, cause, fingerprint string) {
 	if node == nil || (node.proxy != nil && node.proxy.pool) {
 		return
 	}
@@ -207,19 +420,220 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 	delay := p.cooldown * time.Duration(1<<min(failures-1, 3))
 	if resp != nil {
 		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > delay {
-			delay = min(retryAfter, p.cooldown*maxAnonymousRetryAfterMultiplier)
+			delay = retryAfter
 		}
 	}
-	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
+	// One ceiling for both rules above: a short Retry-After still never
+	// shortens the ladder (the > comparison above), and a long one can never
+	// outlive the anonymous lane's local-outage budget.
+	delay = min(delay, anonymousCooldownCeiling(p.cooldown))
+	// Scope the cooldown to the request that triggered it. Retries of this
+	// turn replay the same fingerprint and are blocked; a different turn is
+	// still served. Storing "" (background refresh) keeps the old
+	// block-everything behavior, which is what that caller wants.
+	node.coolHash.Store(fingerprint)
+	node.coolCause.Store(cause)
+	until := time.Now().Add(delay).UnixNano()
+	node.cooldownUntil.Store(until)
+	if cause == "" {
+		return
+	}
+	// Stale watchdog memory: snapshotted once here so later status polls can
+	// report it without ever extending it.
+	node.lastFailure.Store(time.Now().UnixNano())
+	node.lastCause.Store(cause)
+	node.causeExpires.Store(until + int64(staleCauseTTL))
+}
+
+// staleCauseTTL bounds how long an expired transport cause keeps voting in
+// the watchdog feed after its cooldown lapses with no new success. It must
+// comfortably exceed the worst active wall — anonymousCooldownCeiling(base),
+// i.e. 15s by default, or the base itself when the operator raises it above
+// that — plus the script's TransportConfirmRounds window
+// (3x15s poll = 45s), or the "two failures then expiry looks like recovery"
+// resonance simply moves from ~15s to TTL. Five minutes keeps a real outage
+// voting long enough to switch while capping the collateral of a transient
+// blip (a recovered node is served again immediately once its cooldown lapses).
+const staleCauseTTL = 5 * time.Minute
+
+// maxCooldownSnapshot returns the longest still-active anonymous cooldown
+// among transport-healthy proxies and its stored trigger in one pass. One
+// pass keeps seconds and cause on the same node in the common case (two
+// separate scans could straddle an expiry boundary and mix seconds of one
+// node with the cause of another).
+// Transport-unhealthy proxies are skipped, mirroring Next: their cooldowns
+// cannot block any request (unhealthy nodes are never served), so surfacing
+// them would cry wolf to the watchdog.
+// This is a worst-case snapshot across all nodes, not a verdict for any
+// particular request: one node's residual cooldown can outlive its own turns,
+// so the watchdog must treat a quota/transport verdict as one vote (ideally
+// confirmed twice), never as proof that the next turn needs a switch.
+// It is still best-effort under concurrency: MarkSuccess clears
+// cooldownUntil before coolCause, so a success landing between the two loads
+// can surface a stale remain with an empty cause; callers treat that as plain
+// cooling (wait), never as a switch signal.
+func (p *anonymousPool) maxCooldownSnapshot() (time.Duration, string) {
+	if p == nil {
+		return 0, ""
+	}
+	now := time.Now().UnixNano()
+	var longest time.Duration
+	cause := ""
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() {
+			continue
+		}
+		until := node.cooldownUntil.Load()
+		if remain := time.Duration(until - now); remain > longest {
+			longest = remain
+			cause, _ = node.coolCause.Load().(string)
+		}
+	}
+	return longest, cause
+}
+
+// coolingFor reports whether any proxy blocks this fingerprint only because
+// of time-based anonymous cooldown (as opposed to transport health), plus
+// the longest remaining delay. It mirrors the skip logic in NextForRequest, so
+// the answer is exactly "can NextForRequest find nothing".
+func (p *anonymousPool) coolingFor(fingerprint string) (bool, time.Duration) {
+	if p == nil {
+		return false, 0
+	}
+	now := time.Now().UnixNano()
+	blocked := false
+	var longest time.Duration
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() || node.cooldownUntil.Load() <= now {
+			continue
+		}
+		if stored, _ := node.coolHash.Load().(string); stored != "" && stored != fingerprint {
+			continue
+		}
+		blocked = true
+		if remain := time.Duration(node.cooldownUntil.Load() - now); remain > longest {
+			longest = remain
+		}
+	}
+	return blocked, longest
+}
+
+// coolCauseFor returns the stored trigger of the longest fingerprint-matching
+// cooldown (e.g. "FreeUsageLimitError (upstream HTTP 429)"), or "" when
+// nothing cooling matches. It mirrors the skip logic in coolingFor so the
+// reported cause always belongs to the block the caller just hit.
+func (p *anonymousPool) coolCauseFor(fingerprint string) string {
+	if p == nil {
+		return ""
+	}
+	now := time.Now().UnixNano()
+	var longest time.Duration
+	cause := ""
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() || node.cooldownUntil.Load() <= now {
+			continue
+		}
+		if stored, _ := node.coolHash.Load().(string); stored != "" && stored != fingerprint {
+			continue
+		}
+		if remain := time.Duration(node.cooldownUntil.Load() - now); remain > longest {
+			longest = remain
+			cause, _ = node.coolCause.Load().(string)
+		}
+	}
+	return cause
+}
+
+// staleCauseSnapshot returns the most recently expired transport cause
+// still inside its TTL, or "" when none qualifies. Transport-only by design:
+// an expired quota cause must not hold recommend_switch=true for minutes,
+// an expired ratelimit cause must not park the script in wait, and an
+// unknown cause classifies as ok without cooling anyway. Unhealthy proxies
+// stay skipped, mirroring maxCooldownSnapshot.
+func (p *anonymousPool) staleCauseSnapshot() string {
+	if p == nil {
+		return ""
+	}
+	now := time.Now().UnixNano()
+	var bestExpiry int64
+	stale := ""
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() {
+			continue
+		}
+		expiry := node.causeExpires.Load()
+		if expiry <= now {
+			continue
+		}
+		cause, _ := node.lastCause.Load().(string)
+		if cause == "" || classifyAnonymousVerdict(cause, false) != "transport" {
+			continue
+		}
+		if expiry > bestExpiry {
+			bestExpiry = expiry
+			stale = cause
+		}
+	}
+	return stale
+}
+
+// successFailureAges reports the newest user-traffic success and failure
+// moments across transport-healthy proxies as ages. ok=false per side when
+// that side was never recorded (process memory, restart clears, same as the
+// telemetry minute metrics). Read-only: never extends any deadline.
+func (p *anonymousPool) successFailureAges() (successAge, failureAge time.Duration, successOK, failureOK bool) {
+	if p == nil {
+		return 0, 0, false, false
+	}
+	now := time.Now().UnixNano()
+	var newestSuccess, newestFailure int64
+	for _, node := range p.nodes {
+		if !node.proxy.healthy.Load() {
+			continue
+		}
+		if ts := node.lastSuccess.Load(); ts > newestSuccess {
+			newestSuccess = ts
+		}
+		if ts := node.lastFailure.Load(); ts > newestFailure {
+			newestFailure = ts
+		}
+	}
+	if newestSuccess > 0 {
+		successAge, successOK = time.Duration(now-newestSuccess), true
+	}
+	if newestFailure > 0 {
+		failureAge, failureOK = time.Duration(now-newestFailure), true
+	}
+	return successAge, failureAge, successOK, failureOK
 }
 
 func (p *transportPool) hasHealthy() bool {
+	if p == nil {
+		return false
+	}
 	for _, proxy := range p.items {
 		if proxy.healthy.Load() {
 			return true
 		}
 	}
 	return false
+}
+
+// closeIdleConnections releases pooled keep-alive connections. Called on
+// superseded runtimes after a hot-reload swap so old Transports do not hold
+// idle conns until IdleConnTimeoutSeconds.
+func (p *transportPool) closeIdleConnections() {
+	if p == nil {
+		return
+	}
+	for _, proxy := range p.items {
+		if proxy == nil || proxy.client == nil {
+			continue
+		}
+		if transport, ok := proxy.client.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+	}
 }
 
 func (p *transportPool) healthCounts() (total, healthy int) {
@@ -293,6 +707,9 @@ type proxyHealthResult struct {
 // from the test URL proves that the route is reachable; only a timeout or
 // connection refusal keeps the proxy unhealthy.
 func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout time.Duration) []proxyHealthResult {
+	if p == nil {
+		return nil
+	}
 	results := make(chan proxyHealthResult, len(p.items))
 	checks := 0
 	for _, proxy := range p.items {
@@ -324,7 +741,9 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 	defer cancel()
 	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target, nil)
 	if err == nil {
-		req.Header.Set("User-Agent", httpx.UserAgent())
+		// Proxy liveness probe, not an inference turn: this must not claim to
+		// be the opencode CLI (see httpx.GatewayUserAgent).
+		req.Header.Set("User-Agent", httpx.GatewayUserAgent())
 		resp, requestErr := proxy.client.Do(req)
 		err = requestErr
 		if resp != nil {

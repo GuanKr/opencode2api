@@ -122,7 +122,8 @@ func FetchCapabilities(ctx context.Context, client *http.Client, endpoint string
 		return Capabilities{}, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", httpx.UserAgent())
+	// Catalog fetch, not inference: identify as the gateway, never as the CLI.
+	req.Header.Set("User-Agent", httpx.GatewayUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return Capabilities{}, err
@@ -194,7 +195,8 @@ func FetchProtocolDocs(ctx context.Context, client *http.Client, endpoint string
 		return nil, err
 	}
 	req.Header.Set("Accept", "text/plain, text/markdown, */*")
-	req.Header.Set("User-Agent", httpx.UserAgent())
+	// Docs fetch, not inference: identify as the gateway, never as the CLI.
+	req.Header.Set("User-Agent", httpx.GatewayUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -276,10 +278,14 @@ func FetchModels(ctx context.Context, client *http.Client, baseURL, key string) 
 		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
+	// Model list fetch, not inference: identify as the gateway, never as the
+	// CLI — with one exception. The legacy /zen/v1 base is listed first when
+	// the anonymous lane prefers legacy (see anonymousUpstreams), and that
+	// listing expects the v1.3.7 identity, so it keeps LegacyUserAgent.
 	if strings.EqualFold(trimmed, strings.TrimRight(LegacyZenBase, "/")) || strings.HasSuffix(strings.ToLower(trimmed), "/zen") {
 		req.Header.Set("User-Agent", httpx.LegacyUserAgent())
 	} else {
-		req.Header.Set("User-Agent", httpx.UserAgent())
+		req.Header.Set("User-Agent", httpx.GatewayUserAgent())
 	}
 	req.Header.Set("x-opencode-client", "cli")
 	resp, err := client.Do(req)

@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -10,6 +11,12 @@ import (
 
 const FreeModelCheckInterval = time.Hour
 const FailedModelCheckInterval = 24 * time.Hour
+
+// ErrModelDisabled marks a routing failure caused by a confirmed availability
+// disable. It is a server-side condition, not a client error: callers must
+// answer 503 (with the gateway error contract) rather than 400, or clients
+// read a temporarily disabled model as a malformed request and never retry.
+var ErrModelDisabled = errors.New("model disabled by availability probe")
 
 type EffortProbe struct {
 	Effort   string `json:"effort,omitempty"`

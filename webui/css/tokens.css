@@ -23,11 +23,14 @@
   --bad: #cf222e;
   --bad-bg: #ffebe9;
 
+  /* Local fork contract (AGENTS.md): JetBrains Mono leads both stacks and the
+     CJK glyphs fall through to the system UI faces. No webfont is downloaded. */
   --font-sans:
-    system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans",
-    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    "JetBrains Mono", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --font-mono:
-    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", "Microsoft YaHei", monospace;
 
   --fs-xs: 12px;
   --fs-sm: 13px;

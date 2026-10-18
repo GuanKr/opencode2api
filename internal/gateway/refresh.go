@@ -14,7 +14,11 @@ import (
 const (
 	proxyHealthCheckURL      = "https://cloudflare.com/cdn-cgi/trace"
 	proxyHealthCheckInterval = 15 * time.Minute
-	proxyHealthCheckTimeout  = 10 * time.Second
+	// Degraded-mode retry: when no proxy is healthy (e.g. a single-proxy Clash
+	// node switch), waiting a full 15m for the next scheduled check feels
+	// stuck. Poll unhealthy proxies at this faster cadence until one recovers.
+	proxyHealthCheckDegradedInterval = 15 * time.Second
+	proxyHealthCheckTimeout          = 10 * time.Second
 )
 
 // syncProxyResult updates proxy health from real traffic. Only timeouts and
@@ -101,22 +105,74 @@ func (g *Gateway) restoreProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
 }
 
 func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
-	check := func() {
+	check := func(source string) {
 		results := g.transports.CheckHealth(ctx, proxyHealthCheckURL, proxyHealthCheckTimeout)
 		for _, result := range results {
-			g.applyProxyHealthResult(result, "scheduled health check", 0)
+			g.applyProxyHealthResult(result, source, 0)
 		}
 	}
 	go func() {
-		ticker := time.NewTicker(proxyHealthCheckInterval)
-		defer ticker.Stop()
+		normal := time.NewTicker(proxyHealthCheckInterval)
+		defer normal.Stop()
+		degraded := time.NewTicker(proxyHealthCheckDegradedInterval)
+		defer degraded.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				check()
+			case <-normal.C:
+				check("scheduled health check")
+			case <-degraded.C:
+				// Fast lane: only when every proxy is down. CheckHealth is a
+				// no-op while anything is healthy, so this costs nothing in
+				// the common case and caps single-proxy outage recovery at
+				// ~15s instead of ~15m (15s interval leaves a 5s gap after
+				// the 10s probe timeout, so ticks never overlap).
+				if g.transports != nil && len(g.transports.items) > 0 && !g.transports.hasHealthy() {
+					check("degraded health check")
+				}
 			}
+		}
+	}()
+}
+
+// kickProxyRecheck triggers one immediate async re-probe after a request hits
+// the no-healthy-proxy path. Kicks are throttled to one per few seconds: the
+// per-proxy checking CAS inside CheckHealth only dedupes overlapping probes,
+// not goroutine creation, so an unthrottled call-per-request would spawn a
+// short-lived goroutine per request during an all-down spike. The degraded
+// ticker is the correctness backstop; dropped kicks only delay recovery by
+// seconds. Detached from the request context so the probe survives client
+// disconnects — but a request that is already cancelled kicks nothing.
+//
+// It is a no-op whenever any proxy is healthy, which is exactly what keeps it
+// away from cooldown: a node inside its backoff window is still a healthy
+// proxy, so a quota/ratelimit cooldown never triggers a probe that could not
+// clear it anyway.
+func (g *Gateway) kickProxyRecheck(ctx context.Context) {
+	if g == nil || g.transports == nil || len(g.transports.items) == 0 || g.transports.hasHealthy() {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	const kickThrottle = 5 * time.Second
+	now := time.Now().UnixNano()
+	last := g.lastProxyKick.Load()
+	if now-last < int64(kickThrottle) {
+		return
+	}
+	if !g.lastProxyKick.CompareAndSwap(last, now) {
+		return
+	}
+	checkCtx := context.WithoutCancel(ctx)
+	go func() {
+		results := g.transports.CheckHealth(checkCtx, proxyHealthCheckURL, proxyHealthCheckTimeout)
+		for _, result := range results {
+			g.applyProxyHealthResult(result, "on-demand health check", 0)
 		}
 	}()
 }
@@ -248,10 +304,12 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 		g.syncProxyResult(refreshCtx, node.proxy, status, err)
 		cancel()
 		if err == nil {
-			g.anonymous.MarkSuccess(node)
+			g.anonymous.markRefreshSuccess(node)
 			return models
 		}
-		g.anonymous.MarkFailure(node, nil, err)
+		// Background catalog refresh: no client payload to fingerprint, so the
+		// cooldown stays unscoped (blocks every request) exactly as before.
+		g.anonymous.MarkFailure(node, nil, err, "")
 		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", config.RedactURL(base), "attempt", attempt, "proxy", config.RedactURL(node.proxy.name), "error", err)
 	}
 	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", config.RedactURL(base))

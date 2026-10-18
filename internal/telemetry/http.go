@@ -31,6 +31,16 @@ type RequestMeta struct {
 	Stop      string
 	Tail      string
 	Stream    bool
+	// ReasoningEffort is the client-requested reasoning intensity as a short
+	// display label (see protocol.ReasoningEffortLabel). Telemetry-only: it
+	// never affects routing or the wire body. Empty when the request stated
+	// no reasoning setting, or explicitly asked for none.
+	ReasoningEffort string
+	// FirstByteMS is the client-observed time to the first response body byte.
+	// Set by Middleware for streams only; buffered non-stream responses
+	// complete on their first write, so it stays 0 there and the usage page
+	// shows the total instead of a bogus ~0s TTFT.
+	FirstByteMS int64
 	// ServerKeyID is the fingerprint of the local server key the caller
 	// authenticated with, so usage can be split per caller. KeyID is the
 	// upstream account that served the request.
@@ -44,7 +54,28 @@ type RequestMeta struct {
 	// "reAd" or "read_file") when the legacy /zen/v1 shaper renamed it to
 	// "read" on the outbound wire. When non-empty, "read" tool calls in the
 	// upstream response are rewritten back to ToolAlias before returning.
-	ToolAlias      string
+	// Telemetry-only: it changes no routing and no wire body on the
+	// /inference lane, where the gate shaper never renames anything.
+	ToolAlias string
+	// Prestripped is set by the gateway when the first upstream attempt
+	// goes out pre-stripped (poisoned-history fast path). It lets the
+	// usage page tell a pre-stripped att=1 apart from a clean att=1.
+	Prestripped bool
+	// PrestripMode distinguishes the first-attempt shape: "selective"
+	// strips only the snapshotted blacklist (pre-mark poisoned reasoning
+	// ids) while keeping newer healthy reasoning, "full" removes every
+	// reasoning reference. Empty when the request was not pre-stripped.
+	// Old records without a mode are full strips.
+	PrestripMode string
+	// PrestripIDs is the number of blacklisted reasoning ids stored for
+	// this session: the selective first-attempt blacklist size, or the
+	// size recorded by an in-turn self-heal retry. Note the two differ
+	// when a selective pre-strip was rejected and its full-strip fallback
+	// then succeeded: that write learns the ids the refused body carried
+	// before re-publishing the size, so the reported number is the
+	// post-merge one, not the one the first attempt was stripped with.
+	// Zero for full strips and for requests without reasoning surgery.
+	PrestripIDs    int
 	Usage          protocol.Usage
 	UsageReported  bool
 	AttemptOutcome string
@@ -74,8 +105,9 @@ func MetaFromRequest(r *http.Request) *RequestMeta {
 
 type statusWriter struct {
 	http.ResponseWriter
-	status int
-	bytes  int64
+	status     int
+	bytes      int64
+	firstWrite time.Time
 }
 
 func (w *statusWriter) WriteHeader(status int) {
@@ -89,6 +121,9 @@ func (w *statusWriter) WriteHeader(status int) {
 func (w *statusWriter) Write(data []byte) (int, error) {
 	if w.status == 0 {
 		w.WriteHeader(http.StatusOK)
+	}
+	if w.firstWrite.IsZero() {
+		w.firstWrite = time.Now()
 	}
 	n, err := w.ResponseWriter.Write(data)
 	w.bytes += int64(n)
@@ -122,6 +157,13 @@ func Middleware(monitor *Monitor, logger *slog.Logger, next http.Handler) http.H
 				status = http.StatusOK
 			}
 			duration := time.Since(started)
+			if !writer.firstWrite.IsZero() && meta.Stream {
+				// Client-observed time to first body byte: genuine TTFT for
+				// streams only. Buffered non-stream responses complete on
+				// first write, so FirstByteMS stays 0 there and the UI shows
+				// the total directly instead of a bogus ~0s.
+				meta.FirstByteMS = max(writer.firstWrite.Sub(started).Milliseconds(), 0)
+			}
 			monitor.Record(r.URL.Path, status, duration, meta)
 			outcome := meta.Outcome
 			if outcome == "" {
