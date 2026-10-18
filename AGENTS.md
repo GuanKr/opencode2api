@@ -115,17 +115,42 @@
 - **判定「模型不存在」只看结构化字段**：`isModelUnavailable` 先把响应解析成 JSON，只在 `error.type`/`error.code`/`error.message` 与顶层 `type`/`code`/`message` 里找 4 个机器码（`model_not_found`/`model_not_available`/`model_retired`/`model_deprecated`）。**别加回散文短语**（`unknown model` 等）：上游 4xx 会回显请求内容，用户提示词里出现这些字就会把一个正常模型停用 `FailedModelCheckInterval` = 24h。代价是上游只用散文回答已下架模型时不再拉黑它（模型留在目录里每轮探测失败）——这是有意的取舍。
 - **SSE 折叠前先看 Content-Type，也看正文**：`isUpstreamSSE` 用 `mime.ParseMediaType` 严格解析（带参数的 JSON 里提到该 token 也不算流），但**不能只信它**——上游把 SSE 的 Content-Type 留成 `application/json` 时，只看类型就会跳过折叠，把裸 SSE 字节当 JSON 写给客户端（比 502 更难排查）。所以判据是 `isUpstreamSSE(ct) || looksLikeSSE(body)`，后者嗅探 `data:`/`event:` 开头；嗅探只会**多**折叠一次，折叠不成仍在原地大声失败。**流式入口目前没有这道闸**（`ForwardStream`/`TranscodeStream` 直接读 body），是既有缺口，动流式分支时补上。
 - 本地 opencode 源码在 `F:\go\src\opencode`（clone 可能落后于线上，如 2026-10-15 本机 CLI 已是 v2.0.29 而 clone 停在 10-10）：对齐原生行为以该目录为准，但版本号与端点这类「线上才变」的事实，以上游 `main` 的实现与抓包为准。
-- 上游更新流程：`fetch` 后先 `log/stat` 看量；默认先在一次性分支试 rebase，冲突过多就退到移植分支（从 `main` 新开分支逐件移植），验证通过再替换 `local`，**替换前先留 `local-pre-upstream-<日期>` 备份分支**。
+- **上游更新流程：默认走一次 merge，不要先试 rebase**。`fetch` 后先 `log`/`stat` 看量，再用 `merge-tree` 量冲突面，然后在一次性分支上做**一次** merge。
+
+  **为什么不先试 rebase**（2026-10-18 实证，非偏好）：本仓足迹是 34 个提交 / 64 文件 / +16k 行**生产代码**，冲突面钉死在那 10 个文件上——rebase 不会减少冲突，只把它按步数重复一遍。而第 1 个提交就撞 `webui/styles.css` 的 **modify/delete**（上游 `a0da31e feat(webui): rebuild console with tabbed pages` 已删该文件、WebUI 整体重写为多文件 ESM）。「本地改 / 上游删」是 rebase 机械合并不了、必须人工裁决留哪边的那一类，逐 hunk 也无法自动定夺。**该前提至今成立，不要再默认试 rebase。**
+
+  **什么时候才退到「移植分支」**：上游同期自己实现了同一件事（2026-10-15 轮的 staleMemo 治理与看门狗通道即如此）。这时逐 hunk 合并只会产出一堆「两边都有」的破碎实现，应从 `main` 新开分支**逐件重新接**，每件一个提交、跑变异证据，验证通过再替换 `local`。判据是「重叠的是同一件事」而非「冲突文件多」。
+
+  **动 `local` 前必须先留 `local-pre-upstream-<日期>` 回退点**。merge 路线虽不重写历史，但手工解冲突时一次 `git checkout --theirs` 就能丢掉半天工作。已留的 `local-pre-upstream-20261015` / `-20261018` 在确认不再需要回看后才能删。
 
 ```bash
+# 一次性配置（已在本仓库开启，但不在版本库内，重克隆要重做）
+git config rerere.enabled true      # 记住冲突解法，下次自动重放
+git config rerere.autoupdate true   # 连 git add 都省了
+
 git fetch origin
 git log --oneline main..origin/main
 git diff --stat main...origin/main
+
+# 先量冲突面——只列真正冲突的文件，不必靠猜
+git merge-tree --write-tree --name-only local origin/main
+
 git checkout main && git pull --ff-only
-# 首选：试 rebase（先在一次性分支上试，成了再动 local）
-git checkout -b try-rebase local && git rebase main
-# 冲突过多：git rebase --abort，改走移植分支
-git checkout -b local-rebase main
-# ...逐件移植并提交...
-go vet ./... && go build ./cmd/opencode2api && go test ./...
+
+# 回退点先行
+git branch local-pre-upstream-$(date +%Y%m%d)
+
+# 默认路线：一次性分支上做一次 merge
+git checkout -b local-merge local
+git merge origin/main
+# ...逐个手工裁决冲突；rerere 会自动重放与上轮相同的解法...
+go vet ./... && go build ./cmd/opencode2api && go test -count=1 ./...
+
+# 验证通过后让 local 指过去（该轮裁决与遗留未测项写进本文件，见上方两轮记录）
+git checkout local && git merge --ff-only local-merge
+git branch -d local-merge
+
+# 退出：merge 途中 git merge --abort；已提交则回到 local-pre-upstream-<日期>
 ```
+
+  **冲突解法必须逐个记录进本文件**（哪边赢、为什么、代价），下一轮 `merge-tree` 只会告诉你「又冲突了」，不会告诉你上轮为什么那么裁。2026-10-18 轮的五个裁决（D1–D5）就是这么留下的。
