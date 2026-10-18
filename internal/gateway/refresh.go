@@ -293,9 +293,15 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 		var models []string
 		var status int
 		var err error
-		// Prefer the legacy /zen/v1 models listing before falling back to the
-		// configured anonymous upstream.
-		for _, upstream := range g.anonymousUpstreams() {
+		// Walk the anonymous lane order (merge decision D1) and stop at the
+		// first base that answers. With one lane this is the plain fetch; with
+		// two, the recorded upstream has to be the one that actually failed —
+		// naming Upstream.Anonymous here would blame /inference for a /zen/v1
+		// problem, which is the opposite of useful when debugging a 403.
+		upstreams := g.anonymousUpstreams()
+		attempted := ""
+		for _, upstream := range upstreams {
+			attempted = upstream
 			models, status, err = modelcatalog.FetchModels(refreshCtx, node.proxy.client, upstream, anonymousZenKey)
 			if err == nil {
 				break
@@ -310,8 +316,9 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 		// Background catalog refresh: no client payload to fingerprint, so the
 		// cooldown stays unscoped (blocks every request) exactly as before.
 		g.anonymous.MarkFailure(node, nil, err, "")
-		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", config.RedactURL(base), "attempt", attempt, "proxy", config.RedactURL(node.proxy.name), "error", err)
+		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", config.RedactURL(attempted), "attempt", attempt, "proxy", config.RedactURL(node.proxy.name), "error", err)
 	}
+	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", config.RedactURL(base))
 	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", config.RedactURL(base))
 	return nil
 }

@@ -22,9 +22,10 @@ import (
 // that distinction is load-bearing:
 //
 //   - A 502 reads as a broken upstream, so clients retry it immediately. While
-//     the single anonymous node is cooling (up to maxAnonymousRetryAfterMultiplier
-//     × cooldown), that turns one upstream 429 into a burst of 502s that never
-//     reach upstream — 27 of them landed in one hour on 2026-10-16.
+//     the single anonymous node is cooling (up to anonymousCooldownCeiling of
+//     the configured base, and never longer than maxAnonymousCooldown), that
+//     turns one upstream 429 into a burst of 502s that never reach upstream —
+//     27 of them landed in one hour on 2026-10-16.
 //   - watchdog-clash.ps1 classifies a 502 as transport, i.e. "this node is
 //     broken, switch". Since the cooldown is held on the proxy transport rather
 //     than on the Clash node, switching nodes cannot shorten it, so the script

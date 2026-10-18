@@ -68,7 +68,8 @@ type UpstreamConfig struct {
 	// in AGENTS.md only ever saw /inference pass, so defaulting to legacy
 	// would put a doomed attempt in front of every anonymous request. Flip
 	// the default only after measuring the legacy lane. Empty or absent means
-	// ["inference","legacy"].
+	// ["inference"] alone — see DefaultAnonymousLaneOrder for why the legacy
+	// lane is not in the default list even as a fallback.
 	AnonymousLaneOrder []string `json:"anonymous_lane_order,omitempty"`
 }
 

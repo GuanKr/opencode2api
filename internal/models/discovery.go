@@ -19,11 +19,19 @@ const (
 	CapabilitiesURL = "https://models.opencode.ai/api.json"
 	ZenDocsURL      = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/zen.mdx"
 	GoDocsURL       = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx"
-	// LegacyZenBase is the legacy /zen console origin (serving /zen/v1/*) that
-	// still serves anonymous inference and the models listing alongside the newer
-	// /inference backend.
-	LegacyZenBase = "https://opencode.ai/zen"
 )
+
+// LegacyZenBase is the legacy /zen console origin (serving /zen/v1/*) that
+// still serves anonymous inference and the models listing alongside the newer
+// /inference backend.
+//
+// A var, not a const, so a test can point the legacy lane at a local stub. The
+// lane order names this lane as the token "legacy" rather than as a URL, so
+// every caller of anonymousUpstreams() would otherwise dial the real origin and
+// the two-lane dispatch — per-lane shaping, the per-attempt shaped dump, the
+// toolAlias reset between lanes — could not be exercised without egress. No
+// production path reassigns it.
+var LegacyZenBase = "https://opencode.ai/zen"
 
 var protocolDocEndpointPattern = regexp.MustCompile("\\|[^|]+\\|\\s*`?([^|`\\s]+)`?\\s*\\|\\s*`[^`]+/v1/(chat/completions|responses|messages|systemone)`")
 

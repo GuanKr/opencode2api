@@ -211,11 +211,29 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	if update.Reasoning != nil {
 		reasoning = *update.Reasoning
 	}
+	upstream := update.Upstream
+	// The console form has no input for every field of UpstreamConfig, so a PUT
+	// replaces the whole struct and silently resets whatever it did not send.
+	// An empty value is the wire's only way to say "not specified", and
+	// NormalizeConfig would then fill the built-in default back in and persist
+	// that — which is how an operator's upstream.anonymous_lane_order, the only
+	// lever for the anonymous lane order, disappeared on the next unrelated save
+	// made from the console, with applied:true and no log line.
+	//
+	// Backfilling keeps a partial form harmless. Nothing in the console offers a
+	// way to mean "clear this", and NormalizeConfig re-defaults it anyway, so
+	// there is no intent for the backfill to swallow.
+	if strings.TrimSpace(upstream.Anonymous) == "" {
+		upstream.Anonymous = current.Upstream.Anonymous
+	}
+	if len(upstream.AnonymousLaneOrder) == 0 {
+		upstream.AnonymousLaneOrder = current.Upstream.AnonymousLaneOrder
+	}
 	candidate := config.Config{
 		ServerKeyMetadata: current.ServerKeyMetadata,
 		Rotation:          current.Rotation,
 		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Proxies: proxies, ProxyFile: update.ProxyFile,
-		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
+		Upstream: upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		Reasoning: reasoning,
 		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}

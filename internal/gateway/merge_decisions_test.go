@@ -1,14 +1,20 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"opencode2api/internal/config"
+	"opencode2api/internal/identity"
 	"opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/rotation"
@@ -250,4 +256,188 @@ func mergeDecisionStub(t *testing.T) *Gateway {
 	})
 	freezeProxyHealth(g)
 	return g
+}
+
+// ---------------------------------------------------------------------------
+// D1 + D4 + D5 together — the two-lane dispatch, end to end
+// ---------------------------------------------------------------------------
+
+// twoLaneGateway builds a gateway whose anonymous lane has BOTH candidates
+// reachable locally: "legacy" points at a stub that rejects with the free-tier
+// gate 403, "inference" at a stub that answers 200. It returns the two hit
+// counters and the log buffer, so a test can see which lanes were tried, in
+// what order, and what was shaped for each.
+//
+// models.LegacyZenBase is redirected at the legacy stub because the lane order
+// names that lane by token, not by URL. Restored on cleanup.
+func twoLaneGateway(t *testing.T, order []string) (*Gateway, *bytes.Buffer, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+
+	var legacyHits, inferenceHits atomic.Int32
+	legacySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		legacyHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"code":null,"message":"OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.","param":null,"type":"upstream_error"}`))
+	}))
+	t.Cleanup(legacySrv.Close)
+	inferenceSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		inferenceHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","choices":[]}`))
+	}))
+	t.Cleanup(inferenceSrv.Close)
+
+	original := models.LegacyZenBase
+	models.LegacyZenBase = legacySrv.URL
+	t.Cleanup(func() { models.LegacyZenBase = original })
+
+	buf := &bytes.Buffer{}
+	g := newStubGateway(t, inferenceSrv.URL)
+	manager, err := rotation.New("", config.RotationConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.rotation = manager
+	g.cfg.Logging = config.LoggingConfig{Level: "debug", DumpRequestBodies: true}
+	g.logger = slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	g.cfg.Upstream.AnonymousLaneOrder = order
+	registerUsageModels(t, g, map[config.Tier]map[string]wire.Protocol{
+		config.TierZen: {"probe-free": wire.Chat},
+	})
+	freezeProxyHealth(g)
+	return g, buf, &legacyHits, &inferenceHits
+}
+
+// TestTwoLaneRequestTriesBothAndSucceedsOnInference drives one anonymous
+// request through both lanes.
+//
+// It is the only case that pins the whole two-lane path at once: the per-lane
+// shaping dispatch, the per-attempt shaped dump (D5), and the fact that a lane
+// order is an ordering rather than a set. With one lane configured, or with the
+// dump moved back into the preparation loop, this goes red.
+func TestTwoLaneRequestTriesBothAndSucceedsOnInference(t *testing.T) {
+	g, buf, legacyHits, inferenceHits := twoLaneGateway(t, []string{config.LaneLegacy, config.LaneInference})
+
+	client := []byte(`{"model":"probe-free","stream":false,"messages":[{"role":"user","content":"hi"}],` +
+		`"tools":[{"type":"function","function":{"name":"read_file","description":"client read",` +
+		`"parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]}`)
+	resp, _, _, err := g.doUpstreamTiers(context.Background(), chatDumpRoute(),
+		map[config.Tier][]byte{config.TierZen: client}, identity.RequestIDs{Request: "req-2lane"}, 0, "")
+	if err != nil {
+		t.Fatalf("the fallback lane should have carried the request: %v", err)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	if legacyHits.Load() != 1 {
+		t.Fatalf("legacy lane hits = %d, want 1 (it is first in the order and rejects)", legacyHits.Load())
+	}
+	if inferenceHits.Load() != 1 {
+		t.Fatalf("inference lane hits = %d, want 1 (it is second and answers)", inferenceHits.Load())
+	}
+
+	// D5: one shaped record per attempt, each naming the base it went to. The
+	// legacy bytes must not be labelled as if they were the inference ones —
+	// that is the whole reason the record carries a base.
+	var bases []string
+	shaped := make([]string, 0, 2)
+	for _, record := range dumpRecords(t, buf) {
+		if record["phase"] != "shaped" {
+			continue
+		}
+		base, _ := record["upstream"].(string)
+		bases = append(bases, base)
+		shaped = append(shaped, record["body"].(string))
+	}
+	if len(shaped) != 2 {
+		t.Fatalf("want a shaped dump per attempt (2), got %d: %v", len(shaped), dumpPhases(dumpRecords(t, buf)))
+	}
+	if bases[0] != models.LegacyZenBase || bases[1] == models.LegacyZenBase {
+		t.Fatalf("shaped dumps must follow the lane order and name their base, got %v", bases)
+	}
+
+	// D4: each lane got the shaper its own gate needs. The legacy lane wants a
+	// single tool named "read" and ignores schemas, so the client's read_file
+	// is renamed in place and nothing else is appended.
+	legacyBody := shaped[0]
+	if !strings.Contains(legacyBody, `"name":"read"`) || strings.Contains(legacyBody, `"shell"`) {
+		t.Fatalf("the legacy lane must be shaped for the single-read gate, got %s", legacyBody)
+	}
+	if !strings.Contains(legacyBody, "file_path") {
+		t.Fatalf("the legacy rename must keep the client's own parameters, got %s", legacyBody)
+	}
+	// The inference lane needs genuine core definitions, appended — never
+	// substituted over what the client declared.
+	inferenceBody := shaped[1]
+	if !strings.Contains(inferenceBody, `"shell"`) || !strings.Contains(inferenceBody, "[gateway]") {
+		t.Fatalf("the inference lane must append the core toolset and the placeholder note, got %s", inferenceBody)
+	}
+	if !strings.Contains(inferenceBody, "file_path") {
+		t.Fatalf("the client tool must survive inference shaping, got %s", inferenceBody)
+	}
+}
+
+// TestTwoLaneToolAliasResetsWhenTheOtherLaneSucceeds pins that toolAlias is
+// recomputed per attempt. Computed once per request, a response arriving from
+// the other lane would still carry the first lane's alias and the gateway would
+// rewrite a tool call the client never made.
+func TestTwoLaneToolAliasResetsWhenTheOtherLaneSucceeds(t *testing.T) {
+	g, _, legacyHits, inferenceHits := twoLaneGateway(t, []string{config.LaneLegacy, config.LaneInference})
+
+	client := []byte(`{"model":"probe-free","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+	meta := &telemetry.RequestMeta{}
+	ctx := telemetry.WithRequestMeta(context.Background(), meta)
+
+	resp, _, _, err := g.doUpstreamTiers(ctx, chatDumpRoute(),
+		map[config.Tier][]byte{config.TierZen: client}, identity.RequestIDs{Request: "req-alias"}, 0, "")
+	if err != nil {
+		t.Fatalf("the fallback lane should have carried the request: %v", err)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if legacyHits.Load() != 1 || inferenceHits.Load() != 1 {
+		t.Fatalf("both lanes must be tried, got legacy=%d inference=%d", legacyHits.Load(), inferenceHits.Load())
+	}
+	if meta.ToolAlias != "" {
+		t.Fatalf("the successful /inference lane renames nothing, so ToolAlias must be empty, got %q", meta.ToolAlias)
+	}
+}
+
+// TestTwoLaneDumpIsPerAttemptNotPerCandidate is the sharper half of D5: a
+// candidate that is never attempted must not appear in the dump at all. Logging
+// prepared-but-unsent bytes is how "shaped" stops meaning "what went out".
+func TestTwoLaneDumpIsPerAttemptNotPerCandidate(t *testing.T) {
+	g, buf, _, inferenceHits := twoLaneGateway(t, []string{config.LaneInference, config.LaneLegacy})
+
+	// inference is first and answers, so legacy is never dialed.
+	client := []byte(`{"model":"probe-free","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+	resp, _, _, err := g.doUpstreamTiers(context.Background(), chatDumpRoute(),
+		map[config.Tier][]byte{config.TierZen: client}, identity.RequestIDs{Request: "req-1lane"}, 0, "")
+	if err != nil {
+		t.Fatalf("anonymous attempt: %v", err)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if inferenceHits.Load() != 1 {
+		t.Fatalf("fixture: the first lane must have been tried, got %d", inferenceHits.Load())
+	}
+	shapedCount := 0
+	for _, record := range dumpRecords(t, buf) {
+		if record["phase"] != "shaped" {
+			continue
+		}
+		shapedCount++
+		if base, _ := record["upstream"].(string); base == models.LegacyZenBase {
+			t.Fatalf("the untried legacy lane must not be dumped: %v", base)
+		}
+	}
+	if shapedCount != 1 {
+		t.Fatalf("want exactly one shaped dump for one attempt, got %d", shapedCount)
+	}
 }
