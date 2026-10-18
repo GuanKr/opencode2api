@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"opencode2api/internal/config"
-	"opencode2api/internal/rotation"
 	wire "opencode2api/internal/protocol"
+	"opencode2api/internal/rotation"
 	"opencode2api/internal/telemetry"
 )
 
