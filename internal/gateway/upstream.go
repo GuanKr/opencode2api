@@ -917,15 +917,50 @@ var anonymousGateSaturators = []string{"execute", "webfetch", "websearch", "ques
 // is strictly worse than a phantom tool the placeholder note warns about. These
 // definitions are used only for what the gateway itself appends.
 //
+// The OS phrase inside the shell description is DELIBERATELY PINNED and must
+// not be re-synced from upstream without measuring first. Read the history
+// before changing this file — the next upstream sync will offer exactly this
+// conflict again.
+//
+// The official CLI has no fixed "description it ships". It builds the sentence
+// at runtime, substituting the platform and the name of whichever shell it
+// picked: on Windows the preference order is [pwsh, powershell, git-bash,
+// %COMSPEC%], taking the first one present. So there is no single correct
+// string — on this host the real 2.0.32 CLI would emit "Windows using pwsh",
+// not the "powershell" pinned here.
+//
+// What makes the pinned string right is measurement, not fidelity: on
+// 2026-10-15 this exact Windows wording was measured passing the free tier's
+// gate (200) on the /inference lane. Upstream re-synced the file from a Linux
+// client on 2026-10-18 (commit b0a6584, "use the Linux shell tool description
+// the client ships, so the anonymous fingerprint matches") and that change was
+// reverted in f017ca2 — because its premise is contradicted by that same
+// measurement. Had the gate held a Linux-captured reference, the Windows string
+// would have failed. It passed. So the reference is not the Linux bytes, and
+// swapping would trade a measured-passing string for a disproven one.
+//
+// Cost of diverging, stated plainly: carriesGenuineDefinition compares a
+// client-declared entry against this file byte for byte, so a real CLI whose
+// own shell resolves to pwsh — or to bash — is classified as not-genuine and
+// falls through to the saturator branch. Bounded, because a real CLI declares
+// all five core names and edit/glob/grep/read carry no OS text and still match.
+//
+// Blast radius if this file is flipped to the Linux wording: in the common case
+// where a client declares edit/glob/grep/read but not shell, the appended shell
+// is the ONLY genuine definition on the wire. If the gate wants that entry
+// faithful, that is precisely the shape that flips back to 403 FreeTierError —
+// and watchdog-clash.ps1 classifies a gate 403 as quota, which does not break
+// the candidate loop, so the script would burn the whole pool re-checking
+// nodes for a problem no node switch can fix.
+//
+// Known trade-off, accepted: a gateway running on Linux or macOS still injects
+// this Windows wording, so an injected "shell" describes PowerShell there. The
+// placeholder note warns the model off those definitions, and a wrong-but-
+// plausible shell description is the lesser failure against a stable 403.
+//
 // The legacy /zen/v1 lane does not read this file at all: its gate wants a
 // single tool named "read" and ignores descriptions and schemas entirely (see
 // legacyAnonymousReadTool).
-//
-// The descriptions are the Windows variants the official client emits on this
-// platform (the CLI builds them as `Commands run on ${OS} using ${shell}.`),
-// and they pass as-is. A gateway running on Linux or macOS still injects that
-// Windows wording, so an injected "shell" describes PowerShell to every client;
-// the placeholder note warns the model off those definitions.
 //
 //go:embed opencode_tools.json
 var opencodeToolsJSON []byte

@@ -202,13 +202,18 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		// Derived before routing so every client-visible rejection can carry a
 		// real x-request-id for log/telemetry correlation. Previously these
 		// paths passed the literal "model" (or nothing), which produced
-		// `x-request-id: model`.
+		// `x-request-id: model` or no header at all.
 		//
 		// Scoped to the calling server key, so two callers replaying the same
-		// client session do not land on one upstream session. Derived once,
-		// here: the caller scope is already in the context (the auth
-		// middleware stored it before this handler ran), so deriving again
-		// after routing would only mint a second, different request id.
+		// client session do not land on one upstream session. The scope is
+		// already in the context — the auth middleware stored it before this
+		// handler ran — so it is available this early.
+		//
+		// Two of the four request paths still derive again downstream
+		// (handleRotation, forwardSystemOne). That is harmless: Session is
+		// deterministic, so both derivations agree on it and only Request
+		// differs, with the second one winning every consumer. It is not
+		// deduplicated because those handlers are separate entry points.
 		ids := identity.DeriveRequestIDs(r, payload, callerScope(r.Context()))
 		if meta != nil {
 			meta.Request = ids.Request
@@ -256,7 +261,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		// gateway whose OpenAI platform pins every request to Responses.
 		if route.Protocol == wire.SystemOne {
 			if len(jsonutil.MapAt(payload, "questions")) == 0 || payload["state"] == nil {
-				wire.WriteError(w, external, http.StatusBadRequest, "this model uses System One decisions, not chat; send state and typed questions to /v1/systemone", "invalid_request_error", "model")
+				wire.WriteError(w, external, http.StatusBadRequest, "this model uses System One decisions, not chat; send state and typed questions to /v1/systemone", "invalid_request_error", ids.Request)
 				return
 			}
 			g.forwardSystemOne(w, r, body, payload, model, route)
@@ -269,7 +274,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		fingerprint := identity.RequestFingerprint(payload)
 		bodies, err := g.prepareRouteBodies(external, route, payload, body)
 		if err != nil {
-			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", ids.Request)
 			return
 		}
 		// ids already derived, caller-scoped, before routing — see above.
@@ -463,7 +468,7 @@ func (g *Gateway) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if route.Protocol != wire.SystemOne {
-		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, fmt.Sprintf("the model does not use the %s protocol", wire.SystemOne), "invalid_request_error", "model")
+		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, fmt.Sprintf("the model does not use the %s protocol", wire.SystemOne), "invalid_request_error", ids.Request)
 		return
 	}
 	g.forwardSystemOne(w, r, body, payload, model, route)
