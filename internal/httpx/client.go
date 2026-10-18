@@ -23,7 +23,7 @@ import (
 // /inference lane. Upstream accepts a range of releases (the version number
 // itself is not validated), so this only needs bumping when it starts rejecting
 // older ones.
-const clientVersion = "2.0.29"
+const clientVersion = "2.0.32"
 
 // legacyClientVersion is the pre-2.x OpenCode release reported on the legacy
 // /zen/v1 lane, matching the v1.3.7 User-Agent shape.

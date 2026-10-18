@@ -156,16 +156,26 @@ func (g *Gateway) authenticate(next http.HandlerFunc) http.HandlerFunc {
 			wire.WriteError(w, protocol, http.StatusUnauthorized, "invalid local API key", "authentication_error", "")
 			return
 		}
-		if meta := telemetry.MetaFromRequest(r); meta != nil {
-			// The Playground borrows the first enabled key to pass this check, so
-			// its traffic gets its own bucket instead of being billed to that key.
-			meta.ServerKeyID = config.Fingerprint(matched)
-			if isDiagnosticRequest(r.Context()) {
-				meta.ServerKeyID = telemetry.PlaygroundServerKey
-			}
+		// The Playground borrows the first enabled key to pass this check, so
+		// its traffic gets its own bucket instead of being billed to that key.
+		caller := config.Fingerprint(matched)
+		if isDiagnosticRequest(r.Context()) {
+			caller = telemetry.PlaygroundServerKey
 		}
-		next(w, r)
+		if meta := telemetry.MetaFromRequest(r); meta != nil {
+			meta.ServerKeyID = caller
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), callerContextKey{}, caller)))
 	}
+}
+
+type callerContextKey struct{}
+
+// callerScope returns the authenticated caller that request identities are
+// scoped to, so different server keys never share an upstream session.
+func callerScope(ctx context.Context) string {
+	caller, _ := ctx.Value(callerContextKey{}).(string)
+	return caller
 }
 
 func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
@@ -193,7 +203,17 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		// real x-request-id for log/telemetry correlation. Previously these
 		// paths passed the literal "model" (or nothing), which produced
 		// `x-request-id: model`.
-		ids := identity.DeriveRequestIDs(r, payload)
+		//
+		// Scoped to the calling server key, so two callers replaying the same
+		// client session do not land on one upstream session. Derived once,
+		// here: the caller scope is already in the context (the auth
+		// middleware stored it before this handler ran), so deriving again
+		// after routing would only mint a second, different request id.
+		ids := identity.DeriveRequestIDs(r, payload, callerScope(r.Context()))
+		if meta != nil {
+			meta.Request = ids.Request
+			meta.Session = ids.Session
+		}
 		if model == "" {
 			wire.WriteError(w, external, http.StatusBadRequest, "model is required", "invalid_request_error", ids.Request)
 			return
@@ -252,10 +272,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			wire.WriteError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 			return
 		}
-		if meta != nil {
-			meta.Request = ids.Request
-			meta.Session = ids.Session
-		}
+		// ids already derived, caller-scoped, before routing — see above.
 		stream := jsonutil.BoolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
@@ -418,15 +435,24 @@ func (g *Gateway) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 		meta.ReasoningEffort = wire.ReasoningEffortLabel(wire.SystemOne, payload)
 		meta.Stream = jsonutil.BoolAt(payload, "stream")
 	}
+	// Derived before routing so the client-visible rejections below carry a
+	// real x-request-id instead of the literal "model" — the same fix
+	// handleInference got, applied here too. Scoped to the calling server key
+	// so two callers replaying one client session do not share an upstream
+	// session, and derived only once for the same reason.
+	ids := identity.DeriveRequestIDs(r, payload, callerScope(r.Context()))
+	if meta := telemetry.MetaFromRequest(r); meta != nil {
+		meta.Request = ids.Request
+		meta.Session = ids.Session
+	}
 	if model == "" {
-		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "model is required", "invalid_request_error", "model")
+		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "model is required", "invalid_request_error", ids.Request)
 		return
 	}
 	if !g.catalog.Supported(model) {
-		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
+		wire.WriteError(w, wire.SystemOne, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", ids.Request)
 		return
 	}
-	ids := identity.DeriveRequestIDs(r, payload)
 	route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
 	if err != nil {
 		if errors.Is(err, models.ErrModelDisabled) {
@@ -463,8 +489,11 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 		bodies[tier] = body
 	}
 	// Same cooling scope as handleInference; for System One the decisive
-	// fields are state+questions, which RequestFingerprint hashes.
-	ids := identity.DeriveRequestIDs(r, payload)
+	// fields are state+questions, which RequestFingerprint hashes. Derived
+	// here rather than reused from handleSystemOne: this is a separate entry
+	// point (the message endpoints route a System One model straight here)
+	// and it needs the ids as values, not just for the error paths above.
+	ids := identity.DeriveRequestIDs(r, payload, callerScope(r.Context()))
 	if meta != nil {
 		meta.Request = ids.Request
 		meta.Session = ids.Session
