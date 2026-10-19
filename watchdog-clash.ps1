@@ -6,7 +6,7 @@
   每隔 PollSeconds 秒做一次只读巡检，只在命中以下信号时才动作：
     1) 当前 Selector 节点在 Mihomo 侧 alive=false / 消失        → 刷新后原地复测一次，仍坏才切换
     2) 网关 /v1/watchdog/status 报 proxies.all_down=true（传输全坏） → 刷新后原地复测一次，仍坏才切换
-    3) 网关 /v1/watchdog/status 报 anonymous.verdict=transport（传输坏，常见为 cause=transport (connection failed) 网络抖动） → 累计 TransportConfirmRounds 轮（默认 2）仍坏才刷新，刷新后原地复测一次，仍坏才切换（单个 ok/限流轮不再清零，连续 4 轮非 transport 才衰减；网关冷却过期后 5 分钟内仍报 transport，防“两次失败→过期→误报恢复”死循环）
+    3) 网关 /v1/watchdog/status 报 anonymous.verdict=transport（传输坏，常见为 cause=transport (connection failed) 网络抖动） → 累计 TransportConfirmRounds 轮（默认 2，可用 watchdog.json 的 transport_confirm_rounds 或命令行 -TransportConfirmRounds 改）仍坏才刷新，刷新后原地复测一次，仍坏才切换（单个 ok/限流轮不再清零，连续 4 轮非 transport 才衰减；网关冷却过期后 5 分钟内仍报 transport，防“两次失败→过期→误报恢复”死循环）
     4) 网关 /v1/watchdog/status 报 anonymous.verdict=quota（额度尽） → 与上面三类同样先刷新，刷新后原地复测一次（刷新换的是同名节点背后的出口 IP，额度可能已恢复），仍坏才切换；探针走网关的 /v1/watchdog/probe 时只测匿名通道、不回退付费 key，复测 200 就等于这条出口 IP 的匿名通道真恢复了（旧探针 legacy 才需要再复查 verdict 翻离 quota）
   verdict=ratelimit/cooling（纯限流/普通冷却）只记日志，不刷新、不切换、不验证；verdict=ok 且有 transport 前科未验证时只打一次节流验证探针（5 分钟一次），无前科的 ok 轮不验证。
   切换前不再为确认 verdict 打探针：verdict 已由网关内部分类给出原因，不花配额；
@@ -65,18 +65,23 @@
     排序：延迟从低到高；当前节点永不复选(换 IP 才有意义)。
 
   看门狗专用配置文件（-WatchdogConfig，默认脚本同目录 watchdog.json，只读从不写回）：
-  这两项不再需要改脚本源码，直接在配置文件里增删，支持 // 与 /* */ 注释：
+  这三项不再需要改脚本源码，直接在配置文件里增删，支持 // 与 /* */ 注释：
     {
       "exclude_contains": ["剩余","到期","重置","流量","套餐","官网","中国"],
-      "deprioritize": { "contains": ["新加坡"], "penalty_ms": 500 }
+      "deprioritize": { "contains": ["新加坡"], "penalty_ms": 500 },
+      "transport_confirm_rounds": 2
     }
   语义：exclude_contains / deprioritize.contains 是整体替换内置默认值（不是追加），
   [] 即关闭该项；省略的键仍用内置默认值。deprioritize.penalty_ms 省略即用 500。
+  transport_confirm_rounds 省略即用 2（1-10 的整数）：网关报 verdict=transport 时需连续
+  N 轮仍坏才刷新切换，等价于命令行 -TransportConfirmRounds，-Once 单轮模式忽略它。
   优先级：显式命令行参数 > 配置文件 > 内置默认值——所以临时 -DeprioritizeContains
   试一把仍然压过文件，不必先改文件。exclude_contains 没有对应的命令行参数，
   它写错了只能改文件或把 -WatchdogConfig 指向别的路径。
-  校验从严：未知键、类型不对（该给数组却给字符串/null）、空文件一律报错中止启动，
-  不静默回退默认值——悄悄丢掉排除规则会把节点切到本该避开的地区，比直接报错危险。
+  校验从严：未知键、类型不对（该给数组却给字符串/null、轮数给成字符串或小数）、
+  空文件一律报错中止启动，不静默回退默认值——悄悄丢掉排除规则会把节点切到本该避开的
+  地区，比直接报错危险。文件里的值即使被显式命令行参数覆盖也照样校验（只是不生效），
+  免得哪天去掉命令行参数、看门狗才突然起不来。
   只在启动时读一次，改完 watchdog.json 必须重启看门狗才生效。
   新建文件请从 watchdog.example.json 复制；未创建则全部走内置默认值，行为与从前一致。
 
@@ -86,7 +91,7 @@
     - clash-verge.yaml           订阅刷新时同步 proxies/proxy-groups/rules 等节(先备份)
     - .tmp/clash-watchdog.log    运行日志(密钥/订阅 token 自动脱敏)
   只读不写的文件：
-    - watchdog.json              看门狗专用配置(排除/降权规则)，默认取脚本同目录，-WatchdogConfig 可改路径
+    - watchdog.json              看门狗专用配置(排除/降权/transport 确认轮数)，默认取脚本同目录，-WatchdogConfig 可改路径
     - config.json                只读 server_keys[0]
 
   密钥来源(绝不落盘、不打印)：Clash secret 从 clash-verge.yaml 读取；
@@ -97,8 +102,11 @@
 
 .PARAMETER WatchdogConfig
   看门狗专用配置文件路径，默认脚本同目录 watchdog.json。文件不存在即全部用内置默认值；
-  存在则用其中的 exclude_contains（子串排除）与 deprioritize（地区降权）覆盖对应内置默认值，
-  省略的键不受影响。deprioritize 的两个键在显式传同名命令行参数时以命令行优先，
+  存在则用其中的 exclude_contains（子串排除）、deprioritize（地区降权）与
+  transport_confirm_rounds（transport 连续确认轮数）覆盖对应内置默认值，
+  省略的键不受影响。deprioritize 的两个键与 transport_confirm_rounds 在显式传同名命令行参数时
+  以命令行优先（-DeprioritizeContains / -DeprioritizePenaltyMs / -TransportConfirmRounds），
+  但文件里的值照样先校验（写错就报错中止启动，只是不生效），
   exclude_contains 没有对应参数、写错只能改文件或换路径。只在启动时读一次，改完需重启看门狗。
 
 .PARAMETER ProbeEndpoint
@@ -116,6 +124,12 @@
   （/v1/watchdog/status 的 proxies.healthy 回到 proxies.total 就立刻继续）。只在闸门确实关着时
   花时间，默认 5，0 = 不等。注意这不是「探针能不能发出去」的前提——探针会穿透闸门；它只是少让
   「切换后首次拨号超时被判坏」的瞬时状态白烧一个候选和一次额度。
+
+.PARAMETER TransportConfirmRounds
+  transport 连续确认轮数（1-10，默认 2）：网关报 anonymous.verdict=transport（多为网络抖动）
+  时，需连续 N 轮仍为 transport 才刷新/切换，单轮抖动只观察不动作。quota / all_down / 节点失效
+  走立即路径，不受此值影响。也可以写进 watchdog.json 的 transport_confirm_rounds；
+  两者同时存在时命令行显式传参优先。计数只存在进程内存（重启清零），且 -Once 单轮模式忽略此值。
 
 .EXAMPLE
   pwsh -NoProfile -ExecutionPolicy Bypass -File watchdog-clash.ps1 -DryRun
@@ -162,6 +176,7 @@ param(
   [ValidateRange(0, 60)][int]$RefreshSettleSeconds = 3,
   # transport 连续确认轮数：verdict=transport（多为网络抖动，如 transport (connection failed)）需连续 N 轮仍坏才刷新切换；
   # quota/all_down/节点失效不受此限制，仍立即动作。
+  # 未显式传本参数时由 watchdog.json 的 transport_confirm_rounds 接管（见 Read-WatchdogConfig）。
   [ValidateRange(1, 10)][int]$TransportConfirmRounds = 2,
   # 看门狗专用配置文件路径（默认脚本同目录 watchdog.json）。只读、从不写回。
   # 存 exclude_contains（子串排除）与 deprioritize（地区降权）两项，见脚本头 .DESCRIPTION。
@@ -207,6 +222,10 @@ $script:ProxyReadySeconds = $ProxyReadySeconds
 $script:QuotaFailMemoryMinutes = $QuotaFailMemoryMinutes
 $script:DeprioritizeContains = $DeprioritizeContains
 $script:DeprioritizePenaltyMs = $DeprioritizePenaltyMs
+# transport 连续确认轮数：param 绑定值起步，配置文件可覆盖（命令行显式传参时以命令行为准）。
+# param 变量本身就在脚本作用域，所以 $script:TransportConfirmRounds 与 $TransportConfirmRounds
+# 是同一个存储；统一走 $script: 读写，来源单一、不会出现两处读出不同值。
+$script:TransportConfirmRounds = $TransportConfirmRounds
 $script:LogPath = $LogPath
 $script:VergeRoot = Join-Path $env:APPDATA 'io.github.clash-verge-rev.clash-verge-rev'
 
@@ -420,11 +439,13 @@ function Strip-JsonComments {
 function Read-WatchdogConfig {
   # 看门狗专用配置文件（默认 watchdog.json，与 config.json 同目录）。
   # 支持 // 与 /* */ 注释（与 config.json 同一套 Strip-JsonComments 语义）。
-  # 只认两个键，都可整段省略，省略即用内置默认值：
+  # 只认三个键，都可整段省略，省略即用内置默认值：
   #   exclude_contains              子串排除：节点名含任一子串即丢弃（整体替换内置默认值；
   #                                 [] = 关闭子串排除；内置精确排除表不受此键影响）
   #   deprioritize.contains         地区降权关键词（整体替换内置默认值；[] = 关闭）
   #   deprioritize.penalty_ms       降权罚分毫秒（0 = 关闭降权）
+  #   transport_confirm_rounds      transport 连续确认轮数（1-10，默认 2；等价命令行
+  #                                 -TransportConfirmRounds，命令行显式传参时以命令行为准）
   # 优先级：显式命令行参数 > 配置文件 > 内置默认值。配置文件只接管没在命令行显式传过的项，
   # 所以临时 -DeprioritizeContains 试一把仍然压过文件，改完不用先改文件。
   # 解析失败一律抛错中止启动，绝不静默回退默认值：悄悄丢掉排除规则的后果是
@@ -451,22 +472,32 @@ function Read-WatchdogConfig {
       }
     }
     if (-not (Test-JsonObjectShape $cfg)) {
-      throw "看门狗配置文件 [$Path] 顶层必须是 JSON 对象（如 {`"exclude_contains`": [...]}），实际是 $(Get-ShapeName $cfg)"
+      throw "看门狗配置文件 [$Path] 顶层必须是 JSON 对象（如 {`"exclude_contains`": [...], `"deprioritize`": {`"contains`": [...], `"penalty_ms`": 500}, `"transport_confirm_rounds`": 2}），实际是 $(Get-ShapeName $cfg)"
     }
     # 未知键直接报错（与 config.json 的 DisallowUnknownFields 同口径）。键名拼错
     # （exclude-contains / penalty / 尾随空格）若静默忽略，看门狗会照常以内置默认值
     # 跑起来，用户却以为自己的排除/降权规则生效了。
     $unknownTop = @(@($cfg.PSObject.Properties | ForEach-Object { $_.Name }) |
-      Where-Object { @('exclude_contains', 'deprioritize') -notcontains $_ })
+      Where-Object { @('exclude_contains', 'deprioritize', 'transport_confirm_rounds') -notcontains $_ })
     if ($unknownTop.Count -gt 0) {
-      throw "看门狗配置文件 [$Path] 含未知键：$($unknownTop -join ' / ')，只支持 exclude_contains、deprioritize"
+      throw "看门狗配置文件 [$Path] 含未知键：$($unknownTop -join ' / ')，只支持 exclude_contains、deprioritize、transport_confirm_rounds"
     }
   }
-  if (-not $existed) { Write-WdLog "未找到看门狗配置文件 [$Path]，子串排除与地区降权均用内置默认值" 'INFO'; return }
+  if (-not $existed) { Write-WdLog "未找到看门狗配置文件 [$Path]，子串排除、地区降权与 transport 连续确认轮数均用内置默认值" 'INFO'; return }
   Write-WdLog "已解析看门狗配置文件：$Path"
 
+  # 三个计数分开记，别混用一个：
+  #   $seen     文件里识别到的叶子键个数（exclude_contains / deprioritize.contains /
+  #             deprioritize.penalty_ms / transport_confirm_rounds）
+  #   $covered  其中被显式命令行参数覆盖、文件值故意不生效的键个数
+  #   $applied  其中真正被应用的键个数
+  # 分开记才能在「文件里的键全被命令行覆盖」时不说出「空对象 {}：全部使用内置默认值」
+  # 这种既不成立、又与上一行 INFO 自相矛盾的假话（deprioritize 的覆盖分支同样会踩到）。
+  $seen = 0
+  $covered = 0
   $applied = 0
   if (Test-HasKey $cfg 'exclude_contains') {
+    $seen++
     $list = ConvertTo-StrList (Get-Prop $cfg 'exclude_contains') 'exclude_contains'
     $script:ExcludeContains = @($list)
     $applied++
@@ -484,7 +515,9 @@ function Read-WatchdogConfig {
       throw "看门狗配置 deprioritize 含未知键：$($unknownDep -join ' / ')，只支持 contains、penalty_ms"
     }
     if (Test-HasKey $dep 'contains') {
+      $seen++
       if ($script:ExplicitParams -contains 'DeprioritizeContains') {
+        $covered++
         Write-WdLog '命令行已显式传 -DeprioritizeContains，配置文件的 deprioritize.contains 不生效' 'INFO'
       } else {
         $list = ConvertTo-StrList (Get-Prop $dep 'contains') 'deprioritize.contains'
@@ -495,7 +528,9 @@ function Read-WatchdogConfig {
       }
     }
     if (Test-HasKey $dep 'penalty_ms') {
+      $seen++
       if ($script:ExplicitParams -contains 'DeprioritizePenaltyMs') {
+        $covered++
         Write-WdLog '命令行已显式传 -DeprioritizePenaltyMs，配置文件的 deprioritize.penalty_ms 不生效' 'INFO'
       } else {
         $rawPenalty = Get-Prop $dep 'penalty_ms'
@@ -508,8 +543,37 @@ function Read-WatchdogConfig {
       }
     }
   }
+  if (Test-HasKey $cfg 'transport_confirm_rounds') {
+    $seen++
+    $rawRounds = Get-Prop $cfg 'transport_confirm_rounds'
+    # 值必须是整数类型：字符串 "3"、浮点 2.0、指数 1e1 都会被静默强转成别的值
+    # （1e1 → 10），那正是「校验从严、解析失败一律报错中止启动」要防的事。
+    # JSON 整数解析成 int/int64；其他一律拒。
+    if (-not ($rawRounds -is [int] -or $rawRounds -is [long])) {
+      $typeName = if ($null -eq $rawRounds) { 'null' } else { $rawRounds.GetType().Name }
+      throw "看门狗配置 transport_confirm_rounds 非法：[$rawRounds]（类型 $typeName；必须是 1-10 的整数，不要加引号、不要写小数）"
+    }
+    # 区间必须与命令行的 ValidateRange(1,10) 一致，否则文件能写出命令行拒绝的组合。
+    if ($rawRounds -lt 1 -or $rawRounds -gt 10) { throw "看门狗配置 transport_confirm_rounds 越界：[$rawRounds]（应为 1-10）" }
+    $n = [int]$rawRounds
+    if ($script:ExplicitParams -contains 'TransportConfirmRounds') {
+      $covered++
+      Write-WdLog '命令行已显式传 -TransportConfirmRounds，配置文件的 transport_confirm_rounds 不生效' 'INFO'
+    } else {
+      $script:TransportConfirmRounds = $n
+      $applied++
+      Write-WdLog "配置生效：transport 连续确认轮数 = ${n}"
+    }
+  }
   # {} 是合法的“不改任何默认值”，但很容易是误建/误清空后的残留，单独提示一句。
-  if ($applied -eq 0) { Write-WdLog '配置文件已解析但未应用任何键（空对象 {}）：全部使用内置默认值' 'WARN' }
+  # 注意别把「键全被命令行覆盖」也说成「空对象 {}」——那与上一行的 INFO 自相矛盾。
+  if ($applied -eq 0) {
+    if ($covered -gt 0) {
+      Write-WdLog "配置文件的 $covered 个键被显式命令行参数覆盖，未应用任何文件值（生效值取自命令行）" 'INFO'
+    } else {
+      Write-WdLog '配置文件已解析但未应用任何键（等同于空对象 {}）：全部使用内置默认值' 'WARN'
+    }
+  }
 }
 
 function Resolve-GatewayKey {
@@ -1981,7 +2045,7 @@ try {
   $regionKeysForLog = @($script:DeprioritizeContains | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
   if ($script:DeprioritizePenaltyMs -gt 0 -and @($regionKeysForLog).Count -gt 0) { $regionCfg = "$($regionKeysForLog -join '/')+$($script:DeprioritizePenaltyMs)ms" }
   $excludeCfg = if (@($script:ExcludeContains).Count -gt 0) { @($script:ExcludeContains) -join '/' } else { '已关闭' }
-  Write-WdLog "看门狗启动：selector=$Selector 网关=$($script:GatewayBase) 模型=$VerifyModel 轮询=${PollSeconds}s 正常心跳=${NormalLogMinutes}分钟 quota记忆=${QuotaFailMemoryMinutes}分钟 transport连续确认=${TransportConfirmRounds}轮 探针通道=$(if ($script:ProbeSupported) { 'watchdog-probe' } else { 'legacy' }) 闸门等待=${ProxyReadySeconds}s 刷新等待=${RefreshSettleSeconds}s 地区降权=${regionCfg} 子串排除=${excludeCfg}"
+  Write-WdLog "看门狗启动：selector=$Selector 网关=$($script:GatewayBase) 模型=$VerifyModel 轮询=${PollSeconds}s 正常心跳=${NormalLogMinutes}分钟 quota记忆=${QuotaFailMemoryMinutes}分钟 transport连续确认=${script:TransportConfirmRounds}轮 探针通道=$(if ($script:ProbeSupported) { 'watchdog-probe' } else { 'legacy' }) 闸门等待=${ProxyReadySeconds}s 刷新等待=${RefreshSettleSeconds}s 地区降权=${regionCfg} 子串排除=${excludeCfg}"
   if ($DryRun) {
     Invoke-DryRun -Uid $SubscriptionUid
     exit 0
@@ -1989,6 +2053,9 @@ try {
   if ($Once) {
     # -Once 只有一轮攒不出连续计数：传 1 保留单轮即动作的老语义（仍受内部二次确认门控）；
     # 常驻循环仍用 TransportConfirmRounds 轮防抖。
+    if ($script:TransportConfirmRounds -ne 1) {
+      Write-WdLog "-Once 单轮模式固定按 1 轮执行，不使用 transport 连续确认轮数（横幅里的 $($script:TransportConfirmRounds) 轮是配置值，本轮不用它）" 'INFO'
+    }
     $onceResult = Invoke-WatchIteration `
       -MaxCandidates $MaxCandidates -SwitchGapSeconds 0 -VerifyTimeoutSeconds $VerifyTimeoutSeconds `
       -Uid $SubscriptionUid -RoundCooldownMinutes $RoundCooldownMinutes -NormalLogMinutes $NormalLogMinutes -RefreshSettleSeconds $RefreshSettleSeconds `
@@ -2002,7 +2069,7 @@ try {
       Invoke-WatchIteration `
         -MaxCandidates $MaxCandidates -SwitchGapSeconds $SwitchGapSeconds -VerifyTimeoutSeconds $VerifyTimeoutSeconds `
         -Uid $SubscriptionUid -RoundCooldownMinutes $RoundCooldownMinutes -NormalLogMinutes $NormalLogMinutes -RefreshSettleSeconds $RefreshSettleSeconds `
-        -TransportConfirmRounds $TransportConfirmRounds | Out-Null
+        -TransportConfirmRounds $script:TransportConfirmRounds | Out-Null
     } catch {
       Write-WdLog "本轮异常：$($_.Exception.Message)" 'WARN'
     }
