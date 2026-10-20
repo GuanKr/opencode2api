@@ -654,6 +654,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// client asked for a plain JSON reply. Key tiers keep their original bodies.
 	protocol := route.ProtocolFor(config.TierZen)
 	upstreams := g.anonymousUpstreams()
+	if len(upstreams) == 0 {
+		// Reachable only when upstream.anonymous points at the v1 origin while
+		// the lane order leaves "legacy" out (see anonymousUpstreams). Report an
+		// unusable route instead of scanning the cursor for attempts that cannot
+		// exist; the failover script keys on the 503 wording, so keep the
+		// errProxyUnavailable wrap and log the config mistake for the operator.
+		g.logger.Warn("anonymous lane has no usable upstream", "component", "upstream", "event", "anonymous_route_missing", "request_id", ids.Request, "anonymous", config.RedactURL(g.cfg.Upstream.Anonymous), "lane_order", strings.Join(g.cfg.Upstream.AnonymousLaneOrder, ","))
+		return nil, fmt.Errorf("no anonymous upstream is configured: %w", errProxyUnavailable), 0
+	}
 	preparedBodies := make([][]byte, len(upstreams))
 	toolAliases := make([]string, len(upstreams))
 	shapedPhase := shapedDumpPhase(attemptOffset)
@@ -806,7 +815,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 //
 // "inference" resolves to Upstream.Anonymous and is dropped when it is
 // configured to the legacy base, so the two can never produce a duplicate
-// attempt at the same origin.
+// attempt at the same origin. When the order resolves to no base at all the
+// result is empty on purpose: the lane must never fall back to an origin the
+// order excluded (D1). doAnonymousUpstream and the probe/watchdog consumers
+// each report that as an unusable route instead.
 func (g *Gateway) anonymousUpstreams() []string {
 	legacy := strings.TrimRight(models.LegacyZenBase, "/")
 	primary := strings.TrimRight(strings.TrimSpace(g.cfg.Upstream.Anonymous), "/")
@@ -831,9 +843,10 @@ func (g *Gateway) anonymousUpstreams() []string {
 		}
 		upstreams = append(upstreams, base)
 	}
-	if len(upstreams) == 0 {
-		return []string{legacy}
-	}
+	// No implicit legacy fallback: with the default ["inference"] order and
+	// upstream.anonymous pointed at the v1 origin, this returns empty. Silently
+	// dialing legacy here would resurrect exactly the v1-first behaviour D1
+	// rejected, and on a doomed attempt watchdogCause reads as quota.
 	return upstreams
 }
 

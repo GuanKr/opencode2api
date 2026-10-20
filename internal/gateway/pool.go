@@ -647,11 +647,18 @@ func (p *proxyTransports) closeIdleConnections() {
 		return
 	}
 	for _, proxy := range p.items {
-		if proxy == nil || proxy.client == nil {
+		if proxy == nil {
 			continue
 		}
-		if transport, ok := proxy.client.Transport.(*http.Transport); ok {
-			transport.CloseIdleConnections()
+		// Both clients need closing: the regular one and the Bun-disguised
+		// one free-model traffic uses. http.Client.CloseIdleConnections calls
+		// through to any transport that implements the method, so the Bun
+		// transport (httpx.BunTransport) is covered without a type assertion.
+		if proxy.client != nil {
+			proxy.client.CloseIdleConnections()
+		}
+		if proxy.bun != nil {
+			proxy.bun.CloseIdleConnections()
 		}
 	}
 }

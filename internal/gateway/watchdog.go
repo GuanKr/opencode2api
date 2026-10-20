@@ -323,7 +323,12 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 		return result
 	}
 	started := time.Now()
-	resp, err := node.proxy.client.Do(req)
+	// Production anonymous traffic goes through inferenceClient, which selects
+	// the Bun-disguised client for free models on this lane. The probe must
+	// measure that same shape: a verdict taken on the plain Go client would
+	// describe a request the gateway never sends, and any future gate that
+	// keys on the Bun fingerprint would be misreported as an endpoint failure.
+	resp, err := g.inferenceClient(node.proxy, baseURL, model).Do(req)
 	result.Attempted = true
 	result.DurationMS = time.Since(started).Milliseconds()
 	if err != nil {

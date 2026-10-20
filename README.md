@@ -262,7 +262,8 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `prefer`                    | `go`; accepts `go` or `zen`.                                                |
 | `upstream.zen`              | `https://opencode.ai/zen`.                                                  |
 | `upstream.go`               | `https://opencode.ai/zen/go`.                                               |
-| `upstream.anonymous`        | `https://opencode.ai/inference`; the anonymous lane's fallback after `/zen`. |
+| `upstream.anonymous`        | `https://opencode.ai/inference`; the anonymous lane's default (and, by default, only) base. |
+| `upstream.anonymous_lane_order` | `["inference"]`; the bases the anonymous lane tries in order. `"inference"` is `upstream.anonymous`, `"legacy"` is `https://opencode.ai/zen` (the v1 lane). |
 | `proxies`                   | Falls back to `["direct"]` when both proxy sources are empty.               |
 | `proxyfile`                 | Optional; relative paths resolve beside the configuration file.             |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                           |

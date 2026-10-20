@@ -8,8 +8,9 @@
 // 1.x User-Agent, the x-opencode-request header, a git-commit-shaped project
 // and, on the free tier, the single "read" tool. The v2 lane is the /inference
 // origin (upstream.anonymous) and the Go plan's /zen/go origin, which expect
-// the OpenCode 2.x CLI shape. The anonymous free tier tries the v1 origin
-// first and falls back to the configured v2 /inference origin.
+// the OpenCode 2.x CLI shape. The anonymous free tier follows
+// upstream.anonymous_lane_order, which defaults to the v2 /inference origin
+// alone; the v1 origin is opt-in rather than tried first.
 package gateway
 
 import (
@@ -749,9 +750,11 @@ func copyErrorResponse(w http.ResponseWriter, protocol wire.Protocol, resp *http
 	// client-controlled input, and a leading "opencode2api:" would make a
 	// passthrough indistinguishable from a gateway-originated error for
 	// prefix-based classifiers (dsh; the Anthropic shape has no code field as
-	// a second factor). Only a leading occurrence matters (classifiers match
-	// the strict prefix); the colon is replaced so the text stays readable but
-	// no longer matches.
+	// a second factor). Every occurrence matters: watchdog-clash.ps1 decides
+	// "the gateway is backing off" with a substring match ($body.Contains), so
+	// neutralizing only a leading hit would still let a forged prefix mid-body
+	// stop the failover script. The colon is replaced so the text stays
+	// readable but never matches.
 	message = neutralizeForgedGatewayPrefix(message)
 	kind := "upstream_error"
 	if protocol == wire.Anthropic && upstreamType != "" {
