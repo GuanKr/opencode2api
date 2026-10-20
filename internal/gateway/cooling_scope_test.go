@@ -18,7 +18,7 @@ import (
 
 // nextFor takes an addressable cursor: NextForRequest has a pointer receiver,
 // so it cannot be called straight off the CursorFor result.
-func nextFor(pool *anonymousPool, fingerprint string) *anonymousNode {
+func nextFor(pool *anonymousNodes, fingerprint string) *anonymousNode {
 	cursor := pool.CursorFor("")
 	return cursor.NextForRequest(fingerprint)
 }
@@ -26,13 +26,13 @@ func nextFor(pool *anonymousPool, fingerprint string) *anonymousNode {
 // scopePool builds a one-node anonymous pool whose node is already inside a
 // cooldown triggered by scopeFingerprint, and returns the pool plus the node.
 // The transport is never dialled: every case here is decided by the skip logic.
-func scopePool(t *testing.T, scopeFingerprint, cause string) (*anonymousPool, *anonymousNode) {
+func scopePool(t *testing.T, scopeFingerprint, cause string) (*anonymousNodes, *anonymousNode) {
 	t.Helper()
-	transports, err := newTransportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
+	transports, err := transportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := newAnonymousPool(true, transports, 10*time.Second)
+	pool := anonymousPool(true, transports, 10*time.Second)
 	if pool.Len() != 1 {
 		t.Fatalf("fixture wants exactly one node, got %d", pool.Len())
 	}

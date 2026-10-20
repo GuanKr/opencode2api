@@ -56,8 +56,8 @@ func TestClassifyAnonymousVerdict(t *testing.T) {
 	}
 }
 
-func watchdogTestTransports(healthy ...bool) *transportPool {
-	p := &transportPool{}
+func watchdogTestTransports(healthy ...bool) *proxyTransports {
+	p := &proxyTransports{}
 	for i, h := range healthy {
 		pt := &proxyTransport{index: i, name: "direct"}
 		pt.healthy.Store(h)
@@ -66,7 +66,7 @@ func watchdogTestTransports(healthy ...bool) *transportPool {
 	return p
 }
 
-func watchdogTestGateway(transports *transportPool, pool *anonymousPool) *Gateway {
+func watchdogTestGateway(transports *proxyTransports, pool *anonymousNodes) *Gateway {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return &Gateway{
 		cfg: config.Config{
@@ -79,7 +79,7 @@ func watchdogTestGateway(transports *transportPool, pool *anonymousPool) *Gatewa
 		logger:     logger,
 		transports: transports,
 		anonymous:  pool,
-		catalog:    models.NewCatalog(config.TierGo, nil),
+		catalog:    models.Catalog(config.TierGo, nil),
 	}
 }
 
@@ -105,12 +105,12 @@ func watchdogCool429() *http.Response {
 	return &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}}
 }
 
-func watchdogCoolingPool(t *testing.T, cause string) (*anonymousPool, *anonymousNode) {
+func watchdogCoolingPool(t *testing.T, cause string) (*anonymousNodes, *anonymousNode) {
 	t.Helper()
 	proxy := &proxyTransport{index: 0, name: "direct"}
 	proxy.healthy.Store(true)
 	node := &anonymousNode{proxy: proxy}
-	pool := &anonymousPool{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
+	pool := &anonymousNodes{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
 	pool.markUserFailure(node, watchdogCool429(), nil, cause, "")
 	if remain, _ := pool.maxCooldownSnapshot(); remain <= 0 {
 		t.Fatalf("setup must leave active cooling, got %v", remain)
@@ -119,7 +119,7 @@ func watchdogCoolingPool(t *testing.T, cause string) (*anonymousPool, *anonymous
 }
 
 func TestMaxCooldownSnapshotPicksLongest(t *testing.T) {
-	var nilPool *anonymousPool
+	var nilPool *anonymousNodes
 	if _, cause := nilPool.maxCooldownSnapshot(); cause != "" {
 		t.Fatalf("nil pool must report empty cause, got %q", cause)
 	}
@@ -127,7 +127,7 @@ func TestMaxCooldownSnapshotPicksLongest(t *testing.T) {
 	proxy.healthy.Store(true)
 	n1 := &anonymousNode{proxy: proxy}
 	n2 := &anonymousNode{proxy: proxy}
-	pool := &anonymousPool{nodes: []*anonymousNode{n1, n2}, cooldown: 15 * time.Second}
+	pool := &anonymousNodes{nodes: []*anonymousNode{n1, n2}, cooldown: 15 * time.Second}
 	if _, cause := pool.maxCooldownSnapshot(); cause != "" {
 		t.Fatalf("fresh pool must report empty cause, got %q", cause)
 	}
@@ -175,13 +175,13 @@ func TestHandleWatchdogStatusRecommendSwitch(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var pool *anonymousPool
+			var pool *anonymousNodes
 			if tc.cooling {
 				pool, _ = watchdogCoolingPool(t, tc.cause)
 			} else {
 				proxy := &proxyTransport{index: 0, name: "direct"}
 				proxy.healthy.Store(true)
-				pool = &anonymousPool{nodes: []*anonymousNode{{proxy: proxy}}, cooldown: 15 * time.Second}
+				pool = &anonymousNodes{nodes: []*anonymousNode{{proxy: proxy}}, cooldown: 15 * time.Second}
 			}
 			g := watchdogTestGateway(watchdogTestTransports(true), pool)
 			resp := doWatchdogStatus(t, g)
@@ -221,7 +221,7 @@ func TestHandleWatchdogStatusGateRejectionSwitches(t *testing.T) {
 func TestHandleWatchdogStatusAllDownRecommends(t *testing.T) {
 	proxy := &proxyTransport{index: 0, name: "direct"}
 	proxy.healthy.Store(true)
-	pool := &anonymousPool{nodes: []*anonymousNode{{proxy: proxy}}, cooldown: 15 * time.Second}
+	pool := &anonymousNodes{nodes: []*anonymousNode{{proxy: proxy}}, cooldown: 15 * time.Second}
 	g := watchdogTestGateway(watchdogTestTransports(false, false), pool)
 	resp := doWatchdogStatus(t, g)
 	if resp.Anonymous.Verdict != "ok" {
@@ -235,7 +235,7 @@ func TestHandleWatchdogStatusAllDownRecommends(t *testing.T) {
 func TestHandleWatchdogStatusEmptyPoolNotAllDown(t *testing.T) {
 	proxy := &proxyTransport{index: 0, name: "direct"}
 	proxy.healthy.Store(true)
-	pool := &anonymousPool{nodes: []*anonymousNode{{proxy: proxy}}, cooldown: 15 * time.Second}
+	pool := &anonymousNodes{nodes: []*anonymousNode{{proxy: proxy}}, cooldown: 15 * time.Second}
 	g := watchdogTestGateway(watchdogTestTransports(), pool)
 	resp := doWatchdogStatus(t, g)
 	if resp.Proxies.Total != 0 || resp.Proxies.AllDown {
@@ -249,7 +249,7 @@ func TestHandleWatchdogStatusEmptyPoolNotAllDown(t *testing.T) {
 func TestHandleWatchdogStatusRequiresAuth(t *testing.T) {
 	proxy := &proxyTransport{index: 0, name: "direct"}
 	proxy.healthy.Store(true)
-	pool := &anonymousPool{nodes: []*anonymousNode{{proxy: proxy}}, cooldown: 15 * time.Second}
+	pool := &anonymousNodes{nodes: []*anonymousNode{{proxy: proxy}}, cooldown: 15 * time.Second}
 	g := watchdogTestGateway(watchdogTestTransports(true), pool)
 	req := httptest.NewRequest(http.MethodGet, "/v1/watchdog/status", nil)
 	rec := httptest.NewRecorder()
@@ -263,12 +263,12 @@ func TestHandleWatchdogStatusRequiresAuth(t *testing.T) {
 // cooldown lapse while staying inside the stale TTL, i.e. the exact
 // "cooling expired with no new success" state the watchdog must not call
 // recovered. No sleeps: expiry is forced by moving cooldownUntil to the past.
-func staleTestPool(t *testing.T, cause string) (*anonymousPool, *anonymousNode) {
+func staleTestPool(t *testing.T, cause string) (*anonymousNodes, *anonymousNode) {
 	t.Helper()
 	proxy := &proxyTransport{index: 0, name: "direct"}
 	proxy.healthy.Store(true)
 	node := &anonymousNode{proxy: proxy}
-	pool := &anonymousPool{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
+	pool := &anonymousNodes{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
 	pool.markUserFailure(node, nil, errors.New("dial failed"), cause, "")
 	node.cooldownUntil.Store(time.Now().Add(-time.Second).UnixNano())
 	if remain, _ := pool.maxCooldownSnapshot(); remain != 0 {
@@ -362,7 +362,7 @@ func TestStaleCauseSnapshotWorstCaseAcrossProxies(t *testing.T) {
 		proxies[i].healthy.Store(true)
 		nodes[i] = &anonymousNode{proxy: proxies[i]}
 	}
-	pool := &anonymousPool{nodes: nodes, cooldown: 15 * time.Second}
+	pool := &anonymousNodes{nodes: nodes, cooldown: 15 * time.Second}
 	now := time.Now()
 	// Two expired cooldowns, both still inside the stale TTL, with different
 	// deadlines: the later one is the freshest evidence.
@@ -526,7 +526,7 @@ func TestStaleVotesAreTransportOnly(t *testing.T) {
 		proxy := &proxyTransport{index: 0, name: "direct"}
 		proxy.healthy.Store(true)
 		node := &anonymousNode{proxy: proxy}
-		pool := &anonymousPool{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
+		pool := &anonymousNodes{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
 		node.lastCause.Store(tc.cause)
 		node.causeExpires.Store(time.Now().Add(time.Minute).UnixNano())
 		if got := pool.staleCauseSnapshot(); got != tc.want {
@@ -542,7 +542,7 @@ func TestBackgroundMarkFailureRecordsNoUserEvidence(t *testing.T) {
 	proxy := &proxyTransport{index: 0, name: "direct"}
 	proxy.healthy.Store(true)
 	node := &anonymousNode{proxy: proxy}
-	pool := &anonymousPool{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
+	pool := &anonymousNodes{nodes: []*anonymousNode{node}, cooldown: 15 * time.Second}
 	pool.MarkFailure(node, nil, errors.New("dial failed"), "")
 	remain, cause := pool.maxCooldownSnapshot()
 	if remain <= 0 {
@@ -1080,11 +1080,11 @@ func TestWatchdogCauseWorstCasePeekStaysWithinDrainBudget(t *testing.T) {
 // the tail.
 func TestObserveAnonymousResultSlowBodyStillRecordsQuotaSwitch(t *testing.T) {
 	const head = `{"error":{"type":"FreeUsageLimitError","message":"no free credits left"}}`
-	transports, err := newTransportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
+	transports, err := transportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := newAnonymousPool(true, transports, 15*time.Second)
+	pool := anonymousPool(true, transports, 15*time.Second)
 	g := watchdogTestGateway(transports, pool)
 	freezeProxyHealth(g)
 	body := newGatedSlowBody(head)
@@ -1130,11 +1130,11 @@ func TestWatchdogCauseNeverReadsStreamOrSuccess(t *testing.T) {
 // still passed through verbatim.
 func TestObserveAnonymousResultRecordsQuotaVerdict(t *testing.T) {
 	const payload = `{"error":{"type":"FreeUsageLimitError","message":"no free credits left"}}`
-	transports, err := newTransportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
+	transports, err := transportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := newAnonymousPool(true, transports, 15*time.Second)
+	pool := anonymousPool(true, transports, 15*time.Second)
 	g := watchdogTestGateway(transports, pool)
 	freezeProxyHealth(g)
 	node := pool.nodes[0]
@@ -1165,11 +1165,11 @@ func TestObserveAnonymousResultRecordsQuotaVerdict(t *testing.T) {
 
 // Diagnostic requests must never write pool state (existing isolation).
 func TestObserveAnonymousResultSkipsDiagnostic(t *testing.T) {
-	transports, err := newTransportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
+	transports, err := transportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := newAnonymousPool(true, transports, 15*time.Second)
+	pool := anonymousPool(true, transports, 15*time.Second)
 	g := watchdogTestGateway(transports, pool)
 	freezeProxyHealth(g)
 	node := pool.nodes[0]

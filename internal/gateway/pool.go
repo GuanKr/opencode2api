@@ -22,23 +22,33 @@ import (
 	"opencode2api/internal/httpx"
 )
 
+// proxyTransport is one configured proxy route, or "direct", with its own HTTP
+// clients: client for regular traffic and bun for the free-model traffic that
+// goes out disguised as the Bun runtime (see Gateway.inferenceClient). pool
+// marks a rotating proxy pool entry (#pool or pool+), whose health is never
+// tracked. healthy is cleared by proxy-route failures and set again by
+// upstream HTTP responses (see syncProxyResult) or a passing health check;
+// checking claims the single health check allowed in flight.
 type proxyTransport struct {
 	index    int
 	name     string
 	pool     bool
 	client   *http.Client
+	bun      *http.Client
 	healthy  atomic.Bool
 	checking atomic.Bool
 }
 
-type transportPool struct {
+// proxyTransports holds every configured proxy route, indexed by
+// proxyTransport.index, shared by the key and anonymous node pools.
+type proxyTransports struct {
 	items []*proxyTransport
 }
 
-// anonymousPool gives the shared OpenCode "public" credential an independent
+// anonymousNodes gives the shared OpenCode "public" credential an independent
 // cooldown per proxy. Unlike key nodes, anonymous nodes are never rebound:
 // changing proxy is the failover mechanism because Zen rate-limits them by IP.
-type anonymousPool struct {
+type anonymousNodes struct {
 	nodes    []*anonymousNode
 	next     atomic.Uint64
 	cooldown time.Duration
@@ -84,15 +94,20 @@ type anonymousNode struct {
 	lastFailure atomic.Int64
 }
 
+// anonymousCursor walks the anonymous nodes for one request from start;
+// offset counts the positions visited so far and used marks the nodes the
+// first pass or the fallback of Next has already returned.
 type anonymousCursor struct {
-	pool   *anonymousPool
+	pool   *anonymousNodes
 	start  int
 	offset int
 	used   []bool
 }
 
-func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Duration) *anonymousPool {
-	pool := &anonymousPool{cooldown: cooldown}
+// anonymousPool builds one anonymous node per proxy transport, or an empty
+// pool when the anonymous tier is disabled.
+func anonymousPool(enabled bool, transports *proxyTransports, cooldown time.Duration) *anonymousNodes {
+	pool := &anonymousNodes{cooldown: cooldown}
 	if !enabled || transports == nil {
 		return pool
 	}
@@ -106,18 +121,23 @@ func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Dur
 	return pool
 }
 
-func (p *anonymousPool) Len() int {
+func (p *anonymousNodes) Len() int {
 	if p == nil {
 		return 0
 	}
 	return len(p.nodes)
 }
 
-func (p *anonymousPool) HasPool() bool {
+// HasPool reports whether any node uses a rotating proxy pool (#pool), which
+// lets callers make more attempts than there are nodes.
+func (p *anonymousNodes) HasPool() bool {
 	return p != nil && p.hasPool
 }
 
-func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
+// CursorFor returns a cursor whose first node is stable for a non-empty
+// affinity key, keeping a conversation on one exit; an empty affinity rotates
+// the starting node round-robin.
+func (p *anonymousNodes) CursorFor(affinity string) anonymousCursor {
 	if p == nil || len(p.nodes) == 0 {
 		return anonymousCursor{pool: p}
 	}
@@ -268,7 +288,7 @@ func (c *anonymousCursor) NextProbe() *anonymousNode {
 // MarkSuccess records a successful anonymous inference turn: it clears the
 // cooldown and, as the only positive recovery proof the watchdog feed accepts,
 // drops the stale transport memory and stamps the success moment.
-func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
+func (p *anonymousNodes) MarkSuccess(node *anonymousNode) {
 	if node == nil {
 		return
 	}
@@ -285,7 +305,7 @@ func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
 // for the watchdog (a models-endpoint 200 does not prove inference turns
 // succeed) and lastSuccess keeps its user-traffic-only meaning. The cooldown
 // clearing is exactly what MarkSuccess does, unchanged.
-func (p *anonymousPool) markRefreshSuccess(node *anonymousNode) {
+func (p *anonymousNodes) markRefreshSuccess(node *anonymousNode) {
 	if node == nil {
 		return
 	}
@@ -306,7 +326,7 @@ func (n *anonymousNode) hasCauseMemory() bool {
 }
 
 // RestoreProxy clears cooldowns for anonymous nodes bound to a recovered
-// proxy, mirroring nodePool.RestoreProxy for key nodes. Without this, an
+// proxy, mirroring upstreamNodes.RestoreProxy for key nodes. Without this, an
 // outage-era cooldown survives the proxy's recovery and the anonymous lane
 // stays skipped even though the route is healthy again.
 //
@@ -322,7 +342,7 @@ func (n *anonymousNode) hasCauseMemory() bool {
 // back, and the watchdog would switch a healthy node once for nothing.
 // lastSuccess and lastFailure stay untouched: they are user-traffic evidence,
 // so the script still has to see a real turn before it calls the node recovered.
-func (p *anonymousPool) RestoreProxy(proxy *proxyTransport) int {
+func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 	if p == nil || proxy == nil {
 		return 0
 	}
@@ -376,7 +396,7 @@ func anonymousCooldownCeiling(base time.Duration) time.Duration {
 // a stale transport vote that would send the watchdog switching nodes.
 // fingerprint scopes the cooldown to one request (see anonymousNode.coolHash);
 // pass "" to block every request, which is what background work wants.
-func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error, fingerprint string) {
+func (p *anonymousNodes) MarkFailure(node *anonymousNode, resp *http.Response, err error, fingerprint string) {
 	p.startCooldown(node, resp, err, "", fingerprint)
 }
 
@@ -385,7 +405,7 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 // label classifyAnonymousVerdict parses (see watchdogCause); it is never empty
 // on this path, and its presence is what makes the failure count as user
 // traffic (lastFailure plus the TTL-bounded stale transport memory).
-func (p *anonymousPool) markUserFailure(node *anonymousNode, resp *http.Response, err error, cause, fingerprint string) {
+func (p *anonymousNodes) markUserFailure(node *anonymousNode, resp *http.Response, err error, cause, fingerprint string) {
 	p.startCooldown(node, resp, err, cause, fingerprint)
 }
 
@@ -409,7 +429,7 @@ func (p *anonymousPool) markUserFailure(node *anonymousNode, resp *http.Response
 // unaffected — MarkSuccess stamps lastSuccess independently of this function,
 // so the feed still sees a pool entry being used and does not read its
 // silence as death.
-func (p *anonymousPool) startCooldown(node *anonymousNode, resp *http.Response, err error, cause, fingerprint string) {
+func (p *anonymousNodes) startCooldown(node *anonymousNode, resp *http.Response, err error, cause, fingerprint string) {
 	if node == nil || (node.proxy != nil && node.proxy.pool) {
 		return
 	}
@@ -472,7 +492,7 @@ const staleCauseTTL = 5 * time.Minute
 // cooldownUntil before coolCause, so a success landing between the two loads
 // can surface a stale remain with an empty cause; callers treat that as plain
 // cooling (wait), never as a switch signal.
-func (p *anonymousPool) maxCooldownSnapshot() (time.Duration, string) {
+func (p *anonymousNodes) maxCooldownSnapshot() (time.Duration, string) {
 	if p == nil {
 		return 0, ""
 	}
@@ -496,7 +516,7 @@ func (p *anonymousPool) maxCooldownSnapshot() (time.Duration, string) {
 // of time-based anonymous cooldown (as opposed to transport health), plus
 // the longest remaining delay. It mirrors the skip logic in NextForRequest, so
 // the answer is exactly "can NextForRequest find nothing".
-func (p *anonymousPool) coolingFor(fingerprint string) (bool, time.Duration) {
+func (p *anonymousNodes) coolingFor(fingerprint string) (bool, time.Duration) {
 	if p == nil {
 		return false, 0
 	}
@@ -522,7 +542,7 @@ func (p *anonymousPool) coolingFor(fingerprint string) (bool, time.Duration) {
 // cooldown (e.g. "FreeUsageLimitError (upstream HTTP 429)"), or "" when
 // nothing cooling matches. It mirrors the skip logic in coolingFor so the
 // reported cause always belongs to the block the caller just hit.
-func (p *anonymousPool) coolCauseFor(fingerprint string) string {
+func (p *anonymousNodes) coolCauseFor(fingerprint string) string {
 	if p == nil {
 		return ""
 	}
@@ -550,7 +570,7 @@ func (p *anonymousPool) coolCauseFor(fingerprint string) string {
 // an expired ratelimit cause must not park the script in wait, and an
 // unknown cause classifies as ok without cooling anyway. Unhealthy proxies
 // stay skipped, mirroring maxCooldownSnapshot.
-func (p *anonymousPool) staleCauseSnapshot() string {
+func (p *anonymousNodes) staleCauseSnapshot() string {
 	if p == nil {
 		return ""
 	}
@@ -581,7 +601,7 @@ func (p *anonymousPool) staleCauseSnapshot() string {
 // moments across transport-healthy proxies as ages. ok=false per side when
 // that side was never recorded (process memory, restart clears, same as the
 // telemetry minute metrics). Read-only: never extends any deadline.
-func (p *anonymousPool) successFailureAges() (successAge, failureAge time.Duration, successOK, failureOK bool) {
+func (p *anonymousNodes) successFailureAges() (successAge, failureAge time.Duration, successOK, failureOK bool) {
 	if p == nil {
 		return 0, 0, false, false
 	}
@@ -607,7 +627,7 @@ func (p *anonymousPool) successFailureAges() (successAge, failureAge time.Durati
 	return successAge, failureAge, successOK, failureOK
 }
 
-func (p *transportPool) hasHealthy() bool {
+func (p *proxyTransports) hasHealthy() bool {
 	if p == nil {
 		return false
 	}
@@ -622,7 +642,7 @@ func (p *transportPool) hasHealthy() bool {
 // closeIdleConnections releases pooled keep-alive connections. Called on
 // superseded runtimes after a hot-reload swap so old Transports do not hold
 // idle conns until IdleConnTimeoutSeconds.
-func (p *transportPool) closeIdleConnections() {
+func (p *proxyTransports) closeIdleConnections() {
 	if p == nil {
 		return
 	}
@@ -636,7 +656,7 @@ func (p *transportPool) closeIdleConnections() {
 	}
 }
 
-func (p *transportPool) healthCounts() (total, healthy int) {
+func (p *proxyTransports) healthCounts() (total, healthy int) {
 	if p == nil {
 		return 0, 0
 	}
@@ -648,8 +668,15 @@ func (p *transportPool) healthCounts() (total, healthy int) {
 	return len(p.items), healthy
 }
 
-func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
-	p := &transportPool{items: make([]*proxyTransport, 0, len(proxies))}
+// transportPool builds the HTTP clients of every configured proxy entry, each
+// entry starting healthy: a regular client and a Bun-disguised one
+// (httpx.BunTransport) sharing the proxy, connect timeout, idle settings and
+// responseHeaderTimeout as their header wait. A #pool entry gets HTTP/1.1
+// transports without keep-alives, so every attempt opens a new connection
+// through the pool; "direct" dials the upstream without any proxy, ignoring
+// the proxy environment variables.
+func transportPool(proxies []string, cfg config.PerformanceConfig, responseHeaderTimeout time.Duration) (*proxyTransports, error) {
+	p := &proxyTransports{items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {
 		clean, isPool := config.ParseProxyEntry(raw)
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -679,6 +706,7 @@ func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHe
 			Timeout:   time.Duration(cfg.ConnectTimeoutSeconds) * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext
+		var proxyURL *url.URL
 		if clean == "direct" {
 			transport.Proxy = nil
 		} else {
@@ -687,14 +715,29 @@ func newTransportPool(proxies []string, cfg config.PerformanceConfig, responseHe
 				return nil, fmt.Errorf("parse proxy %s: %w", config.RedactURL(raw), err)
 			}
 			transport.Proxy = http.ProxyURL(u)
+			proxyURL = u
 		}
-		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, client: &http.Client{Transport: transport}}
+		bun, err := httpx.NewBunTransport(httpx.BunOptions{
+			Proxy:                 proxyURL,
+			ConnectTimeout:        time.Duration(cfg.ConnectTimeoutSeconds) * time.Second,
+			ResponseHeaderTimeout: responseHeaderTimeout,
+			IdleConnTimeout:       transport.IdleConnTimeout,
+			MaxIdleConnsPerHost:   cfg.MaxIdleConnsPerHost,
+			DisableKeepAlives:     isPool,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("proxy %s: %w", config.RedactURL(raw), err)
+		}
+		proxy := &proxyTransport{index: len(p.items), name: raw, pool: isPool, client: &http.Client{Transport: transport}, bun: &http.Client{Transport: bun}}
 		proxy.healthy.Store(true)
 		p.items = append(p.items, proxy)
 	}
 	return p, nil
 }
 
+// proxyHealthResult is the outcome of one health check. failed is set only
+// for a proxy-route failure (see isProxyFailure), and wasHealthy is the
+// healthy flag as it stood before the check updated it.
 type proxyHealthResult struct {
 	proxy      *proxyTransport
 	err        error
@@ -706,7 +749,7 @@ type proxyHealthResult struct {
 // Healthy proxies are skipped before a check is claimed. Any HTTP response
 // from the test URL proves that the route is reachable; only a timeout or
 // connection refusal keeps the proxy unhealthy.
-func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout time.Duration) []proxyHealthResult {
+func (p *proxyTransports) CheckHealth(ctx context.Context, target string, timeout time.Duration) []proxyHealthResult {
 	if p == nil {
 		return nil
 	}
@@ -734,8 +777,11 @@ func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout 
 	return out
 }
 
-// checkClaimedProxy performs a check after the caller has acquired checking.
-func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTransport, target string, timeout time.Duration) proxyHealthResult {
+// checkClaimedProxy sends one GET to target through proxy after the caller
+// has acquired checking, and releases that claim when done. Any HTTP response
+// marks the proxy healthy, a proxy-route failure marks it unhealthy, and any
+// other error leaves the flag as it is.
+func (p *proxyTransports) checkClaimedProxy(ctx context.Context, proxy *proxyTransport, target string, timeout time.Duration) proxyHealthResult {
 	defer proxy.checking.Store(false)
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -762,8 +808,9 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 }
 
 // isProxyFailure deliberately recognizes only failures that say the proxy
-// route is unavailable. HTTP responses and unrelated transport/protocol errors
-// must not evict a proxy.
+// route is unavailable: a timeout or a connection refusal. HTTP responses,
+// timeouts in the first-event wait (the upstream already answered with
+// headers) and unrelated transport/protocol errors must not evict a proxy.
 func isProxyFailure(err error) bool {
 	if errors.Is(err, errFirstEventTimeout) || upstreamAccepted(err) {
 		return false // The upstream accepted HTTP; slow generation is not a broken proxy.
@@ -789,23 +836,27 @@ type upstreamNode struct {
 	cooldownUntil  atomic.Int64
 }
 
-type nodePool struct {
+// upstreamNodes is one tier's key pool. bindingsMu serializes rebinding and
+// guards bindingCount, the number of keys bound to each proxy index; a node's
+// proxyIndex is atomic, so reading a binding needs no lock.
+type upstreamNodes struct {
 	nodes        []*upstreamNode
-	transports   *transportPool
+	transports   *proxyTransports
 	next         atomic.Uint64
 	cooldown     time.Duration
 	bindingsMu   sync.Mutex
 	bindingCount []int
 }
 
-// newNodePool distributes keys over proxies in round-robin order. When there
+// nodePool distributes keys over proxies in round-robin order. When there
 // are fewer keys than proxies, the remaining proxies are intentionally idle and
-// can take over a key immediately if an active proxy fails.
-func newNodePool(keys []string, transports *transportPool, cooldown time.Duration) (*nodePool, error) {
+// can take over a key immediately if an active proxy fails. It needs at least
+// one proxy transport.
+func nodePool(keys []string, transports *proxyTransports, cooldown time.Duration) (*upstreamNodes, error) {
 	if transports == nil || len(transports.items) == 0 {
 		return nil, fmt.Errorf("at least one proxy transport is required")
 	}
-	pool := &nodePool{
+	pool := &upstreamNodes{
 		nodes:        make([]*upstreamNode, 0, len(keys)),
 		transports:   transports,
 		cooldown:     cooldown,
@@ -825,9 +876,10 @@ func newNodePool(keys []string, transports *transportPool, cooldown time.Duratio
 }
 
 // RestoreProxy moves keys that were originally assigned to a recovered proxy
-// back to it. Proxies without an original key simply become healthy failover
-// candidates again.
-func (p *nodePool) RestoreProxy(recoveredProxy int) int {
+// back to it, clearing their failure counts and cooldowns, and returns how
+// many keys moved. Proxies without an original key simply become healthy
+// failover candidates again.
+func (p *upstreamNodes) RestoreProxy(recoveredProxy int) int {
 	if p == nil || p.transports == nil || recoveredProxy < 0 || recoveredProxy >= len(p.transports.items) {
 		return 0
 	}
@@ -852,11 +904,11 @@ func (p *nodePool) RestoreProxy(recoveredProxy int) int {
 	return moved
 }
 
-func (p *nodePool) Len() int { return len(p.nodes) }
+func (p *upstreamNodes) Len() int { return len(p.nodes) }
 
 // NodeByID resolves a node by its stable fingerprint. Callers only ever hold
 // the fingerprint, never the key value, so the lookup cannot leak a secret.
-func (p *nodePool) NodeByID(id string) *upstreamNode {
+func (p *upstreamNodes) NodeByID(id string) *upstreamNode {
 	if p == nil || id == "" {
 		return nil
 	}
@@ -868,7 +920,7 @@ func (p *nodePool) NodeByID(id string) *upstreamNode {
 	return nil
 }
 
-func (p *nodePool) Proxy(node *upstreamNode) *proxyTransport {
+func (p *upstreamNodes) Proxy(node *upstreamNode) *proxyTransport {
 	if p == nil || node == nil || p.transports == nil {
 		return nil
 	}
@@ -882,8 +934,10 @@ func (p *nodePool) Proxy(node *upstreamNode) *proxyTransport {
 // RebindProxy moves every key currently using failedProxy to the least-loaded
 // healthy proxy. Empty proxies are selected in configuration order; otherwise
 // one of the least-loaded proxies is chosen at random. If every alternative is
-// currently unhealthy, it still attempts the least-loaded alternative.
-func (p *nodePool) RebindProxy(failedProxy int) int {
+// currently unhealthy, it still moves the key to the least-loaded alternative.
+// Moved keys start with a clean failure count and cooldown. It returns how
+// many keys moved; with a single proxy there is nowhere to move them.
+func (p *upstreamNodes) RebindProxy(failedProxy int) int {
 	if p == nil || p.transports == nil || len(p.transports.items) < 2 || failedProxy < 0 || failedProxy >= len(p.transports.items) {
 		return 0
 	}
@@ -912,7 +966,12 @@ func (p *nodePool) RebindProxy(failedProxy int) int {
 	return moved
 }
 
-func (p *nodePool) replacementLocked(failedProxy int, healthyOnly bool) int {
+// replacementLocked picks the proxy a key leaving failedProxy moves to: the
+// first proxy in configuration order with no keys bound, otherwise a random
+// one of the least-loaded, considering only healthy proxies when healthyOnly
+// is set. It returns -1 when no proxy qualifies. The caller must hold
+// bindingsMu.
+func (p *upstreamNodes) replacementLocked(failedProxy int, healthyOnly bool) int {
 	minimum := int(^uint(0) >> 1)
 	candidates := make([]int, 0, len(p.transports.items)-1)
 	for i := range p.transports.items {
@@ -938,14 +997,14 @@ func (p *nodePool) replacementLocked(failedProxy int, healthyOnly bool) int {
 }
 
 type nodeCursor struct {
-	pool *nodePool
+	pool *upstreamNodes
 	next int
 }
 
 // Cursor reserves a different starting node for each concurrent request.
 // Selection is delayed until Next, so a node marked failed by the preceding
 // attempt is immediately skipped. Both Cursor and Next allocate no memory.
-func (p *nodePool) Cursor() nodeCursor {
+func (p *upstreamNodes) Cursor() nodeCursor {
 	if len(p.nodes) == 0 {
 		return nodeCursor{pool: p}
 	}
@@ -956,7 +1015,7 @@ func (p *nodePool) Cursor() nodeCursor {
 // affinity key. This keeps every turn in a conversation on the same upstream
 // key while retaining Next's cooldown-aware failover behavior. Empty affinity
 // keys keep the round-robin behavior used by background tasks.
-func (p *nodePool) CursorFor(affinity string) nodeCursor {
+func (p *upstreamNodes) CursorFor(affinity string) nodeCursor {
 	if affinity == "" || len(p.nodes) == 0 {
 		return p.Cursor()
 	}
@@ -965,37 +1024,66 @@ func (p *nodePool) CursorFor(affinity string) nodeCursor {
 	return nodeCursor{pool: p, next: int(hash.Sum64() % uint64(len(p.nodes)))}
 }
 
+// Next chooses an uncooled key on a healthy proxy first, then the earliest
+// cooling key on any healthy proxy. Only when no healthy proxy has a key does
+// it fall back to an uncooled key on an unhealthy proxy, then the earliest
+// cooldown overall. It moves the cursor past the selected node. Unlike
+// anonymousCursor.Next it never returns nil for a non-empty pool and may revisit
+// a node, so callers bound attempts themselves.
 func (c *nodeCursor) Next() *upstreamNode {
 	if c.pool == nil || len(c.pool.nodes) == 0 {
 		return nil
 	}
 	now := time.Now().UnixNano()
-	choice := -1
-	var earliest int64
-	for offset := 0; offset < len(c.pool.nodes); offset++ {
+	ready, healthyReady := -1, -1
+	var earliest, healthyEarliest int64
+	choice, healthyChoice := -1, -1
+	for offset := range len(c.pool.nodes) {
 		i := (c.next + offset) % len(c.pool.nodes)
-		until := c.pool.nodes[i].cooldownUntil.Load()
+		node := c.pool.nodes[i]
+		proxy := c.pool.Proxy(node)
+		healthy := proxy != nil && proxy.healthy.Load()
+		until := node.cooldownUntil.Load()
 		if until <= now {
-			choice = i
-			break
+			if healthy {
+				healthyReady = i
+				break
+			}
+			if ready < 0 {
+				ready = i
+			}
+			continue
 		}
-		if choice == -1 || until < earliest {
+		if healthy && (healthyChoice < 0 || until < healthyEarliest) {
+			healthyChoice, healthyEarliest = i, until
+		}
+		if choice < 0 || until < earliest {
 			choice, earliest = i, until
 		}
 	}
-	if choice < 0 {
+	if healthyReady >= 0 {
+		choice = healthyReady
+	} else if healthyChoice >= 0 {
+		choice = healthyChoice
+	} else if ready >= 0 {
+		choice = ready
+	} else if choice < 0 {
 		return nil
 	}
 	c.next = (choice + 1) % len(c.pool.nodes)
 	return c.pool.nodes[choice]
 }
 
-func (p *nodePool) MarkSuccess(node *upstreamNode) {
+func (p *upstreamNodes) MarkSuccess(node *upstreamNode) {
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
 }
 
-func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err error) {
+// MarkFailure cools node down after an error or a 401, 403, 429 or 5xx
+// response; any other response leaves it untouched. The cooldown doubles with
+// each consecutive failure, from the base cooldown up to 8x, and an upstream
+// Retry-After longer than that is honored in full.
+func (p *upstreamNodes) MarkFailure(node *upstreamNode, resp *http.Response, err error) {
 	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 		return
 	}
@@ -1010,6 +1098,9 @@ func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err erro
 	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
 }
 
+// parseRetryAfter reads a Retry-After header in delta-seconds or HTTP-date
+// form. It returns 0 for an empty, non-positive or unparsable value and for a
+// date already in the past.
 func parseRetryAfter(value string) time.Duration {
 	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds > 0 {
 		return time.Duration(seconds) * time.Second

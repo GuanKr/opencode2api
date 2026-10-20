@@ -397,15 +397,15 @@ func staleStubGateway(t *testing.T) (*Gateway, *sync.Mutex, *[]byte, *atomic.Int
 func newStubGateway(t *testing.T, baseURL string) *Gateway {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	transports, err := newTransportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
+	transports, err := transportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	zenNodes, err := newNodePool(nil, transports, time.Second)
+	zenNodes, err := nodePool(nil, transports, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	goNodes, err := newNodePool(nil, transports, time.Second)
+	goNodes, err := nodePool(nil, transports, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,9 +419,9 @@ func newStubGateway(t *testing.T, baseURL string) *Gateway {
 		transports: transports,
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
-		anonymous:  newAnonymousPool(true, transports, time.Second),
-		catalog:    models.NewCatalog(config.TierZen, nil),
-		monitor:    telemetry.NewMonitor(),
+		anonymous:  anonymousPool(true, transports, time.Second),
+		catalog:    models.Catalog(config.TierZen, nil),
+		monitor:    telemetry.Monitor(),
 	}
 }
 

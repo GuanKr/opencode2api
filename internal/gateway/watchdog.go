@@ -17,6 +17,7 @@ import (
 	"opencode2api/internal/httpx"
 	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
+	"opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/telemetry"
 )
@@ -280,7 +281,7 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 		return result
 	}
 	baseURL := upstreams[0]
-	legacy := isLegacyZenUpstream(baseURL)
+	legacy := models.IsV1Upstream(baseURL)
 	// probePayload routes the body through prepareAnonymousBody, so the probe
 	// carries the forced stream:true and the genuine core tool definitions —
 	// the same agent shape real anonymous traffic sends, which is what the free
@@ -315,7 +316,7 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 	}
 	ctx, cancel := context.WithTimeout(ctx, watchdogProbeTimeout)
 	defer cancel()
-	req, err := newUpstreamRequest(ctx, baseURL, protocol, payload, ids, anonymousZenKey)
+	req, err := upstreamRequest(ctx, baseURL, protocol, payload, ids, anonymousZenKey)
 	if err != nil {
 		result.Verdict = "config"
 		result.Cause = "probe request could not be created"

@@ -25,7 +25,7 @@ func TestModelDisabledAnswers503Not400(t *testing.T) {
 	for _, external := range []wire.Protocol{wire.Chat, wire.Anthropic, wire.SystemOne} {
 		t.Run(string(external), func(t *testing.T) {
 			g, _ := newAnonymousJSONStub(t)
-			store, err := modelcatalog.NewAvailabilityStore(t.TempDir() + "/availability.json")
+			store, err := modelcatalog.AvailabilityStore(t.TempDir() + "/availability.json")
 			if err != nil {
 				t.Fatal(err)
 			}

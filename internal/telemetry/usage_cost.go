@@ -24,7 +24,7 @@ type ModelPrice struct {
 // SetPriceFunc supplies current models.dev prices (USD per 1M tokens) for
 // historical cost estimation. It is set once by RuntimeManager; the function
 // itself reads the metadata store so price updates apply to later records.
-func (m *Monitor) SetPriceFunc(fn func(string) (ModelPrice, bool)) {
+func (m *Metrics) SetPriceFunc(fn func(string) (ModelPrice, bool)) {
 	m.mu.Lock()
 	m.priceFunc = fn
 	m.mu.Unlock()
@@ -42,7 +42,7 @@ func (m *Monitor) SetPriceFunc(fn func(string) (ModelPrice, bool)) {
 // rate. The min clamp only defends against malformed upstream counts
 // (Cached > Input); well-formed data keeps the subset invariant and prices
 // exactly once. Do not "fix" the clamp into an exact-partition assumption.
-func (m *Monitor) usageCostLocked(model string, tokens TokenCounts) (float64, bool) {
+func (m *Metrics) usageCostLocked(model string, tokens TokenCounts) (float64, bool) {
 	if m.priceFunc == nil || model == "" {
 		return 0, false
 	}
@@ -66,7 +66,7 @@ func addCostMap(target map[string]float64, key string, value float64) {
 // recordHourUsage folds one inference request into the current UTC hour bucket.
 // The caller must hold m.mu. Cost uses the price func captured at record time
 // and is returned so Monitor.Record can reuse it for the per-request entry.
-func (m *Monitor) recordHourUsage(now time.Time, endpoint string, meta *RequestMeta, tokens TokenCounts) float64 {
+func (m *Metrics) recordHourUsage(now time.Time, endpoint string, meta *RequestMeta, tokens TokenCounts) float64 {
 	now = now.UTC()
 	hour := now.Truncate(time.Hour).Unix()
 	if m.usageHours == nil {

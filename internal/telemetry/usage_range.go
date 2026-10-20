@@ -249,7 +249,7 @@ func trimCostMap(costs map[string]float64, kept map[string]TokenCounts) map[stri
 }
 
 // UsageRangeExplicit aggregates hourly buckets into Beijing-aligned points.
-func (m *Monitor) UsageRangeExplicit(granularity string, from, to time.Time) (UsageRangeResult, error) {
+func (m *Metrics) UsageRangeExplicit(granularity string, from, to time.Time) (UsageRangeResult, error) {
 	switch granularity {
 	case "hour", "day", "week", "month":
 	default:
@@ -311,7 +311,7 @@ func (m *Monitor) UsageRangeExplicit(granularity string, from, to time.Time) (Us
 
 // UsageRangeCount returns the latest count buckets including the current
 // Beijing bucket, shifted back by offset pages for prev/next navigation.
-func (m *Monitor) UsageRangeCount(granularity string, count, offset int) (UsageRangeResult, error) {
+func (m *Metrics) UsageRangeCount(granularity string, count, offset int) (UsageRangeResult, error) {
 	switch granularity {
 	case "hour", "day", "week", "month":
 	default:

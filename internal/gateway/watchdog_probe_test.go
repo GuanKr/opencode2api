@@ -111,7 +111,7 @@ func addUnreachableTransport(t *testing.T, g *Gateway) {
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
 	}
-	extra, err := newTransportPool([]string{"http://" + address}, config.PerformanceConfig{}, time.Second)
+	extra, err := transportPool([]string{"http://" + address}, config.PerformanceConfig{}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,11 +418,11 @@ func TestWatchdogProbeConfigAnswers(t *testing.T) {
 // traffic).
 func TestNextProbeIgnoresGatesAndVisitsEachNodeOnce(t *testing.T) {
 	// Two loopback-free transports; nothing here is ever dialled.
-	transports, err := newTransportPool([]string{"direct", "direct"}, config.PerformanceConfig{}, time.Second)
+	transports, err := transportPool([]string{"direct", "direct"}, config.PerformanceConfig{}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := newAnonymousPool(true, transports, time.Second)
+	pool := anonymousPool(true, transports, time.Second)
 	if len(pool.nodes) != 2 {
 		t.Fatalf("fixture wants two anonymous nodes, got %d", len(pool.nodes))
 	}

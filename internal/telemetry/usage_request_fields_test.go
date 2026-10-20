@@ -53,7 +53,7 @@ func TestReasoningEffortLabel(t *testing.T) {
 // ring. These were silently dropped when the usage page was ported onto the
 // upstream baseline, which is what left those four columns permanently empty.
 func TestRecordCarriesRequestShapeFields(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.Record("/v1/responses", 200, 1200*time.Millisecond, &RequestMeta{
 		Model: "model-a", Tier: "zen", Request: "req_shape", Channel: "key",
 		Stream: true, ReasoningEffort: "high", FirstByteMS: 180,
@@ -97,7 +97,7 @@ func TestMiddlewareRecordsFirstByteForStreamsOnly(t *testing.T) {
 		{"non-stream", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			monitor := NewMonitor()
+			monitor := Monitor()
 			logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 			handler := Middleware(monitor, logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				time.Sleep(upstreamDelay)
@@ -137,7 +137,7 @@ func TestMiddlewareRecordsFirstByteForStreamsOnly(t *testing.T) {
 // survives restarts; losing them here would empty the columns again after a
 // restart even though live traffic looked fine.
 func TestRequestShapeFieldsSurviveHistoryRoundTrip(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.Record("/v1/messages", 200, 900*time.Millisecond, &RequestMeta{
 		Model: "model-a", Tier: "zen", Request: "req_round", Channel: "key",
 		Stream: true, ReasoningEffort: "max", FirstByteMS: 250,
@@ -147,7 +147,7 @@ func TestRequestShapeFieldsSurviveHistoryRoundTrip(t *testing.T) {
 	if err := monitor.SaveUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
-	restored := NewMonitor()
+	restored := Monitor()
 	if _, err := restored.LoadUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestStreamShapeKeepsAllThreeStates(t *testing.T) {
 	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	monitor := NewMonitor()
+	monitor := Monitor()
 	if _, err := monitor.LoadUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}

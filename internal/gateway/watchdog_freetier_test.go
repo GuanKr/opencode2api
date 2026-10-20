@@ -195,13 +195,13 @@ func TestWatchdogCauseGatePeekKeepsBodyIntact(t *testing.T) {
 // observeGateFailure drives the production wiring for one anonymous failure —
 // the same call doAnonymousUpstream makes for a non-2xx answer — with the
 // response handed to the label producer, and returns the resulting pool.
-func observeGateFailure(t *testing.T, resp *http.Response) (*Gateway, *anonymousPool) {
+func observeGateFailure(t *testing.T, resp *http.Response) (*Gateway, *anonymousNodes) {
 	t.Helper()
-	transports, err := newTransportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
+	transports, err := transportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := newAnonymousPool(true, transports, 15*time.Second)
+	pool := anonymousPool(true, transports, 15*time.Second)
 	g := watchdogTestGateway(transports, pool)
 	freezeProxyHealth(g)
 	g.observeAnonymousResult(context.Background(), pool.nodes[0], resp, nil, "")

@@ -207,7 +207,7 @@ func TestAnonymousCooldownStaysUnderTheCeiling(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pool := &anonymousPool{cooldown: base}
+			pool := &anonymousNodes{cooldown: base}
 			node := &anonymousNode{}
 			node.proxy = &proxyTransport{}
 			node.proxy.healthy.Store(true)

@@ -221,7 +221,7 @@ func TestOutboundDumpStaysSilentWhenDisabled(t *testing.T) {
 // key-lane shaping turns it red instead of leaving it green.
 func TestOutboundDumpRecordsShapedBytesOnTheKeyLane(t *testing.T) {
 	g, buf, sink := dumpTestGateway(t)
-	zen, err := newNodePool([]string{"key-1"}, g.transports, time.Second)
+	zen, err := nodePool([]string{"key-1"}, g.transports, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

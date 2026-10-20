@@ -44,7 +44,7 @@ func TestBeijingDayWeekMonthAlignment(t *testing.T) {
 }
 
 func TestUsageRangeRollupCostAndTopN(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	// Two Beijing days: 09-04 (2 requests) and 09-05 (1 request).
 	h1 := time.Date(2026, 9, 3, 16, 0, 0, 0, time.UTC) // 09-04 00:00 Beijing
 	h2 := time.Date(2026, 9, 4, 16, 0, 0, 0, time.UTC) // 09-05 00:00 Beijing
@@ -78,7 +78,7 @@ func TestUsageRangeRollupCostAndTopN(t *testing.T) {
 	}
 
 	// TopN trimming: 20 models must collapse to 15.
-	big := NewMonitor()
+	big := Monitor()
 	hour := time.Date(2026, 9, 4, 16, 0, 0, 0, time.UTC)
 	bucket := newUsageHourBucket(hour.Unix())
 	for i := 0; i < 20; i++ {
@@ -102,7 +102,7 @@ func TestUsageRangeRollupCostAndTopN(t *testing.T) {
 }
 
 func TestUsageHistorySaveLoadRoundTrip(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.SetPriceFunc(func(string) (ModelPrice, bool) { return ModelPrice{Input: 1, Output: 2, CacheRead: 0.5}, true })
 	hour := time.Now().UTC().Truncate(time.Hour)
 	monitor.mu.Lock()
@@ -114,7 +114,7 @@ func TestUsageHistorySaveLoadRoundTrip(t *testing.T) {
 	}
 	// Permission bits are not asserted here: 0600 is applied through
 	// os.Chmod, which Windows maps to a read-only flag only.
-	restored := NewMonitor()
+	restored := Monitor()
 	if _, err := restored.LoadUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestUsageHistorySaveLoadRoundTrip(t *testing.T) {
 }
 
 func TestUsageRangeValidation(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	if _, err := monitor.UsageRangeExplicit("year", time.Now().Add(-time.Hour), time.Now()); err == nil {
 		t.Fatalf("invalid granularity must fail")
 	}
@@ -143,7 +143,7 @@ func TestUsageRangeValidation(t *testing.T) {
 }
 
 func TestUsageRangeCountIncludesCurrentBucket(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	hour := time.Now().UTC().Truncate(time.Hour)
 	monitor.mu.Lock()
 	monitor.usageHours[hour.Unix()] = testHourBucket(hour, "model-now", "zen", 10, 5, 0.00002)
@@ -165,7 +165,7 @@ func TestUsageRangeCountIncludesCurrentBucket(t *testing.T) {
 }
 
 func TestRecordHourCostFormulaUnknownAndTierSkip(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.SetPriceFunc(func(model string) (ModelPrice, bool) {
 		if model == "model-paid" {
 			// USD per 1M tokens; cache reads priced below the base rate.
@@ -215,7 +215,7 @@ func TestRecordHourCostFormulaUnknownAndTierSkip(t *testing.T) {
 }
 
 func TestRecordHourCacheReadPricing(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.SetPriceFunc(func(string) (ModelPrice, bool) {
 		return ModelPrice{Input: 1, Output: 2, CacheRead: 0.5}, true
 	})
@@ -245,7 +245,7 @@ func TestRecordHourCacheReadPricing(t *testing.T) {
 }
 
 func TestRecordEndpointTokensAndPerRequestUsage(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.SetPriceFunc(func(string) (ModelPrice, bool) { return ModelPrice{Input: 1, Output: 2, CacheRead: 0.5}, true })
 	monitor.Record("/v1/responses", 200, 1500*time.Millisecond, &RequestMeta{
 		Model: "model-a", Tier: "zen", Request: "req_1", Session: "ses_test", KeyID: "abc12", Channel: "key",
@@ -292,7 +292,7 @@ func TestRecordEndpointTokensAndPerRequestUsage(t *testing.T) {
 }
 
 func TestUsageHistoryRecentRequestsRoundTrip(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	// Chronological insertion: the stale head lets Save-side Prune actually
 	// fire instead of passing vacuously through Snapshot filtering.
 	monitor.mu.Lock()
@@ -315,7 +315,7 @@ func TestUsageHistoryRecentRequestsRoundTrip(t *testing.T) {
 	if err := monitor.SaveUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
-	restored := NewMonitor()
+	restored := Monitor()
 	if _, err := restored.LoadUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestUsageHistoryRecentRequestsRoundTrip(t *testing.T) {
 // one-hour response. The ring must not be cut to an hour by the snapshot
 // either — that would destroy the day of history the usage page queries.
 func TestMonitorRequestsStayOnOneHourWindow(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	now := time.Now().UTC()
 	monitor.mu.Lock()
 	monitor.recentRequests.Add(UpstreamRequest{Time: now.Add(-23 * time.Hour), RequestID: "req_23h"})
@@ -372,7 +372,7 @@ func TestMonitorRequestsStayOnOneHourWindow(t *testing.T) {
 // happened, so losing it would freeze the on-disk history forever while
 // every other test still passed.
 func TestSaveAfterTrafficRewritesFile(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.SetPriceFunc(func(string) (ModelPrice, bool) { return ModelPrice{Input: 1, Output: 2, CacheRead: 0.5}, true })
 	path := filepath.Join(t.TempDir(), "config.json.usage.history.json")
 	// First save establishes the file, then it disappears (operator cleanup,
@@ -393,7 +393,7 @@ func TestSaveAfterTrafficRewritesFile(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("save after traffic must rewrite the history file: %v", err)
 	}
-	restored := NewMonitor()
+	restored := Monitor()
 	if _, err := restored.LoadUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +418,7 @@ func TestUsageHistoryRetentionPrune(t *testing.T) {
 	if usageHistoryRetentionDays != 400 {
 		t.Fatalf("usage history must be retained for 400 days, got %d", usageHistoryRetentionDays)
 	}
-	monitor := NewMonitor()
+	monitor := Monitor()
 	now := time.Now().UTC()
 	inside := now.Add(-300 * 24 * time.Hour).Truncate(time.Hour)
 	outside := now.Add(-450 * 24 * time.Hour).Truncate(time.Hour)
@@ -443,7 +443,7 @@ func TestUsageHistoryRetentionPrune(t *testing.T) {
 	if droppedAfterSave {
 		t.Fatal("save must prune a bucket older than the retention window")
 	}
-	restored := NewMonitor()
+	restored := Monitor()
 	if _, err := restored.LoadUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
@@ -469,7 +469,7 @@ func TestUnreadableHistoryFencesSave(t *testing.T) {
 	}
 	defer func() { openHistoryFile = original }()
 
-	monitor := NewMonitor()
+	monitor := Monitor()
 	path := filepath.Join(t.TempDir(), "config.json.usage.history.json")
 	if err := os.WriteFile(path, []byte(`{"version":1,"hours":[]}`), 0600); err != nil {
 		t.Fatal(err)
@@ -498,7 +498,7 @@ func TestUnreadableHistoryFencesSave(t *testing.T) {
 func TestLoadRecoversInterruptedReplace(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json.usage.history.json")
-	written := NewMonitor()
+	written := Monitor()
 	hour := time.Now().UTC().Truncate(time.Hour)
 	written.mu.Lock()
 	written.usageHours[hour.Unix()] = testHourBucket(hour, "model-a", "zen", 1000, 500, 0.002)
@@ -512,7 +512,7 @@ func TestLoadRecoversInterruptedReplace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	monitor := NewMonitor()
+	monitor := Monitor()
 	recovered, err := monitor.LoadUsageHistory(path)
 	if err != nil {
 		t.Fatal(err)
@@ -537,7 +537,7 @@ func TestLoadRecoversInterruptedReplace(t *testing.T) {
 // TestLoadWithoutReplaceStaysEmpty is the negative half of the recovery: a
 // genuinely absent history must still load as empty and must not be fenced.
 func TestLoadWithoutReplaceStaysEmpty(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	path := filepath.Join(t.TempDir(), "config.json.usage.history.json")
 	recovered, err := monitor.LoadUsageHistory(path)
 	if err != nil || recovered {
@@ -551,7 +551,7 @@ func TestLoadWithoutReplaceStaysEmpty(t *testing.T) {
 // TestRequestRingKeepsADayButNotTwo guards the 24h retention window of the
 // request detail: /api/usage serves the day, anything older is pruned.
 func TestRequestRingKeepsADayButNotTwo(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.mu.Lock()
 	monitor.recentRequests.Add(UpstreamRequest{Time: time.Now().UTC().Add(-23 * time.Hour), RequestID: "req_23h"})
 	monitor.recentRequests.Add(UpstreamRequest{Time: time.Now().UTC().Add(-25 * time.Hour), RequestID: "req_25h"})
@@ -580,7 +580,7 @@ func TestLoadCorruptFilePreserved(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{truncated"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	monitor := NewMonitor()
+	monitor := Monitor()
 	if _, err := monitor.LoadUsageHistory(path); err == nil {
 		t.Fatal("corrupt history must fail Load")
 	}
@@ -603,7 +603,7 @@ func TestLoadCorruptFilePreserved(t *testing.T) {
 }
 
 func TestLoadTwiceRefused(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.Record("/v1/responses", 200, 1200*time.Millisecond, &RequestMeta{
 		Model: "model-a", Tier: "zen", Request: "req_first", Channel: "key",
 		UsageReported: true, Usage: protocol.Usage{Input: 100, Output: 50, Total: 150},
@@ -612,7 +612,7 @@ func TestLoadTwiceRefused(t *testing.T) {
 	if err := monitor.SaveUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
-	restored := NewMonitor()
+	restored := Monitor()
 	if _, err := restored.LoadUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +623,7 @@ func TestLoadTwiceRefused(t *testing.T) {
 }
 
 func TestIdleSaveSkipsWrite(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	path := filepath.Join(t.TempDir(), "config.json.usage.history.json")
 	// First save always establishes the file, even with no traffic.
 	if err := monitor.SaveUsageHistory(path); err != nil {
@@ -647,7 +647,7 @@ func TestFailedLoadFencesSave(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{truncated"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	monitor := NewMonitor()
+	monitor := Monitor()
 	if _, err := monitor.LoadUsageHistory(path); err == nil {
 		t.Fatal("corrupt history must fail Load")
 	}

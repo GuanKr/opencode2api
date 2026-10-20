@@ -33,7 +33,7 @@ func TestParseUsageTimeBareFlag(t *testing.T) {
 
 func doUsageRequest(t *testing.T, query string) telemetry.UsageRangeResult {
 	t.Helper()
-	server := &Server{monitor: telemetry.NewMonitor()}
+	server := &Server{monitor: telemetry.Monitor()}
 	req := httptest.NewRequest(http.MethodGet, "/api/usage?"+query, nil)
 	rec := httptest.NewRecorder()
 	server.handleUsage(rec, req)
@@ -90,7 +90,7 @@ func TestHandleUsageRequestShapeFieldsReachTheWire(t *testing.T) {
 	// fields and would pass a struct-level check while emptying the columns.
 	// `session` earned its place here the hard way — it was renamed from
 	// session_id between releases, and only the wire name catches that.
-	monitor := telemetry.NewMonitor()
+	monitor := telemetry.Monitor()
 	monitor.Record("/v1/messages", 200, 900*time.Millisecond, &telemetry.RequestMeta{
 		Model: "model-a", Tier: "zen", Request: "req_wire", Channel: "key",
 		Session: "ses_wire", Stream: true, ReasoningEffort: "high", FirstByteMS: 250,
@@ -171,7 +171,7 @@ func TestHandleUsagePagedFormAndErrors(t *testing.T) {
 		"granularity=day&to=tomorrow",
 		"granularity=hour&count=1000",
 	} {
-		server := &Server{monitor: telemetry.NewMonitor()}
+		server := &Server{monitor: telemetry.Monitor()}
 		req := httptest.NewRequest(http.MethodGet, "/api/usage?"+query, nil)
 		rec := httptest.NewRecorder()
 		server.handleUsage(rec, req)

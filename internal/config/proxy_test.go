@@ -87,7 +87,7 @@ func TestNormalizeAcceptsPoolProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Normalize rejected a pool proxy: %v", err)
 	}
-	redactor := NewSecretRedactor()
+	redactor := SecretRedactor()
 	redactor.Replace(normalized)
 	if got := redactor.String("dial http://user:secret@127.0.0.1:7890 failed"); got != "dial *** failed" {
 		t.Errorf("pool proxy credentials survived redaction: %q", got)

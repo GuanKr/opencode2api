@@ -70,7 +70,7 @@ func newUsageHourBucket(hour int64) *usageHourBucket {
 
 // pruneUsageHoursLocked drops buckets older than the retention window,
 // reporting whether anything was removed. The caller must hold m.mu.
-func (m *Monitor) pruneUsageHoursLocked(now time.Time) bool {
+func (m *Metrics) pruneUsageHoursLocked(now time.Time) bool {
 	cutoff := now.Add(-time.Duration(usageHistoryRetentionDays) * 24 * time.Hour).Truncate(time.Hour).Unix()
 	removed := false
 	for hour := range m.usageHours {
@@ -91,7 +91,7 @@ func UsageHistoryPath(configPath string) string {
 	return configPath + ".usage.history.json"
 }
 
-func (m *Monitor) snapshotUsageHoursLocked() []usageHourBucket {
+func (m *Metrics) snapshotUsageHoursLocked() []usageHourBucket {
 	result := make([]usageHourBucket, 0, len(m.usageHours))
 	for _, bucket := range m.usageHours {
 		clone := usageHourBucket{
@@ -143,7 +143,7 @@ func sortUsageHours(hours []usageHourBucket) {
 // the last save only the cheap retention prune runs and the snapshot,
 // marshal and disk write are skipped. After a failed Load the save is
 // refused outright so an empty monitor never overwrites on-disk history.
-func (m *Monitor) SaveUsageHistory(path string) error {
+func (m *Metrics) SaveUsageHistory(path string) error {
 	if path == "" {
 		return nil
 	}
@@ -242,7 +242,7 @@ var openHistoryFile = os.Open
 // load failure. Load is startup-only into an empty monitor: a second Load
 // (or one racing live traffic) is refused, and a repeated Hour inside one
 // file takes the last entry instead of double-counting.
-func (m *Monitor) LoadUsageHistory(path string) (bool, error) {
+func (m *Metrics) LoadUsageHistory(path string) (bool, error) {
 	if path == "" {
 		return false, nil
 	}
@@ -391,7 +391,7 @@ func (m *Monitor) LoadUsageHistory(path string) (bool, error) {
 // empty file over the top of it. It reports whether a backup was adopted; a
 // backup that exists but cannot be moved back fences the monitor instead of
 // letting the next save strand it.
-func (m *Monitor) recoverReplacedHistory(path string) (bool, error) {
+func (m *Metrics) recoverReplacedHistory(path string) (bool, error) {
 	backup := path + ".replace"
 	if info, err := os.Stat(backup); err != nil || info.IsDir() {
 		return false, nil

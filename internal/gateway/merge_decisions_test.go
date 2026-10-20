@@ -88,13 +88,13 @@ func TestAnonymousLaneOrderDropsDuplicateBase(t *testing.T) {
 
 // mergeDecisionPool builds a one-node anonymous pool and returns it with the
 // node. Nothing is dialled: every D2 case is decided by the skip logic.
-func mergeDecisionPool(t *testing.T) (*anonymousPool, *anonymousNode) {
+func mergeDecisionPool(t *testing.T) (*anonymousNodes, *anonymousNode) {
 	t.Helper()
-	transports, err := newTransportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
+	transports, err := transportPool([]string{"direct"}, config.PerformanceConfig{}, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := newAnonymousPool(true, transports, 10*time.Second)
+	pool := anonymousPool(true, transports, 10*time.Second)
 	if pool.Len() != 1 {
 		t.Fatalf("fixture wants exactly one node, got %d", pool.Len())
 	}

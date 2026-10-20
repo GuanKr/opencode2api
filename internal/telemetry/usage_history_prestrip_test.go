@@ -17,7 +17,7 @@ import (
 // must outlive a save/load of the usage history ring, otherwise the usage
 // page only shows the pre-strip state for as long as the process lives.
 func TestPrestripFlagsSurviveUsageHistoryRoundTrip(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.Record("/v1/responses", 200, 900*time.Millisecond, &RequestMeta{
 		Model: "model-a", Tier: "zen", Request: "req_sel", Session: "ses_sel", Channel: "key",
 		UsageReported: true, Usage: protocol.Usage{Input: 10, Output: 5, Total: 15},
@@ -93,7 +93,7 @@ func TestPrestripFlagsSurviveUsageHistoryRoundTrip(t *testing.T) {
 	if bytes.Contains(raw, []byte("\n  ")) {
 		t.Fatal("usage history must be written compact, not indented (write amplification)")
 	}
-	restored := NewMonitor()
+	restored := Monitor()
 	if _, err := restored.LoadUsageHistory(path); err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestPrestripFlagsSurviveUsageHistoryRoundTrip(t *testing.T) {
 // history written by this build stays byte-compatible with the field set a
 // previous build knew about.
 func TestPrestripFlagsOmittedWhenUnset(t *testing.T) {
-	monitor := NewMonitor()
+	monitor := Monitor()
 	monitor.Record("/v1/responses", 200, 100*time.Millisecond, &RequestMeta{
 		Model: "model-a", Tier: "zen", Request: "req_plain", Channel: "key",
 	})
