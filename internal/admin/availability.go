@@ -5,11 +5,12 @@ import (
 	"opencode2api/internal/httpx"
 )
 
-// handleAvailability lists the free models with their probe state, so the
-// availability page can show which ones are disabled and why.
+// handleAvailability lists the free models with their probe state and
+// advertised context window, so the availability page can show which ones are
+// disabled and why.
 func (a *Server) handleAvailability(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": a.manager.AvailabilitySnapshot()})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": a.manager.AvailabilityReport()})
 }
 
 // handleRestoreModel returns a disabled free model to manual control, which

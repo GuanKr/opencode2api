@@ -54,7 +54,15 @@ type RouteDiagnostic struct {
 	Attempts             int                           `json:"attempts,omitempty"`
 	KeyTiers             []config.Tier                 `json:"key_tiers,omitempty"`
 	AnonymousEligibility AnonymousDecision             `json:"anonymous_eligibility"`
-	RouteError           string                        `json:"route_error,omitempty"`
+	// ContextWindow is the advertised context window to display: the serving
+	// tier's window when a route can be built, otherwise an advertising tier's
+	// window in prefer order so the diagnostics table stays useful before
+	// credentials are configured. That fallback is a display heuristic, not a
+	// routing promise (it does not re-derive the anonymous lane or per-tier
+	// protocol support). It is 0 when no tier advertises the model or neither
+	// metadata source states a limit.
+	ContextWindow int    `json:"context_window,omitempty"`
+	RouteError    string `json:"route_error,omitempty"`
 }
 
 // ModelCatalog knows which models the Zen and Go tiers advertise, their native
@@ -464,13 +472,47 @@ func (c *ModelCatalog) Diagnostic(model string, requested wire.Protocol, hasZenK
 	route, err := c.Route(model, hasZenKeys, hasGoKeys, hasAnonymous)
 	if err != nil {
 		diagnostic.RouteError = err.Error()
+		// No tier serves the model right now, but it may still be advertised:
+		// report an advertised window (prefer order) so the diagnostics table
+		// is not a wall of dashes before keys exist. Informational only — see
+		// the field comment for what this fallback deliberately does not model.
+		diagnostic.ContextWindow = c.contextWindowUnrouted(model, zen, goModel, prefer)
 		return diagnostic
 	}
 	diagnostic.NativeProtocol = route.Protocol
 	diagnostic.NativeProtocols = route.Protocols
 	diagnostic.Tier, diagnostic.Anonymous = route.Tier, route.Anonymous
 	diagnostic.KeyTiers = append([]config.Tier(nil), route.KeyTiers...)
+	// The window must come from the tier that will actually serve the request:
+	// same-named models can advertise different limits on Zen and Go.
+	diagnostic.ContextWindow = c.MetadataForTier(route.ID, route.Tier).ContextWindow
 	return diagnostic
+}
+
+// contextWindowUnrouted picks an advertised window for a model that cannot be
+// routed with the current credentials: the advertising tier in prefer order,
+// falling back to the other advertising tier when the first has no window. It
+// is a display heuristic for RouteError rows only: it does not re-derive the
+// anonymous lane (which starts on Zen regardless of prefer) or per-tier
+// protocol support. It returns 0 for a model no tier advertises.
+func (c *ModelCatalog) contextWindowUnrouted(model string, zen, goModel bool, prefer config.Tier) int {
+	tiers := []config.Tier{config.TierZen, config.TierGo}
+	if prefer == config.TierGo {
+		tiers[0], tiers[1] = tiers[1], tiers[0]
+	}
+	for _, tier := range tiers {
+		advertised := zen
+		if tier == config.TierGo {
+			advertised = goModel
+		}
+		if !advertised {
+			continue
+		}
+		if window := c.MetadataForTier(model, tier).ContextWindow; window > 0 {
+			return window
+		}
+	}
+	return 0
 }
 
 // isFreeModel is the name rule: a model whose ID contains "free" in any case.

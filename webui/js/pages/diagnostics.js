@@ -11,6 +11,7 @@ import {
   el,
   emptyRow,
   formatNumber,
+  formatTokenCount,
   renderFacts,
   timeOnly,
   toast,
@@ -265,6 +266,11 @@ function renderRouteModels() {
           el("td", { class: "mono", text: item.model }),
           el("td", { text: `${item.native_protocol} · ${item.protocol_source}` }),
           el("td", {
+            class: "num",
+            text: formatTokenCount(item.context_window),
+            title: item.context_window ? formatNumber(item.context_window) : null,
+          }),
+          el("td", {
             class: item.route_error ? "bad" : "",
             text: item.route_error || (plan.length ? plan.join(" → ") : "—"),
           }),
@@ -282,7 +288,7 @@ function renderRouteModels() {
         ]),
       );
     });
-  if (!host.children.length) emptyRow(host, 6, t("没有匹配模型", "diag.noMatch"));
+  if (!host.children.length) emptyRow(host, 7, t("没有匹配模型", "diag.noMatch"));
 }
 
 let activeTab = "playground";

@@ -7,17 +7,54 @@ import (
 
 	"time"
 
+	"opencode2api/internal/config"
 	"opencode2api/internal/models"
 )
 
 // AvailabilitySnapshot returns the availability state of every free model in
 // the current runtime's catalog.
 func (m *RuntimeController) AvailabilitySnapshot() []models.Availability {
-	items := []models.Availability{}
 	r := m.current.Load()
 	if r == nil {
-		return items
+		return []models.Availability{}
 	}
+	return availabilityOf(r)
+}
+
+// FreeModelStatus is one free model's probe state plus the context window its
+// anonymous route advertises. The anonymous lane serves free models from the
+// Zen tier, so the window comes from that tier's metadata, with the pricing
+// metadata filling in when the capability catalog omitted the limit; it is 0
+// when neither source states one.
+type FreeModelStatus struct {
+	models.Availability
+	ContextWindow int `json:"context_window,omitempty"`
+}
+
+// AvailabilityReport returns the availability rows of the current runtime with
+// the advertised context window attached, for the operator-facing free model
+// page.
+func (m *RuntimeController) AvailabilityReport() []FreeModelStatus {
+	r := m.current.Load()
+	if r == nil {
+		return []FreeModelStatus{}
+	}
+	rows := availabilityOf(r)
+	items := make([]FreeModelStatus, 0, len(rows))
+	for _, item := range rows {
+		items = append(items, FreeModelStatus{
+			Availability:  item,
+			ContextWindow: r.gateway.catalog.MetadataForTier(item.Model, config.TierZen).ContextWindow,
+		})
+	}
+	return items
+}
+
+// availabilityOf lists the probe state of every free model in r's catalog. It
+// takes the runtime explicitly so a caller cannot pair rows of one runtime with
+// metadata of another.
+func availabilityOf(r *gatewayRuntime) []models.Availability {
+	items := []models.Availability{}
 	for _, model := range r.gateway.catalog.List() {
 		if r.gateway.catalog.IsFreeModel(model) {
 			items = append(items, r.availability.Get(model))

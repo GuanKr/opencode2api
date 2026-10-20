@@ -25,6 +25,17 @@ export function el(tag, props = {}, children = []) {
 
 export const formatNumber = (value) => Number(value || 0).toLocaleString();
 
+// Compact token counts for model limits: 200000 → "200K", 1048576 → "1.05M".
+// Unknown or non-positive values render as an em dash; callers that want the
+// exact count can pass formatNumber(value) as a title tooltip.
+export function formatTokenCount(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count <= 0) return "—";
+  if (count >= 1e6) return `${Number((count / 1e6).toFixed(2))}M`;
+  if (count >= 1e3) return `${Math.round(count / 1e3)}K`;
+  return String(count);
+}
+
 export function localTime(value) {
   return value ? new Date(value).toLocaleString(dateLocale(), { hour12: false }) : "—";
 }

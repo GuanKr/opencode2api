@@ -419,7 +419,7 @@
                   <div>
                     <h2 class="section-title" data-i18n="diagnostics.models.title">模型路由表</h2>
                     <p class="section-caption" data-i18n="diagnostics.models.caption">
-                      显式协议、匿名资格来源与成本判断。
+                      显式协议、上下文长度、匿名资格来源与成本判断。
                     </p>
                   </div>
                   <input
@@ -435,6 +435,7 @@
                       <tr>
                         <th data-i18n="diagnostics.models.col.model">模型</th>
                         <th data-i18n="diagnostics.models.col.protocol">原生协议</th>
+                        <th class="num" data-i18n="diagnostics.models.col.context">上下文长度</th>
                         <th data-i18n="diagnostics.models.col.route">路由</th>
                         <th data-i18n="diagnostics.models.col.eligibility">匿名资格</th>
                         <th data-i18n="diagnostics.models.col.source">判断来源</th>
@@ -930,7 +931,7 @@
                   <div>
                     <h2 class="section-title" data-i18n="availability.title">免费模型探测</h2>
                     <p class="section-caption" data-i18n="availability.desc">
-                      检查名称含 free 或零价未弃用的模型；仅明确失效才禁用并在 24 小时后复测，临时错误不新增禁用。手动控制的模型保持启用，不自动探测。
+                      检查名称含 free 或零价未弃用的模型；仅明确失效才禁用并在 24 小时后复测，临时错误不新增禁用。手动控制的模型保持启用，不自动探测。上下文长度取自模型目录元数据（免费模型按 Zen 层级），与探测结果无关。
                     </p>
                   </div>
                   <button id="availability-refresh" class="btn btn-sm" data-i18n="availability.refresh">
@@ -943,6 +944,7 @@
                     <thead>
                       <tr>
                         <th data-i18n="availability.col.model">模型</th>
+                        <th class="num" data-i18n="availability.col.context">上下文长度</th>
                         <th data-i18n="availability.col.state">状态</th>
                         <th data-i18n="availability.col.channel">通道 / 结果</th>
                         <th data-i18n="availability.col.control">控制</th>

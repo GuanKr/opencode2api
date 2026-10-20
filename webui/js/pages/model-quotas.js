@@ -2,7 +2,7 @@
 import { api, hasSession } from "../api.js";
 import { loadDebugModels } from "../data.js";
 import { t, onChange } from "../i18n.js";
-import { $, bindTabs, copyText, el, emptyRow, localTime } from "../ui.js";
+import { $, bindTabs, copyText, el, emptyRow, formatNumber, formatTokenCount, localTime } from "../ui.js";
 
 const windows = () => [
   ["rolling", t("5 小时窗口", "quotas.window.hour")],
@@ -184,6 +184,11 @@ async function loadAvailability() {
       host.append(
         el("tr", {}, [
           el("td", { class: "mono", text: item.model }),
+          el("td", {
+            class: "num",
+            text: formatTokenCount(item.context_window),
+            title: item.context_window ? formatNumber(item.context_window) : null,
+          }),
           el("td", {
             class: item.disabled ? "warn" : "ok",
             text: item.disabled ? t("已禁用", "state.disabled") : t("已启用", "state.enabled"),

@@ -560,6 +560,10 @@ func (m *RuntimeController) DebugRouteForTier(model string, tier config.Tier) (m
 	diagnostic.Tier, diagnostic.Anonymous = route.Tier, false
 	diagnostic.KeyTiers = []config.Tier{tier}
 	diagnostic.NativeProtocol, diagnostic.NativeProtocols = route.Protocol, route.Protocols
+	// The diagnostic above described the automatic route; the selected key pins
+	// the serving tier, so its window has to be re-read instead of keeping the
+	// auto route's.
+	diagnostic.ContextWindow = gateway.catalog.MetadataForTier(model, route.Tier).ContextWindow
 	return diagnostic, nil
 }
 
