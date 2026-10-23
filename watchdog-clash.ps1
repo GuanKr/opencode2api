@@ -21,11 +21,12 @@
   换节点根本解不开的闸门上）、不写任何池状态（不自造退避、不伪造恢复证据）、并直接回
   机器可读的 verdict（quota/transport/ratelimit/fingerprint/config/ok）。
   网关没有该端点（404）时自动回落旧的 /v1/chat/completions 探针，也可用 -ProbeEndpoint legacy 强制。
-  探针通过即结束，失败则按延迟从低到高试下一个候选，最多 MaxCandidates 个。
-  注意最坏单轮耗时：MaxCandidates(默认40) × VerifyTimeoutSeconds(默认120s) + SwitchGapSeconds ≈ 80 分钟，
-  外加每个候选最多 ProxyReadySeconds(默认5s)+10s（闸门等待里最后一次 status 调用自身带 10s 超时）与候选间 2s 收敛等待：三笔合计真最坏 ≈ 94 分钟；
+  探针通过即结束，失败则按延迟从低到高试下一个候选，最多 MaxCandidates 个(默认120，可用
+  watchdog.json 的 max_candidates 或命令行 -MaxCandidates 改，上限 300)。
+  注意最坏单轮耗时：MaxCandidates(默认120) × VerifyTimeoutSeconds(默认120s) + SwitchGapSeconds ≈ 4 小时，
+  外加每个候选最多 ProxyReadySeconds(默认5s)+10s（闸门等待里最后一次 status 调用自身带 10s 超时）与候选间 2s 收敛等待：三笔合计真最坏 ≈ 4.5 小时；
   刷新后的原地复测另加最多 1 × VerifyTimeoutSeconds（quota 轮现在也计入），刷新本身还有下载+校验+热重载，
-  同步阻塞巡检循环属设计如此（不是卡死），调参前请知悉。
+  同步阻塞巡检循环属设计如此（不是卡死），调参前请知悉。真实故障里失败候选往往秒回错误，不会真跑满这个上界。
   进入切换前先刷新一次订阅(受 RefreshCooldownMinutes 节流，每轮最多 1 次)，
   再基于最新节点列表選取，避免旧列表里只剩高延迟节点可换，
   transport/all_down/节点失效/quota 四类在刷新成功后先等 RefreshSettleSeconds 秒（默认 3），
@@ -54,6 +55,9 @@
 
   筛选规则(对应截图要求，按最新确认)：
     只排除：中国大陆节点 + 流量/到期等信息占位节点 + 自动选择/DIRECT/故障转移这类非叶子；
+    非叶子组现在按 /proxies 里的 type 判定（Selector/URLTest/Fallback/LoadBalance/Relay/
+    Direct/Reject/Compatible/Pass），不再依赖组名恰好等于「自动选择」——带 emoji 的
+    「♻️ 自动选择」以前会漏进候选池，被当成延迟未知的兜底节点试一遍。
     香港/台湾节点已按要求移出排除表——出口 IP 同样是境外 IP，匿名额度按出口 IP 计，
     不构成必须避开的理由；要临时排除见下方 watchdog.json；
     红框内两个占位节点（节点超时…/Gemini解锁请使用VLESS节点）用精确匹配排除，
@@ -62,17 +66,33 @@
     “直连”指机场直连服务器，“境外中转”指经中转入口再出境，只是接入路径不同；
     无国家名的其余节点作为兜底候选排最后（默认选国家节点，不会无声丢弃）；
     地区降权（默认新加坡 +500ms）：延迟低但不稳定的地区只降排序、不排除，保底仍可选；
-    排序：延迟从低到高；当前节点永不复选(换 IP 才有意义)。
+    排序：延迟从低到高（全部候选都没有测速数据时退化为名字序，日志会单独 WARN）；
+    当前节点永不复选(换 IP 才有意义)。
+
+  订阅刷新与本地配置（2026-10-23）：
+    Selector 是 Clash 里的「代理组名」，UID 是 Clash Verge profiles.yaml 里的 profile id。
+    两者都可以写进 watchdog.json（selector / subscription_uid），不必改源码；
+    -SubscriptionUid 留空时自动取 profiles.yaml 的 current:（当前激活的那份配置），
+    所以每次重新导入「opencode2api-节点.yaml」（Verge 每次导入都会生成新 uid）都不用改参数；
+    进程运行中重新导入时，下一次故障切换会重新解析 current: 并自动跟随新 uid。
+    当前配置若是 type: local（没有 url: 行，例如本地生成后拖进 Verge 的 yaml），
+    刷新动作直接跳过并记 INFO：本地文件不会自己变，逐节点切换照常走内核的当前节点列表。
 
   看门狗专用配置文件（-WatchdogConfig，默认脚本同目录 watchdog.json，只读从不写回）：
-  这三项不再需要改脚本源码，直接在配置文件里增删，支持 // 与 /* */ 注释：
+  这些项都不需要改脚本源码，直接在配置文件里增删，支持 // 与 /* */ 注释：
     {
+      "selector": "🚀 节点选择",
+      "subscription_uid": "",
+      "max_candidates": 120,
       "exclude_contains": ["剩余","到期","重置","流量","套餐","官网","中国"],
       "deprioritize": { "contains": ["新加坡"], "penalty_ms": 500 },
       "transport_confirm_rounds": 2
     }
   语义：exclude_contains / deprioritize.contains 是整体替换内置默认值（不是追加），
   [] 即关闭该项；省略的键仍用内置默认值。deprioritize.penalty_ms 省略即用 500。
+  selector 是 Clash 里的代理组名（省略 = 用命令行默认值）；subscription_uid 留空/省略 =
+  自动取 profiles.yaml 的 current:（重新导入配置后不需要改参数）。
+  max_candidates 是单轮最多试多少个候选节点（1-300，省略即 120），等价于命令行 -MaxCandidates。
   transport_confirm_rounds 省略即用 2（1-10 的整数）：网关报 verdict=transport 时需连续
   N 轮仍坏才刷新切换，等价于命令行 -TransportConfirmRounds，-Once 单轮模式忽略它。
   优先级：显式命令行参数 > 配置文件 > 内置默认值——所以临时 -DeprioritizeContains
@@ -80,18 +100,22 @@
   它写错了只能改文件或把 -WatchdogConfig 指向别的路径。
   校验从严：未知键、类型不对（该给数组却给字符串/null、轮数给成字符串或小数）、
   空文件一律报错中止启动，不静默回退默认值——悄悄丢掉排除规则会把节点切到本该避开的
-  地区，比直接报错危险。文件里的值即使被显式命令行参数覆盖也照样校验（只是不生效），
-  免得哪天去掉命令行参数、看门狗才突然起不来。
+  地区，比直接报错危险。selector / subscription_uid / max_candidates /
+  transport_confirm_rounds 即使被显式命令行参数覆盖也照样校验（只是不生效），
+  免得哪天去掉命令行参数、看门狗才突然起不来；deprioritize.* 被覆盖时跳过校验
+  （既有行为，别照上面那句推断）。
   只在启动时读一次，改完 watchdog.json 必须重启看门狗才生效。
   新建文件请从 watchdog.example.json 复制；未创建则全部走内置默认值，行为与从前一致。
 
   本脚本会写的文件(试运行 -DryRun 除外，-DryRun 除运行日志外零写入)：
     - profiles/<uid>.yaml        订阅刷新时覆盖(先备份 .bak-yyyyMMdd-HHmmss)
     - profiles.yaml              订阅刷新时更新 extra/updated；每次切换成功后更新 selected.now
+                                 （首次切换时该 profile 还没有 selected 块，会补写一块）
     - clash-verge.yaml           订阅刷新时同步 proxies/proxy-groups/rules 等节(先备份)
     - .tmp/clash-watchdog.log    运行日志(密钥/订阅 token 自动脱敏)
   只读不写的文件：
-    - watchdog.json              看门狗专用配置(排除/降权/transport 确认轮数)，默认取脚本同目录，-WatchdogConfig 可改路径
+    - watchdog.json              看门狗专用配置(selector/uid/候选上限/排除/降权/transport 轮数)，
+                                 默认取脚本同目录，-WatchdogConfig 可改路径
     - config.json                只读 server_keys[0]
 
   密钥来源(绝不落盘、不打印)：Clash secret 从 clash-verge.yaml 读取；
@@ -99,15 +123,34 @@
 
 .PARAMETER DryRun
   只读试运行：打印看门狗快照（verdict/cause）、候选排名 Top10、订阅差异预览，除运行日志外不写任何配置文件、不切换、不验证(零网关配额消耗，订阅下载仍耗机场流量)。
+  当前配置若是本地文件（type: local，无 url:），订阅差异预览自动跳过，只打印候选与 selected 检查。
+
+.PARAMETER Selector
+  Clash 里的代理组名（默认「🚀 节点选择」）。看门狗只在这个组里换节点，
+  所以它必须与当前激活配置的 proxy-groups 名称一致；也可用 watchdog.json 的
+  selector 覆盖（命令行显式传参优先）。
+
+.PARAMETER SubscriptionUid
+  Clash Verge profiles.yaml 里的 profile uid（决定刷新哪份配置、selected.now 写到哪）。
+  留空（默认）= 自动取 profiles.yaml 的 current:，即当前激活的那份；
+  每次重新导入本地 yaml 都会生成新 uid，留空就不必改参数；运行中重新导入时，
+  下一次故障切换会重新解析 current: 并跟随新 uid（不必重启看门狗）。
+  解析不出来时只跳过「刷新 + selected 记录」，逐节点切换照常。
+
+.PARAMETER MaxCandidates
+  单轮最多试多少个候选节点（默认 120，范围 1-300）。节点池比它小就整池试一遍。
+  也可用 watchdog.json 的 max_candidates 覆盖（命令行显式传参优先）。
+  注意最坏耗时随它线性增长（见 .DESCRIPTION）。
 
 .PARAMETER WatchdogConfig
   看门狗专用配置文件路径，默认脚本同目录 watchdog.json。文件不存在即全部用内置默认值；
-  存在则用其中的 exclude_contains（子串排除）、deprioritize（地区降权）与
+  存在则用其中的 selector（代理组名）、subscription_uid（profile uid，空=自动）、
+  max_candidates（候选上限）、exclude_contains（子串排除）、deprioritize（地区降权）与
   transport_confirm_rounds（transport 连续确认轮数）覆盖对应内置默认值，
-  省略的键不受影响。deprioritize 的两个键与 transport_confirm_rounds 在显式传同名命令行参数时
-  以命令行优先（-DeprioritizeContains / -DeprioritizePenaltyMs / -TransportConfirmRounds），
-  但文件里的值照样先校验（写错就报错中止启动，只是不生效），
-  exclude_contains 没有对应参数、写错只能改文件或换路径。只在启动时读一次，改完需重启看门狗。
+  省略的键不受影响。除 exclude_contains 外，其余键在显式传同名命令行参数时以命令行优先
+  （selector / subscription_uid / max_candidates / transport_confirm_rounds 被覆盖也照样
+  先校验，写错会中止启动；deprioritize.* 被覆盖时跳过校验，属既有行为）。
+  只在启动时读一次，改完需重启看门狗。
 
 .PARAMETER ProbeEndpoint
   验证探针走哪条通道。auto（默认）= 打网关的 POST /v1/watchdog/probe：它保证请求真的发到上游
@@ -143,14 +186,15 @@
 param(
   [string]$ClashBase = 'http://127.0.0.1:9097',
   [string]$ClashSecret = '',
-  [string]$Selector = '渔云CloudFisher',
+  [string]$Selector = '🚀 节点选择',
   [string]$GatewayBase = 'http://127.0.0.1:19880',
   [string]$GatewayKey = '',
   [string]$VerifyModel = 'big-pickle',
   [ValidateRange(5, 300)][int]$PollSeconds = 15,
-  # 候选上限：默认 40（2026-10-17 由 20 上调）；上限 60 只挡明显笔误，别按「默认+5」
-  # 收回——实测当前订阅候选池 44 个，45 会让「显式试完整池」的覆盖立刻被拒。
-  [ValidateRange(1, 60)][int]$MaxCandidates = 40,
+  # 候选上限：默认 120（2026-10-23 由 40 上调；当前本地配置 100 个节点 + 组名等，
+  # 120 覆盖整池还留余量）。上限 300 只挡明显笔误；也可用 watchdog.json 的
+  # max_candidates 覆盖，命令行显式传参优先。
+  [ValidateRange(1, 300)][int]$MaxCandidates = 120,
   [ValidateRange(0, 300)][int]$SwitchGapSeconds = 15,
   [ValidateRange(5, 600)][int]$VerifyTimeoutSeconds = 120,
   # 探针通道。auto = 优先打网关的 /v1/watchdog/probe：它保证请求真的发到上游
@@ -163,7 +207,10 @@ param(
   # 只在闸门确实关着时才花时间，0 = 不等。探针本身已经能穿透闸门，所以这一项
   # 只是少误伤、少烧配额，不是探针能发出去的前提。
   [ValidateRange(0, 30)][int]$ProxyReadySeconds = 5,
-  [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$SubscriptionUid = 'RYni6JpVUPX8',
+  # profile uid：决定刷新哪份 profile、selected.now 写到哪个条目。
+  # 留空 = 启动时自动取 profiles.yaml 的 current:（重新导入本地 yaml 会换 uid，
+  # 留空就不必每次改参数）；显式传入则按传入值。
+  [ValidatePattern('^[A-Za-z0-9_-]*$')][string]$SubscriptionUid = '',
   [string]$SubscriptionUA = 'clash-verge/v2.5.2',
   [int]$RefreshCooldownMinutes = 5,
   [int]$RoundCooldownMinutes = 2,
@@ -216,6 +263,13 @@ $script:GatewayBase = $GatewayBase.TrimEnd('/')
 $script:GatewayKey = $GatewayKey
 $script:VerifyModel = $VerifyModel
 $script:ProbeEndpoint = $ProbeEndpoint
+# 候选上限与 profile uid：param 绑定值起步，watchdog.json 可覆盖（命令行显式传参优先）。
+# uid 为空时在启动块里自动解析为 profiles.yaml 的 current:。
+$script:MaxCandidates = $MaxCandidates
+$script:SubscriptionUid = $SubscriptionUid
+# uid 是否来自「自动跟随 current:」。启动块里会按生效 uid（命令行/watchdog.json）重算：
+# 显式钉死的 uid 失效时必须报错，不能悄悄改成去刷新/覆盖当前激活 profile。
+$script:UidAuto = $true
 # 运行时可降级：探针端点 404 一次就把本进程永久切回旧探针，不必每轮再试。
 $script:ProbeSupported = ($ProbeEndpoint -ne 'legacy')
 $script:ProxyReadySeconds = $ProxyReadySeconds
@@ -233,6 +287,11 @@ $script:ExcludeExact = @('自动选择', '故障转移', 'DIRECT', 'COMPATIBLE',
   # 以下两个是红框内的信息占位节点（与真实节点同服同口，靠名字区分），必须精确排除：
   # 用精确匹配而不用子串，是为了不误杀 VLESS-美国01 / Gemini解锁类真实命名。
   '节点超时请手动更新订阅', 'Gemini解锁请使用VLESS节点')
+# 非叶子组的 mihomo type（/proxies 里每个条目的 type 字段）。组名不可靠——本地这份
+# 「🚀 节点选择」的候选里就带着「♻️ 自动选择」，精确匹配 '自动选择' 命不中它，
+# 它会以兜底候选身份被切换循环试一遍。按 type 排除才是稳的。
+$script:GroupTypes = @('Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Relay', 'Smart',
+  'Direct', 'Reject', 'RejectDrop', 'Compatible', 'Pass')
 # 只排除流量/到期/官网类信息占位节点 + 中国大陆节点。
 # 注意：香港/台湾节点已按要求移出排除表（它们的出口 IP 同样是境外 IP，匿名额度按出口
 # 计，不构成必须避开的理由）；要临时排除请用 watchdog.json 的 exclude_contains 追加。
@@ -250,7 +309,16 @@ $script:CountryHints = @('日本', '新加坡', '美国', '德国', '英国', '�
   '澳大利亚', '墨西哥', '以色列', '南非', '阿联酋', '迪拜', '印度', '孟买', '沙特',
   '巴西', '智利', '哥伦比亚', '菲律宾', '泰国', '韩国', '马来', '印尼', '越南',
   '俄罗斯', '荷兰', '意大利', '瑞典', '挪威', '芬兰', '土耳其', '阿根廷', '新西兰', '爱尔兰',
-  '香港', '台湾')
+  '香港', '台湾',
+  # 2026-10-23 补齐：本地 opencode2api 节点池实际用到的国家词。缺一个就会让整批节点
+  # 静默掉进 900000+ 兜底桶（排在所有国家节点之后，约等于「加了但不优先选」）——
+  # 黑山 7 个、波兰 6 个、拉脱维亚 3 个、亚美尼亚 1 个曾整批被压后。
+  '黑山', '波兰', '拉脱维亚', '亚美尼亚',
+  # 常见但此前未列出的，避免换一份订阅又要来补：欧洲/中亚/南亚/东南亚。
+  '立陶宛', '爱沙尼亚', '捷克', '奥地利', '罗马尼亚', '保加利亚', '乌克兰', '塞尔维亚',
+  '克罗地亚', '斯洛文尼亚', '匈牙利', '希腊', '葡萄牙', '比利时', '丹麦', '卢森堡', '冰岛',
+  '摩尔多瓦', '白俄罗斯', '哈萨克斯坦', '巴基斯坦', '孟加拉', '斯里兰卡', '尼泊尔',
+  '柬埔寨', '缅甸', '老挝', '蒙古', '埃及', '摩洛哥', '尼日利亚', '肯尼亚')
 $script:SyncKeys = @('proxies', 'proxy-providers', 'proxy-groups', 'rules', 'rule-providers')
 
 function Write-WdLog {
@@ -439,7 +507,10 @@ function Strip-JsonComments {
 function Read-WatchdogConfig {
   # 看门狗专用配置文件（默认 watchdog.json，与 config.json 同目录）。
   # 支持 // 与 /* */ 注释（与 config.json 同一套 Strip-JsonComments 语义）。
-  # 只认三个键，都可整段省略，省略即用内置默认值：
+  # 只认以下键，都可整段省略，省略即用内置默认值：
+  #   selector                      代理组名（Clash /proxies 里的组，决定在哪个组里换节点）
+  #   subscription_uid              profile uid；空字符串 = 自动取 profiles.yaml 的 current:
+  #   max_candidates                单轮候选上限（1-300）
   #   exclude_contains              子串排除：节点名含任一子串即丢弃（整体替换内置默认值；
   #                                 [] = 关闭子串排除；内置精确排除表不受此键影响）
   #   deprioritize.contains         地区降权关键词（整体替换内置默认值；[] = 关闭）
@@ -478,9 +549,9 @@ function Read-WatchdogConfig {
     # （exclude-contains / penalty / 尾随空格）若静默忽略，看门狗会照常以内置默认值
     # 跑起来，用户却以为自己的排除/降权规则生效了。
     $unknownTop = @(@($cfg.PSObject.Properties | ForEach-Object { $_.Name }) |
-      Where-Object { @('exclude_contains', 'deprioritize', 'transport_confirm_rounds') -notcontains $_ })
+      Where-Object { @('selector', 'subscription_uid', 'max_candidates', 'exclude_contains', 'deprioritize', 'transport_confirm_rounds') -notcontains $_ })
     if ($unknownTop.Count -gt 0) {
-      throw "看门狗配置文件 [$Path] 含未知键：$($unknownTop -join ' / ')，只支持 exclude_contains、deprioritize、transport_confirm_rounds"
+      throw "看门狗配置文件 [$Path] 含未知键：$($unknownTop -join ' / ')，只支持 selector、subscription_uid、max_candidates、exclude_contains、deprioritize、transport_confirm_rounds"
     }
   }
   if (-not $existed) { Write-WdLog "未找到看门狗配置文件 [$Path]，子串排除、地区降权与 transport 连续确认轮数均用内置默认值" 'INFO'; return }
@@ -496,6 +567,62 @@ function Read-WatchdogConfig {
   $seen = 0
   $covered = 0
   $applied = 0
+  if (Test-HasKey $cfg 'selector') {
+    $seen++
+    $rawSel = Get-Prop $cfg 'selector'
+    # 必须是字符串：写成数字/数组时若静默转成 "System.Object[]"，selector 只会永远
+    # 404 空转，报错中止启动才看得见。
+    if (-not ($rawSel -is [string]) -or [string]::IsNullOrWhiteSpace($rawSel)) {
+      throw "看门狗配置 selector 非法：[$rawSel]（必须是非空字符串，如 `"🚀 节点选择`"）"
+    }
+    if ($script:ExplicitParams -contains 'Selector') {
+      $covered++
+      Write-WdLog '命令行已显式传 -Selector，配置文件的 selector 不生效' 'INFO'
+    } else {
+      $script:Selector = ([string]$rawSel).Trim()
+      $applied++
+      Write-WdLog "配置生效：selector = $($script:Selector)"
+    }
+  }
+  if (Test-HasKey $cfg 'subscription_uid') {
+    $seen++
+    $rawUid = Get-Prop $cfg 'subscription_uid'
+    if (-not ($rawUid -is [string])) {
+      throw "看门狗配置 subscription_uid 非法：[$rawUid]（必须是字符串；留空 '' 表示自动取 profiles.yaml 的 current:）"
+    }
+    $uid = ([string]$rawUid).Trim()
+    if ($uid -ne '' -and $uid -notmatch '^[A-Za-z0-9_-]+$') {
+      throw "看门狗配置 subscription_uid 非法：[$uid]（只允许字母数字下划线短横，或留空表示自动）"
+    }
+    if ($script:ExplicitParams -contains 'SubscriptionUid') {
+      $covered++
+      Write-WdLog '命令行已显式传 -SubscriptionUid，配置文件的 subscription_uid 不生效' 'INFO'
+    } else {
+      $script:SubscriptionUid = $uid
+      $applied++
+      if ($uid -eq '') { Write-WdLog '配置生效：subscription_uid 为空 → 自动取当前激活 profile' }
+      else { Write-WdLog "配置生效：subscription_uid = $uid" }
+    }
+  }
+  if (Test-HasKey $cfg 'max_candidates') {
+    $seen++
+    $rawMax = Get-Prop $cfg 'max_candidates'
+    # 与 transport_confirm_rounds 同一口径：只收 JSON 整数，字符串 "120" / 浮点 120.0 一律拒。
+    if (-not ($rawMax -is [int] -or $rawMax -is [long])) {
+      $typeName = if ($null -eq $rawMax) { 'null' } else { $rawMax.GetType().Name }
+      throw "看门狗配置 max_candidates 非法：[$rawMax]（类型 $typeName；必须是 1-300 的整数，不要加引号）"
+    }
+    # 区间必须与命令行的 ValidateRange(1,300) 一致，否则文件能写出命令行拒绝的组合。
+    if ($rawMax -lt 1 -or $rawMax -gt 300) { throw "看门狗配置 max_candidates 越界：[$rawMax]（应为 1-300）" }
+    if ($script:ExplicitParams -contains 'MaxCandidates') {
+      $covered++
+      Write-WdLog '命令行已显式传 -MaxCandidates，配置文件的 max_candidates 不生效' 'INFO'
+    } else {
+      $script:MaxCandidates = [int]$rawMax
+      $applied++
+      Write-WdLog "配置生效：max_candidates = $($script:MaxCandidates)"
+    }
+  }
   if (Test-HasKey $cfg 'exclude_contains') {
     $seen++
     $list = ConvertTo-StrList (Get-Prop $cfg 'exclude_contains') 'exclude_contains'
@@ -713,12 +840,16 @@ function Get-RankedCandidates {
     $name = $prop.Name
     if ($SelectorAll -ne $null -and @($SelectorAll) -notcontains $name) { continue }
     if ($name -eq $ExcludeNow) { continue }
+    $node = $prop.Value
+    # 非叶子组按 type 排除：组名换成「♻️ 自动选择」「🇺🇸 美国节点」都拦得住。
+    $nodeType = ''
+    try { $nodeType = [string](Get-Prop $node 'type') } catch { }
+    if ($script:GroupTypes -contains $nodeType) { $dropped += "$name（非叶子组 $nodeType）"; continue }
     $reason = ''
     if (-not (Test-NodeEligible $name ([ref]$reason))) {
       if ($reason -ne '') { $dropped += "$name（$reason）" }
       continue
     }
-    $node = $prop.Value
     $alive = $false
     try { $alive = [bool](Get-Prop $node 'alive') } catch { $alive = $false }
     $delay = -1
@@ -1070,23 +1201,75 @@ function Update-SelectedNow {
   $next = $text.IndexOf("$eol- uid:", $start)
   if ($next -lt 0) { $next = $text.Length }
   $block = $text.Substring($start, $next - $start)
+  $safe = $Name
+  if ($safe -match '[:#''"]|^\s|\s$') { $safe = "'" + ($safe -replace "'", "''") + "'" }
   # uid 块下可能有多个 proxy-group 各带一个 now:（Verge 常见），必须锚定到
   # “- name: <Selector>”之后、下一个“- name:”之前的 now:，不能取块内第一个。
   $selName = [regex]::Escape($script:Selector)
   $m = [regex]::Match($block, "(?ms)^\s*-\s*name:\s*['""]?$selName['""]?\s*\r?\n(.*?)^\s*now:\s*(.*?)(\r?)$")
-  if (-not $m.Success) { throw "profiles.yaml 里找不到 selector [$($script:Selector)] 的 now: 行，拒绝写入" }
-  $old = $m.Groups[2].Value.Trim()
-  $safe = $Name
-  if ($safe -match '[:#''"]|^\s|\s$') { $safe = "'" + ($safe -replace "'", "''") + "'" }
-  $nowStart = $m.Groups[2].Index - $m.Index
-  $nowLen = $m.Groups[2].Length
-  $newBlock = $block.Substring(0, $m.Index + $nowStart) + $safe + $block.Substring($m.Index + $nowStart + $nowLen)
+  if ($m.Success) {
+    $old = $m.Groups[2].Value.Trim()
+    $nowStart = $m.Groups[2].Index - $m.Index
+    $nowLen = $m.Groups[2].Length
+    $newBlock = $block.Substring(0, $m.Index + $nowStart) + $safe + $block.Substring($m.Index + $nowStart + $nowLen)
+    $logMsg = "profiles.yaml selected 已更新：$old -> now: $Name"
+  } else {
+    # 没有本组的 now: 行。分两种情况，绝不能盲目补一块 selected:——
+    # Verge 用 serde 解析 profiles.yaml，同一个 profile 里出现两个 selected: 键会报
+    # duplicate field，整份 profiles.yaml 加载失败（所有 profile 一起丢），而且我们
+    # 是 WriteAllText 直接落盘、不会抛异常，属于静默写坏。
+    $selLit = $script:Selector
+    if ($selLit -match '[:#''"]|^\s|\s$') { $selLit = "'" + ($selLit -replace "'", "''") + "'" }
+    # 行尾用 lookahead 判界、不吃 \r：CRLF 文件里 `[ \t]*$` 撞上 \r 会整行匹配失败，
+    # 于是掉到第三层再补一块 selected:，写出重复键。rest 用来识别 [] / 行尾注释等形态。
+    $selKey = [regex]::Match($block, '(?m)^(?<ind>[ \t]*)selected:(?<rest>[^\r\n]*?)[ \t]*(?=\r?$)')
+    if ($selKey.Success) {
+      $ind = $selKey.Groups['ind'].Value
+      $rest = $selKey.Groups['rest'].Value.Trim()
+      if ($rest -ne '' -and $rest -ne '[]') {
+        # 例如 `selected: # 注释` 或 flow 写法：不认识就别动，宁可拒绝也不写重复键。
+        throw "profiles.yaml 的 selected: 不是空列表也不是 block 列表（[$(Shorten $rest 80)]），拒绝改写"
+      }
+      # 已有 selected:（例如先在 Verge UI 里切过别的组）→ 在列表头部追加一项。
+      # 插在 `selected:` 行之后即可：indentless sequence 允许第一项紧跟 key。
+      # 若紧跟的下一项用了别的缩进（手写文件），跟随它，避免同列表缩进不一致。
+      $nextItem = [regex]::Match($block.Substring($selKey.Index + $selKey.Length), '^\r?\n(?<ii>[ \t]*)- ')
+      $itemInd = if ($nextItem.Success) { $nextItem.Groups['ii'].Value } else { $ind }
+      $itemText = $eol + $itemInd + '- name: ' + $selLit + $eol + $itemInd + '  now: ' + $safe
+      if ($rest -eq '[]') {
+        # selected: [] → 展开成列表（连 [] 一起替换，否则会写成 `selected: []- name:`）
+        $replacement = $ind + 'selected:'
+        $newBlock = $block.Substring(0, $selKey.Index) + $replacement + $itemText + $block.Substring($selKey.Index + $selKey.Length)
+      } else {
+        $insertAt = $selKey.Index + $selKey.Length
+        $newBlock = $block.Substring(0, $insertAt) + $itemText + $block.Substring($insertAt)
+      }
+      $logMsg = "profiles.yaml 的 selected 已有其他组，追加 $($script:Selector) -> now: $Name"
+    } else {
+      # 连 selected: 都没有（本地配置首次导入时 Verge 还没写过）→ 在 updated: 后补一块。
+      # 写法跟随 Verge：selected: 与 - name: 同级（indentless sequence），缩进沿用
+      # 块内 updated: 的缩进。行尾用 lookahead 判界、不吃 \r：否则 CRLF 文件要么匹配
+      # 不上（[ \t]*$ 撞 \r），要么多吃一个 \r 再拼 $eol 而多出空行。
+      $anchor = [regex]::Match($block, '(?m)^(?<ind>[ \t]*)updated:[ \t]*\d+[ \t]*(?=\r?$)')
+      $ind = '  '
+      if ($anchor.Success) {
+        $ind = $anchor.Groups['ind'].Value
+        $insertAt = $anchor.Index + $anchor.Length
+      } else {
+        if (-not $block.EndsWith($eol)) { $block += $eol }
+        $insertAt = $block.Length
+      }
+      $insert = $eol + $ind + 'selected:' + $eol + $ind + '- name: ' + $selLit + $eol + $ind + '  now: ' + $safe
+      $newBlock = $block.Substring(0, $insertAt) + $insert + $block.Substring($insertAt)
+      $logMsg = "profiles.yaml 尚无 selected 块，已补写：$($script:Selector) -> now: $Name"
+    }
+  }
   $newText = $text.Substring(0, $start) + $newBlock + $text.Substring($next)
   # 先写临时文件再原子替换，避免中途崩溃撕裂 profiles.yaml。
   $tmp = "$profilesYaml.tmp"
   [IO.File]::WriteAllText($tmp, $newText, (New-Object Text.UTF8Encoding $false))
   Move-Item -LiteralPath $tmp -Destination $profilesYaml -Force
-  Write-WdLog "profiles.yaml selected 已更新：$old -> now: $Name"
+  Write-WdLog $logMsg
 }
 
 function Switch-ClashNode {
@@ -1103,7 +1286,22 @@ function Switch-ClashNode {
       Invoke-WebRequest -Uri ($script:ClashBase + '/connections') -Method Delete `
         -Headers @{ Authorization = "Bearer $(Resolve-ClashSecret)" } -TimeoutSec 10 -UseBasicParsing | Out-Null
     } catch { }
-    Update-SelectedNow -Name $Name -Uid $Uid
+    # 切换已成功（内核 2xx），profiles.yaml 的 selected 只是让 Verge UI/下次重载
+    # 记得这个选择：它失败不能把候选判成失败、更不能中断候选循环。
+    # uid 为空（启动时没解析出来）就直接跳过；uid 失效（运行中重新导入了 yaml）
+    # 时按签名只报一次——否则一轮 100 个候选会刷 100 条同样的 WARN。
+    if (-not [string]::IsNullOrWhiteSpace($Uid)) {
+      try {
+        Update-SelectedNow -Name $Name -Uid $Uid
+        $script:SelectedWarnSig = ''
+      } catch {
+        $sig = "$Uid|$($_.Exception.Message)"
+        if ($script:SelectedWarnSig -ne $sig) {
+          $script:SelectedWarnSig = $sig
+          Write-WdLog "已切到 [$Name]，但 profiles.yaml 的 selected 记录失败（不影响本轮切换）：$($_.Exception.Message)。若是重新导入过 yaml，下一轮会跟随新的 current: uid" 'WARN'
+        }
+      }
+    }
     return $true
   }
   Write-WdLog "切换接口返回异常状态码：$code" 'WARN'
@@ -1122,6 +1320,28 @@ function Get-ProfileBlock {
   $next = $text.IndexOf("$eol- uid:", $start)
   if ($next -lt 0) { $next = $text.Length }
   return @{ Path = $profilesYaml; Text = $text; Start = $start; End = $next; Block = $text.Substring($start, $next - $start) }
+}
+
+function Resolve-ActiveProfileUid {
+  # 从 profiles.yaml 的 current: 读当前激活 profile 的 uid。
+  # 为什么要自动解析：Clash Verge 每次「拖入本地 yaml」都会新建一个 uid（本地这份
+  # opencode2api-节点.yaml 已换过好几轮），把 uid 写死在脚本里，重新导入一次就静默失联
+  # （refresh 找不到 uid、selected.now 写不进去，而 selector 恰好还在的话看门狗仍会切换，
+  # 只是每次切换都在后台刷一条失败日志）。留空即跟随当前激活配置，导入多少次都不用改。
+  $profilesYaml = Join-Path $script:VergeRoot 'profiles.yaml'
+  if (-not (Test-Path -LiteralPath $profilesYaml)) { throw "找不到 Clash Verge 的 profiles.yaml：$profilesYaml" }
+  $text = [IO.File]::ReadAllText($profilesYaml, [Text.Encoding]::UTF8)
+  $m = [regex]::Match($text, '(?m)^\s*current:\s*(?<u>[A-Za-z0-9_-]+)\s*$')
+  if (-not $m.Success) { throw 'profiles.yaml 里没有 current: 行，无法自动定位当前激活配置；请用 -SubscriptionUid 显式指定' }
+  return $m.Groups['u'].Value
+}
+
+function Get-ProfileType {
+  # profile 条目的 type: remote / local / merge / script。只用于日志与「跳过刷新」判定。
+  param([string]$Block)
+  $m = [regex]::Match($Block, '(?m)^\s*type:\s*(?<t>\S+)\s*$')
+  if ($m.Success) { return $m.Groups['t'].Value }
+  return ''
 }
 
 function Get-SubscriptionUrl {
@@ -1259,6 +1479,65 @@ function Get-SubscriptionYaml {
 
 function Refresh-Subscription {
   param([string]$Uid, [string]$UaOverride = $null, [switch]$Force)
+  # 本地 profile（type: local，没有 url: 行）没有可刷新的远端内容：直接跳过，不当失败。
+  # 本地 yaml 是生成脚本产出的静态文件，刷新只会白跑一次「找不到订阅地址」；节点池
+  # 以内核当前列表为准，逐节点切换完全不受影响。返回 Skipped 让 Invoke-Failover 记
+  # INFO 而不是 ERROR，也不写失败退避（没有网络失败可言）。
+  # uid 为空（启动时 profiles.yaml 还读不出来）时在这里重试解析；自动跟随的 uid 失效
+  # （运行中重新导入 yaml 换了新 uid）时跟随 current:，并把新 uid 回传给本轮切换用。
+  # 这一段排在节流之前：节流只该挡「下载」，不该把 uid 修正也一起挡掉。
+  if ([string]::IsNullOrWhiteSpace($Uid)) {
+    try {
+      $Uid = Resolve-ActiveProfileUid
+      $script:SubscriptionUid = $Uid
+      Write-WdLog "uid 为空，已跟随当前激活配置：$Uid"
+    } catch {
+      return @{ Ok = $false; Skipped = $true; Error = '无法定位当前激活 profile，跳过刷新与 selected 记录' }
+    }
+  }
+  $profileType = ''
+  $hasUrl = $false
+  # 自动跟随模式下每次 failover 都对一次 current:（一次小文件读，failover 频率很低）：
+  # 只靠「旧 uid 消失」不够——在 Verge UI 切到另一份**已存在**的 profile 时旧 uid 还在，
+  # current 却已经变了。钉死模式不做这一步。
+  if ($script:UidAuto) {
+    try {
+      $curUid = Resolve-ActiveProfileUid
+      if ($curUid -ne $Uid) {
+        Write-WdLog "当前激活配置已变为 $curUid（原 $Uid），本轮跟随" 'INFO'
+        $Uid = $curUid
+        $script:SubscriptionUid = $curUid
+      }
+    } catch { }
+  }
+  try {
+    $blk = Get-ProfileBlock -Uid $Uid
+  } catch {
+    if (-not $script:UidAuto) {
+      # 显式钉死的 uid（CLI / watchdog.json）失效：报错，绝不悄悄改去刷新当前激活 profile。
+      return @{ Ok = $false; Error = "钉死的 uid [$Uid] 在 profiles.yaml 里不存在（检查 subscription_uid / -SubscriptionUid）" }
+    }
+    try {
+      $newUid = Resolve-ActiveProfileUid
+      if ($newUid -ne $Uid) {
+        Write-WdLog "profiles.yaml 里找不到原 uid [$Uid]（配置被重新导入过？），改为跟随 current=$newUid" 'WARN'
+        $Uid = $newUid
+        $script:SubscriptionUid = $newUid
+        $blk = Get-ProfileBlock -Uid $Uid
+      } else { throw }
+    } catch {
+      return @{ Ok = $false; Skipped = $true; Error = "profiles.yaml 里找不到 uid [$Uid]，跳过刷新" }
+    }
+  }
+  $profileType = Get-ProfileType -Block $blk.Block
+  $hasUrl = [regex]::IsMatch($blk.Block, '(?m)^\s*url:\s*\S+')
+  if (-not $hasUrl) {
+    # 不推进 LastRefresh：本地分支在节流判断之前就返回，打戳挡不住任何东西，反而会把
+    # 「刚切到远端 profile 后的第一次刷新」无谓推迟 5 分钟。每次 failover 一条 INFO 可接受。
+    Write-WdLog "当前配置 uid=$Uid 是本地配置（type=$profileType；无 url 行），跳过订阅刷新，用内核当前节点列表继续" 'INFO'
+    return @{ Ok = $false; Skipped = $true; Uid = $Uid; Error = '本地配置无订阅地址，跳过刷新' }
+  }
+  # 远端配置才需要节流（避免每轮 failover 都下载/覆盖订阅）。
   if (-not $Force) {
     if ((Get-Date) -lt $script:LastRefresh) {
       $wait = [int]((($script:LastRefresh) - (Get-Date)).TotalSeconds)
@@ -1270,7 +1549,6 @@ function Refresh-Subscription {
   try {
     $url = Get-SubscriptionUrl -Uid $Uid
   } catch {
-    # 本地 profile（无 url）等情况：抛错会跳过“用旧列表继续”，这里转成失败返回。
     return @{ Ok = $false; Error = "读取订阅地址失败：$($_.Exception.Message)" }
   }
   Write-WdLog "订阅地址：$(Mask-Url $url)"
@@ -1465,11 +1743,23 @@ function Invoke-Failover {
     $rr = @{ Ok = $false; Error = "订阅刷新异常：$(Mask-Text $_.Exception.Message)" }
   }
   $refreshOk = [bool](Get-Prop $rr 'Ok')
+  # Refresh-Subscription 可能修正过 uid（运行中重新导入本地 yaml → current 变了）：
+  # 本轮切换写 selected.now 必须用新 uid，否则每切一次都报一条找不到 uid。
+  # 取 $script: 的那份而不是 $rr.Uid：刷新中途失败也有多个返回点，逐个塞 Uid 容易漏。
+  $adoptedUid = [string]$script:SubscriptionUid
+  if (-not [string]::IsNullOrWhiteSpace($adoptedUid) -and $adoptedUid -ne $Uid) {
+    Write-WdLog "本轮切换的 profile uid 跟随为 $adoptedUid（配置重新导入过）"
+    $Uid = $adoptedUid
+  }
   if ($refreshOk) {
     $addedMsg = ''
     $addedNames = Get-Prop $rr 'Added'
     if ($addedNames -ne $null -and @($addedNames).Count -gt 0) { $addedMsg = "，新增 $(@($addedNames).Count)（$(($addedNames | Select-Object -First 5) -join ' / ')）" }
     Write-WdLog "订阅已刷新（新增/消失见上）$addedMsg" 'OK'
+  } elseif ((Get-Prop $rr 'Skipped')) {
+    # 本地配置（type: local）没有订阅地址：预期行为，不是故障，所以不打 ERROR、
+    # 也不写失败退避。节点池用内核当前列表，候选循环照常跑。
+    Write-WdLog "跳过订阅刷新：$((Get-Prop $rr 'Error'))（逐节点切换照常）"
   } elseif ((Get-Prop $rr 'Throttled')) {
     Write-WdLog '订阅刷新被节流，用当前列表继续'
   } else {
@@ -1568,7 +1858,12 @@ function Invoke-Failover {
   } elseif ($Verdict -eq 'quota') {
     # 刷新没成功（被节流或下载失败）时拿不到新出口 IP，复测多半仍败，直接进切换。
     # 注意 LastRefresh 在刷新失败时也会打戳（+2min），所以“节流”也可能只是几分钟前下载失败。
-    Write-WdLog 'quota 本次刷新未成功（见上），没有新出口 IP 可试，跳过原地复测直接切换'
+    if ((Get-Prop $rr 'Skipped')) {
+      # 本地配置本来就没有可刷新的订阅，别让日志读起来像故障。
+      Write-WdLog 'quota：当前是本地配置（无可刷新订阅），直接换节点试新出口'
+    } else {
+      Write-WdLog 'quota 本次刷新未成功（见上），没有新出口 IP 可试，跳过原地复测直接切换'
+    }
   }
   Write-WdLog '===== 进入节点切换 =====' 'WARN'
   $sel = [uri]::EscapeDataString($script:Selector)
@@ -1596,13 +1891,19 @@ function Invoke-Failover {
   $cands = Get-RankedCandidates -ProxyMap $map -SelectorAll $all -ExcludeNow $original
   $aliveCount = @($cands | Where-Object { $_.Alive -and $_.Delay -gt 0 }).Count
   Write-WdLog "候选池：符合条件 $(@($cands).Count) 个，其中 alive 有延迟 $aliveCount 个"
+  if ($aliveCount -eq 0 -and @($cands).Count -gt 0) {
+    # 刚导入的本地配置（url-test 组 lazy: true）没有 history，全部候选 delay=0、
+    # DelayRank=999999，排序退化成名字序。必须说出来：否则看日志的人会以为
+    # 「延迟从低到高」仍然成立，实际是先按字母试。
+    Write-WdLog '候选全部没有测速数据（Clash 尚未对这些节点做过 url-test）：本轮按名字序试候选，不是按延迟；开一次 Verge 的组测速可改善' 'WARN'
+  }
   if (@($cands).Count -eq 0) {
     Write-WdLog '候选池为空（过滤后无可用节点），不做无效切换' 'ERROR'
     return @{ Ok = $false; Node = $null }
   }
   $tried = @()
-  # 候选池不足 MaxCandidates 时 Select-Object -First 只返回池里的全部（不补齐、不报错），
-  # 所以「节点总数 < 40」的订阅就是这一轮把池子试一遍：池子大小见上一行的
+  # 候选池不足 $MaxCandidates 时 Select-Object -First 只返回池里的全部（不补齐、不报错），
+  # 所以「候选数 < MaxCandidates」的订阅就是这一轮把池子试一遍：池子大小见上一行的
   # 「候选池：符合条件 N 个」，实际试了几个见失败行的「已试：」列表。
   # 空池（含只有当前节点一个可用的情况，当前节点已被 -ExcludeNow 排除）在上面单独拦截。
   $pick = @($cands | Select-Object -First $MaxCandidates)
@@ -1718,10 +2019,29 @@ function Invoke-WatchIteration {
     $sel = [uri]::EscapeDataString($script:Selector)
     $detail = Invoke-ClashGet -Path "/proxies/$sel"
     $map = Get-ProxyMap
+    $script:LastClashErrSig = ''
   } catch {
-    Write-WdLog "Clash 接口不可达：$($_.Exception.Message)（Clash 未启动？稍后重试）" 'WARN'
-    # 同上：中断恢复后的首个正常轮次立即补一条。
-    $script:NeedRecoveryLog = $true
+    $errMsg = [string]$_.Exception.Message
+    if ($errMsg -match '404|NotFound') {
+      # selector 组名不存在（换订阅/重新导入本地 yaml 后最常见的配置错），不是 Clash 没起。
+      # 措辞必须分开，否则排障会去查 Clash 进程，而真正要改的是组名。
+      # 每轮都打会 15s 一条 ERROR 刷爆日志（5MB 轮转把排障记录滚掉），用签名去重：
+      # 同一 selector 只报一次，成功读到 /proxies 时清空（见上）。
+      $sig = "selector404|$($script:Selector)"
+      if ($script:LastClashErrSig -ne $sig) {
+        $script:LastClashErrSig = $sig
+        Write-WdLog "Selector [$($script:Selector)] 不在当前 Clash 配置里（404）：把 watchdog.json 的 selector 改成实际的代理组名并重启看门狗（配置只在启动时读一次），或用 -Selector 显式指定" 'ERROR'
+      }
+      $script:NeedRecoveryLog = $true
+    } else {
+      $sig = "clashdown|$errMsg"
+      if ($script:LastClashErrSig -ne $sig) {
+        $script:LastClashErrSig = $sig
+        Write-WdLog "Clash 接口不可达：$errMsg（Clash 未启动？稍后重试）" 'WARN'
+      }
+      # 同上：中断恢复后的首个正常轮次立即补一条。
+      $script:NeedRecoveryLog = $true
+    }
     # 同网关不可达：verdict 未知轮不清零会把中断前的计数漏到恢复后。
     $script:TransportStrikes = 0
     return @{ Acted = $false }
@@ -1947,7 +2267,13 @@ function Invoke-DryRun {
   try { $wdCause = Shorten ([string](Get-Prop $anon 'cause')) 200 } catch { }
   Write-WdLog "网关看门狗：status=$(Get-Prop $wd 'status') healthy=$(Get-Prop $prox 'healthy')/$(Get-Prop $prox 'total') all_down=$(Get-Prop $prox 'all_down') verdict=$(Get-Prop $anon 'verdict') cooling=$(Get-Prop $anon 'cooling_seconds') recommend=$(Get-Prop $wd 'recommend_switch') cause=$wdCause"
   $sel = [uri]::EscapeDataString($script:Selector)
-  $detail = Invoke-ClashGet -Path "/proxies/$sel"
+  try { $detail = Invoke-ClashGet -Path "/proxies/$sel" }
+  catch {
+    if ([string]$_.Exception.Message -match '404|NotFound') {
+      throw "Selector [$($script:Selector)] 不在当前 Clash 配置里（404）：用 watchdog.json 的 selector 或 -Selector 指定实际代理组名"
+    }
+    throw
+  }
   $now = [string](Get-Prop $detail 'now')
   $rawAll = Get-Prop $detail 'all'
   $all = @($rawAll | Where-Object { $_ -ne $null -and $_ -ne '' })
@@ -1955,6 +2281,11 @@ function Invoke-DryRun {
   $map = Get-ProxyMap
   $cands = Get-RankedCandidates -ProxyMap $map -SelectorAll $all -ExcludeNow $now
   $exclTxt = if (@($script:ExcludeContains).Count -gt 0) { @($script:ExcludeContains) -join '/' } else { '已关闭' }
+  $dryAlive = @($cands | Where-Object { $_.Alive -and $_.Delay -gt 0 }).Count
+  if ($dryAlive -eq 0 -and @($cands).Count -gt 0) {
+    # 与正式切换路径同一条告警：DryRun 正是用来判断「到底有没有测速数据」的场合。
+    Write-WdLog '候选全部没有测速数据（Clash 尚未对这些节点做过 url-test）：实际切换会按名字序试候选，不是按延迟；开一次 Verge 的组测速可改善' 'WARN'
+  }
   Write-WdLog "候选（生效子串排除=$exclTxt；另有内置精确排除：非叶子组/占位节点；按延迟(+地区/quota罚分)排序）共 $(@($cands).Count) 个，Top10："
   $i = 0
   foreach ($c in @($cands | Select-Object -First 10)) {
@@ -1964,37 +2295,52 @@ function Invoke-DryRun {
     $demoteMark = Get-DemoteMark $c
     Write-WdLog ("  {0,2}. {1}  delay={2}ms alive={3}{4}" -f $i, $c.Name, $c.Delay, $c.Alive, $demoteMark)
   }
-  $url = Get-SubscriptionUrl -Uid $Uid
-  Write-WdLog "订阅地址：$(Mask-Url $url)"
-  # DryRun 只读：下载走正式刷新同一逻辑（含 7890 兜底），下面只做差异预览，不写任何文件。
-  $dl = Get-SubscriptionYaml -Url $url -UaOverride $SubscriptionUA
-  if (-not (Get-Prop $dl 'Ok')) { throw "订阅下载失败：$((Get-Prop $dl 'Error'))" }
-  $newYaml = [string](Get-Prop $dl 'Yaml')
-  $dryLen = $newYaml.Length
-  Write-WdLog "订阅下载 OK（$dryLen 字节，DryRun 不写入）" 'OK'
-  if (-not ([regex]::IsMatch($newYaml, '(?m)^(proxies|proxy-providers):'))) { throw '订阅内容无 proxies 节' }
-  $newNames = Get-NodeNames -YamlText $newYaml
-  $runtimeFile = Join-Path $script:VergeRoot 'clash-verge.yaml'
-  $oldNames = Get-NodeNames -YamlText ([IO.File]::ReadAllText($runtimeFile, [Text.Encoding]::UTF8))
-  $added = @($newNames | Where-Object { @($oldNames) -notcontains $_ })
-  $removed = @($oldNames | Where-Object { @($newNames) -notcontains $_ })
-  Write-WdLog "订阅差异预览：旧 $(@($oldNames).Count) → 新 $(@($newNames).Count)，新增 $(@($added).Count)，消失 $(@($removed).Count)"
-  if (@($added).Count -gt 0) { Write-WdLog "新增：$(($added | Select-Object -First 10) -join ' / ')" }
-  if (@($removed).Count -gt 0) { Write-WdLog "消失：$(($removed | Select-Object -First 10) -join ' / ')" }
-  $runtimeOld = [IO.File]::ReadAllText($runtimeFile, [Text.Encoding]::UTF8)
-  try {
-    $merged = Sync-RuntimeText -Runtime $runtimeOld -Profile $newYaml
-    if ($merged -eq $runtimeOld) { Write-WdLog '运行配置拼接预览：与当前一致（无需改动）' }
-    else { Write-WdLog "运行配置拼接预览：会变更（旧 $($runtimeOld.Length) 字 → 新 $($merged.Length) 字），DryRun 不写入" }
-  } catch {
-    Write-WdLog "运行配置拼接预览：拒绝写入（$($_.Exception.Message)），正好验证了防护逻辑" 'WARN'
-  }
-  $info = Get-ProfileBlock -Uid $Uid
-  $selName = [regex]::Escape($script:Selector)
-  if ([regex]::IsMatch($info.Block, "(?ms)^\s*-\s*name:\s*['""]?$selName['""]?\s*\r?\n.*?^\s*now:\s*.*?$")) {
-    Write-WdLog 'profiles.yaml selected.now 定位 OK（DryRun 不写入）'
+  # 本地配置（type: local）没有订阅地址：不是错误，跳下载预览即可。
+  # uid 失效要和「本地配置」分开报：否则先打一句「本地配置」，下一行又抛「找不到 uid」，
+  # 两句话自相矛盾。
+  $info = $null
+  try { $info = Get-ProfileBlock -Uid $Uid } catch { $info = $null }
+  $hasUrl = ($info -ne $null) -and [regex]::IsMatch($info.Block, '(?m)^\s*url:\s*\S+')
+  if ($info -eq $null) {
+    Write-WdLog "profiles.yaml 里找不到 uid [$Uid]：跳过订阅差异预览与 selected 检查（逐节点切换仍可用）" 'WARN'
+  } elseif (-not $hasUrl) {
+    Write-WdLog "本地配置（uid=$Uid，type=$(Get-ProfileType -Block $info.Block)；无 url 行）：跳过订阅差异预览；逐节点切换照常可用" 'INFO'
   } else {
-    Write-WdLog "profiles.yaml 里找不到 selector [$($script:Selector)] 的 now: 行（DryRun 不写入）" 'WARN'
+    $url = Get-SubscriptionUrl -Uid $Uid
+    Write-WdLog "订阅地址：$(Mask-Url $url)"
+    # DryRun 只读：下载走正式刷新同一逻辑（含 7890 兜底），下面只做差异预览，不写任何文件。
+    $dl = Get-SubscriptionYaml -Url $url -UaOverride $SubscriptionUA
+    if (-not (Get-Prop $dl 'Ok')) { throw "订阅下载失败：$((Get-Prop $dl 'Error'))" }
+    $newYaml = [string](Get-Prop $dl 'Yaml')
+    $dryLen = $newYaml.Length
+    Write-WdLog "订阅下载 OK（$dryLen 字节，DryRun 不写入）" 'OK'
+    if (-not ([regex]::IsMatch($newYaml, '(?m)^(proxies|proxy-providers):'))) { throw '订阅内容无 proxies 节' }
+    $newNames = Get-NodeNames -YamlText $newYaml
+    $runtimeFile = Join-Path $script:VergeRoot 'clash-verge.yaml'
+    $oldNames = Get-NodeNames -YamlText ([IO.File]::ReadAllText($runtimeFile, [Text.Encoding]::UTF8))
+    $added = @($newNames | Where-Object { @($oldNames) -notcontains $_ })
+    $removed = @($oldNames | Where-Object { @($newNames) -notcontains $_ })
+    Write-WdLog "订阅差异预览：旧 $(@($oldNames).Count) → 新 $(@($newNames).Count)，新增 $(@($added).Count)，消失 $(@($removed).Count)"
+    if (@($added).Count -gt 0) { Write-WdLog "新增：$(($added | Select-Object -First 10) -join ' / ')" }
+    if (@($removed).Count -gt 0) { Write-WdLog "消失：$(($removed | Select-Object -First 10) -join ' / ')" }
+    $runtimeOld = [IO.File]::ReadAllText($runtimeFile, [Text.Encoding]::UTF8)
+    try {
+      $merged = Sync-RuntimeText -Runtime $runtimeOld -Profile $newYaml
+      if ($merged -eq $runtimeOld) { Write-WdLog '运行配置拼接预览：与当前一致（无需改动）' }
+      else { Write-WdLog "运行配置拼接预览：会变更（旧 $($runtimeOld.Length) 字 → 新 $($merged.Length) 字），DryRun 不写入" }
+    } catch {
+      Write-WdLog "运行配置拼接预览：拒绝写入（$($_.Exception.Message)），正好验证了防护逻辑" 'WARN'
+    }
+  }
+  if ($info -ne $null) {
+    $selName = [regex]::Escape($script:Selector)
+    if ([regex]::IsMatch($info.Block, "(?ms)^\s*-\s*name:\s*['""]?$selName['""]?\s*\r?\n.*?^\s*now:\s*.*?$")) {
+      Write-WdLog 'profiles.yaml selected.now 定位 OK（DryRun 不写入）'
+    } elseif ([regex]::IsMatch($info.Block, '(?m)^\s*selected:')) {
+      Write-WdLog "profiles.yaml 的 selected 里还没有 selector [$($script:Selector)]：下次切换会在列表头部追加一项（DryRun 不写入）" 'INFO'
+    } else {
+      Write-WdLog "profiles.yaml 里还没有 selector [$($script:Selector)] 的 selected 块：首次成功切换时会自动补写（DryRun 不写入）" 'INFO'
+    }
   }
   Write-WdLog '===== 试运行结束：一切只读检查通过 =====' 'OK'
 }
@@ -2010,6 +2356,10 @@ $script:QuotaFailedAt = @{}
 # 上次打印的过滤丢弃集合签名（降噪用）与上次见到的 Selector 当前节点（外部切换检测用）。
 $script:LastDropSignature = $null
 $script:LastSeenNow = ''
+# Clash 接口错误签名（selector 404 / 连不上各只报一次）与 selected.now 写失败签名
+# （uid 失效时一轮 100 个候选会各报一条相同的 WARN）。
+$script:LastClashErrSig = ''
+$script:SelectedWarnSig = ''
 # transport 计数（抖动容忍用）：verdict=transport 累计 N 轮才动作，见 Invoke-WatchIteration。
 # 单个 ok/限流轮不再清零，改由 OkStreak 慢衰减（连续 4 轮非 transport 才清），
 # 否则冷却过期节拍与轮询共振会把计数永远卡在 2/3；网关 stale 机制下 cooling=0
@@ -2048,15 +2398,29 @@ try {
   Resolve-ClashSecret | Out-Null
   # 必须早于下面这行启动横幅与任何候选排序：横幅要如实打印生效的地区降权配置。
   Read-WatchdogConfig -Path $script:WatchdogConfigPath
+  # profile uid 为空 = 跟随 profiles.yaml 的 current:（重新导入本地 yaml 会换 uid）。
+  # 解析失败**不中止启动**：uid 只影响「订阅刷新 + selected.now 书签」，逐节点切换、
+  # 探针、回滚全都不需要它。用 bookkeeping 的依赖否决核心功能是反的——真解析不出来时
+  # 让 Refresh-Subscription 每轮自行再试（配置重新导入后 current 就有了）。
+  $script:UidAuto = [string]::IsNullOrWhiteSpace($script:SubscriptionUid)
+  if ($script:UidAuto) {
+    try {
+      $script:SubscriptionUid = Resolve-ActiveProfileUid
+      Write-WdLog "profile uid 未指定，自动取当前激活配置：$($script:SubscriptionUid)"
+    } catch {
+      $script:SubscriptionUid = ''
+      Write-WdLog "无法自动解析当前激活 profile（$($_.Exception.Message)）：先跳过订阅刷新与 selected 记录，逐节点切换照常；稍后每轮自动重试，也可用 -SubscriptionUid 指定" 'WARN'
+    }
+  }
   $regionCfg = '关闭'
   # 与 Get-RankedCandidates 同口径：先过滤空白条目再计数，全空白列表视为关闭，
   # 日志与行为读同一份 $script: 源，避免一侧被重赋值后分叉。
   $regionKeysForLog = @($script:DeprioritizeContains | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
   if ($script:DeprioritizePenaltyMs -gt 0 -and @($regionKeysForLog).Count -gt 0) { $regionCfg = "$($regionKeysForLog -join '/')+$($script:DeprioritizePenaltyMs)ms" }
   $excludeCfg = if (@($script:ExcludeContains).Count -gt 0) { @($script:ExcludeContains) -join '/' } else { '已关闭' }
-  Write-WdLog "看门狗启动：selector=$Selector 网关=$($script:GatewayBase) 模型=$VerifyModel 轮询=${PollSeconds}s 正常心跳=${NormalLogMinutes}分钟 quota记忆=${QuotaFailMemoryMinutes}分钟 transport连续确认=${script:TransportConfirmRounds}轮 探针通道=$(if ($script:ProbeSupported) { 'watchdog-probe' } else { 'legacy' }) 闸门等待=${ProxyReadySeconds}s 刷新等待=${RefreshSettleSeconds}s 地区降权=${regionCfg} 子串排除=${excludeCfg}"
+  Write-WdLog "看门狗启动：selector=$($script:Selector) uid=$($script:SubscriptionUid) 候选上限=$($script:MaxCandidates) 网关=$($script:GatewayBase) 模型=$VerifyModel 轮询=${PollSeconds}s 正常心跳=${NormalLogMinutes}分钟 quota记忆=${QuotaFailMemoryMinutes}分钟 transport连续确认=${script:TransportConfirmRounds}轮 探针通道=$(if ($script:ProbeSupported) { 'watchdog-probe' } else { 'legacy' }) 闸门等待=${ProxyReadySeconds}s 刷新等待=${RefreshSettleSeconds}s 地区降权=${regionCfg} 子串排除=${excludeCfg}"
   if ($DryRun) {
-    Invoke-DryRun -Uid $SubscriptionUid
+    Invoke-DryRun -Uid $script:SubscriptionUid
     exit 0
   }
   if ($Once) {
@@ -2066,8 +2430,8 @@ try {
       Write-WdLog "-Once 单轮模式固定按 1 轮执行，不使用 transport 连续确认轮数（横幅里的 $($script:TransportConfirmRounds) 轮是配置值，本轮不用它）" 'INFO'
     }
     $onceResult = Invoke-WatchIteration `
-      -MaxCandidates $MaxCandidates -SwitchGapSeconds 0 -VerifyTimeoutSeconds $VerifyTimeoutSeconds `
-      -Uid $SubscriptionUid -RoundCooldownMinutes $RoundCooldownMinutes -NormalLogMinutes $NormalLogMinutes -RefreshSettleSeconds $RefreshSettleSeconds `
+      -MaxCandidates $script:MaxCandidates -SwitchGapSeconds 0 -VerifyTimeoutSeconds $VerifyTimeoutSeconds `
+      -Uid $script:SubscriptionUid -RoundCooldownMinutes $RoundCooldownMinutes -NormalLogMinutes $NormalLogMinutes -RefreshSettleSeconds $RefreshSettleSeconds `
       -TransportConfirmRounds 1
     # Invoke-WatchIteration 永远返回 @{Acted}（$null 输入时 Get-Prop 守卫回 $null 走 false），点访问恒安全。
     if ($onceResult -ne $null -and $onceResult.Acted -and (Get-Date) -lt $script:RoundCooldownUntil) { exit 1 }
@@ -2076,8 +2440,8 @@ try {
   while ($true) {
     try {
       Invoke-WatchIteration `
-        -MaxCandidates $MaxCandidates -SwitchGapSeconds $SwitchGapSeconds -VerifyTimeoutSeconds $VerifyTimeoutSeconds `
-        -Uid $SubscriptionUid -RoundCooldownMinutes $RoundCooldownMinutes -NormalLogMinutes $NormalLogMinutes -RefreshSettleSeconds $RefreshSettleSeconds `
+        -MaxCandidates $script:MaxCandidates -SwitchGapSeconds $SwitchGapSeconds -VerifyTimeoutSeconds $VerifyTimeoutSeconds `
+        -Uid $script:SubscriptionUid -RoundCooldownMinutes $RoundCooldownMinutes -NormalLogMinutes $NormalLogMinutes -RefreshSettleSeconds $RefreshSettleSeconds `
         -TransportConfirmRounds $script:TransportConfirmRounds | Out-Null
     } catch {
       Write-WdLog "本轮异常：$($_.Exception.Message)" 'WARN'
