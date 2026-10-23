@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"opencode2api/internal/config"
 )
 
 // errFreeTierIPBlocked reports that OpenCode's free gateway refused the request
@@ -21,7 +23,11 @@ var errFreeTierIPBlocked = errors.New("free tier blocked the egress IP")
 // The upstream message tells people to turn off a VPN, which is wrong for a
 // server that egresses through a proxy; this one names the real cause and the
 // two ways out.
-const freeTierBlockedMessage = "OpenCode is blocking free-model traffic from the IP this gateway leaves from, so retrying now cannot succeed. Route the request through another exit or wait for the block to expire."
+//
+// The opencode2api: prefix is the script-facing marker for "the gateway wrote
+// this, not the upstream" (watchdog-clash.ps1 matches it as a substring), so it
+// is carried here exactly like proxyUnavailableMessage.
+const freeTierBlockedMessage = "opencode2api: OpenCode is blocking free-model traffic from the IP this gateway leaves from, so retrying now cannot succeed. Route the request through another exit or wait for the block to expire."
 
 // errAnonymousLanePaused reports that the anonymous lane's circuit breaker has
 // paused the whole lane. Unlike an upstream rejection, another exit or a retry
@@ -32,13 +38,15 @@ var errAnonymousLanePaused = errors.New("anonymous lane paused by its circuit br
 // anonymousLanePausedMessage is what a client receives while the circuit
 // breaker holds the anonymous lane shut. It names the cause so the operator is
 // not sent looking for a credential or model problem.
-const anonymousLanePausedMessage = "The anonymous free tier is paused after repeated upstream failures. Configure an authenticated key, wait for the pause to expire, or restart the gateway after confirming the upstream block has lifted."
+//
+// Prefixed for the same reason as freeTierBlockedMessage.
+const anonymousLanePausedMessage = "opencode2api: The anonymous free tier is paused after repeated upstream failures. Configure an authenticated key, wait for the pause to expire, or restart the gateway after confirming the upstream block has lifted."
 
 // freeTierBlockTTL keeps a blocked exit out of the anonymous cursor. Upstream
 // does not publish the block duration, so this is a conservative backoff: long
 // enough to stop the retry storm, short enough that an unblocked IP recovers
 // without a restart.
-const freeTierBlockTTL = 15 * time.Minute
+const freeTierBlockTTL = time.Duration(config.DefaultFreeTierBlockSeconds) * time.Second
 
 // freeTierBlockTTL returns the backoff applied to an exit the free tier flagged.
 func (g *Gateway) freeTierBlockTTL() time.Duration {
@@ -109,12 +117,15 @@ func peekNetworkAbuseBlock(resp *http.Response) bool {
 // which tells the client to re-authenticate instead of compacting.
 var errDeterministicClientRejection = errors.New("upstream rejected the request deterministically")
 
-// deterministicMarkers are the error types and codes an upstream uses for a
-// request that will fail identically everywhere. The status must be 400 or 422
-// as well: a 401, 403 or 429 can be specific to the credential or the moment.
+// deterministicMarkers are the phrases an upstream uses for a request that will
+// fail identically everywhere. They are deliberately all about length/context:
+// the gateway reshapes every anonymous body (stream, tool definitions,
+// max_completion_tokens), so a generic "invalid_request_error" 400 may be the
+// gateway's own shaping rather than the client's mistake. Treating that as
+// deterministic would skip a keyed tier that shapes differently and could have
+// served the request, so the generic markers are not accepted here; a 413 is,
+// because that status is the upstream's own verdict on the payload size.
 var deterministicMarkers = []string{
-	"invalid_request_error",
-	"invalid_request",
 	"context_length_exceeded",
 	"maximum context length",
 	"string_above_max_length",
@@ -124,7 +135,7 @@ var deterministicMarkers = []string{
 // isDeterministicClientResponse reports whether status and body describe a
 // request-level rejection rather than a credential or availability problem.
 func isDeterministicClientResponse(status int, body []byte) bool {
-	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity && status != http.StatusRequestEntityTooLarge {
 		return false
 	}
 	text := strings.ToLower(string(body))

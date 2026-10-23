@@ -665,7 +665,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 // performance.max_anonymous_exits is zero. Without a cap, a request that every
 // exit rejects (403/429) scans the whole proxy list, up to two lanes per exit,
 // and can spend minutes before failing over.
-const defaultMaxAnonymousExits = 8
+const defaultMaxAnonymousExits = config.DefaultMaxAnonymousExits
 
 // maxAnonymousExits returns the configured cap, or the built-in default when
 // the operator left the setting unset.
@@ -761,7 +761,12 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			// the free tier's block, report the block rather than the generic
 			// no-proxy error, so the caller can try the authenticated Go tier
 			// or answer with the block itself.
-			blocked = g.anonymous.blockedExits(time.Now())
+			//
+			// OR, never an assignment: a block seen on an earlier exit is still
+			// evidence even when the exits that remain were merely unhealthy.
+			// Overwriting it here would report "no healthy proxies" and let the
+			// Zen key tier retry into the same blocked IP.
+			blocked = blocked || g.anonymous.blockedExits(time.Now())
 			break
 		}
 		proxies++
@@ -1220,8 +1225,10 @@ func ensureV2CompletionLimit(payload map[string]any) bool {
 var v2ChatKeyOrder = []string{"model", "messages", "tools", "stream", "stream_options", "max_completion_tokens"}
 
 // marshalV2ChatBody encodes a chat payload with v2ChatKeyOrder first and any
-// remaining keys sorted after it. Values still go through encoding/json, so
-// only the key order differs from a plain marshal.
+// remaining keys sorted after it. Values go through jsonutil.Marshal, so they
+// are written without HTML escaping, and nested objects (tools, messages) keep
+// their own alphabetical key order: the fidelity is in the top-level skeleton a
+// captured client sends, not a byte-for-byte reproduction of every nested map.
 func marshalV2ChatBody(payload map[string]any) ([]byte, error) {
 	var buffer bytes.Buffer
 	buffer.WriteByte('{')
@@ -2156,11 +2163,24 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 		// watchdogCause only labels the failure for the watchdog feed; the
 		// upstream error document itself is still passed through untouched
 		// (the label peeks the body at most and puts it back byte for byte).
-		g.anonymous.markUserFailure(node, resp, err, watchdogCause(resp, err), fingerprint)
+		// It is computed once and reused for the breaker decision below, so the
+		// response body is peeked once, not twice.
+		cause := watchdogCause(resp, err)
+		g.anonymous.markUserFailure(node, resp, err, cause, fingerprint)
 		if resp != nil && peekNetworkAbuseBlock(resp) {
 			// An IP block is scoped to this exit; doAnonymousUpstream marks it
 			// blocked and opens the lane breaker only when no exit is left.
 			// Counting it here as well would stop the other exits early.
+			return
+		}
+		// Quota and rate-limit answers are not evidence that the lane is down,
+		// and they must not trip the breaker: this build answers a cooling lane
+		// with 429 + Retry-After (merge decision D3) and caps that cooldown at
+		// 15s, precisely so a burned free allowance is a short wait. A strike
+		// here would turn one all-429 request (8 exits × threshold 6) into an
+		// hour-long 503 while the client was told to retry in seconds.
+		// Transport and 5xx still count: those say the lane itself is unreachable.
+		if verdict := classifyAnonymousVerdict(cause, false); verdict == "quota" || verdict == "ratelimit" {
 			return
 		}
 		if pause, tripped := g.anonymous.NoteFailure(); tripped {

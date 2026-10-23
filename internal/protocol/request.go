@@ -788,11 +788,9 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 	jsonutil.Put(output, "max_tokens", request.MaxTokens)
 	jsonutil.Put(output, "stop", request.Stop)
 	if effort := reasoningEffort(request.Reasoning); effort != nil {
-		if effort == "none" {
-			output["reasoning_effort"] = "none"
-		} else {
-			output["reasoning_effort"] = effort
-		}
+		// "none" is a level here, not an absence: an explicit disable has to
+		// survive the bridge, so it is written like any other level.
+		output["reasoning_effort"] = effort
 	}
 	jsonutil.Put(output, "response_format", chatResponseFormat(request.ResponseFormat))
 	jsonutil.Put(output, "parallel_tool_calls", request.ParallelToolCalls)
@@ -1027,8 +1025,10 @@ func missingToolIDs(order []string, pending map[string]bool) []string {
 // completely, so a client asking for "max" reached the upstream with no
 // reasoning configuration at all.
 //
-// An object of type "disabled" yields nil and is omitted; one that yields no
-// level is forwarded unchanged, and a bare "none"/"disabled" string yields nil.
+// An object of type "disabled", or a bare "none"/"disabled" string, yields
+// {"effort":"none"} so the disable survives instead of being dropped and then
+// resurrected by a forced default. A value that yields no level is forwarded
+// unchanged.
 func responsesReasoning(value any) any {
 	if object, ok := value.(map[string]any); ok {
 		if reasoningDisabled(object) {

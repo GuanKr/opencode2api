@@ -153,6 +153,14 @@ func NormalizeLaneOrder(raw []string) ([]string, error) {
 	return out, nil
 }
 
+// Defaults for the anonymous lane bounds. Normalize fills them in when the
+// operator leaves the field at zero, so a loaded configuration is always
+// concrete and the WebUI shows the number that is actually in force.
+const (
+	DefaultMaxAnonymousExits    = 8
+	DefaultFreeTierBlockSeconds = 900
+)
+
 // RetryConfig bounds the upstream retries. MaxAttempts caps the attempts of a
 // retry loop: the keyed attempts of a client request outside the rotation
 // path, and the catalog refresh. For the anonymous lane it is instead a floor
@@ -257,10 +265,10 @@ type PerformanceConfig struct {
 	AttemptTimeoutSeconds    int `json:"attempt_timeout_seconds"`
 	FirstEventTimeoutSeconds int `json:"first_event_timeout_seconds"`
 	// MaxAnonymousExits bounds how many distinct static proxy exits one
-	// anonymous request may walk. Each exit may still try the v2 /inference
-	// lane and the v1 /zen lane, so the upstream request count can be twice
-	// this value; a rotating #pool entry is drawn once per retry.max_attempts
-	// instead.
+	// anonymous request may walk. Each exit still walks every base in
+	// upstream.anonymous_lane_order (one by default), so the upstream request
+	// count is multiplied by that list's length; a rotating #pool entry is
+	// drawn once per retry.max_attempts instead.
 	MaxAnonymousExits int `json:"max_anonymous_exits"`
 	// FreeTierBlockSeconds is how long an exit the free tier flagged as
 	// abusive stays out of the anonymous cursor. Upstream does not publish
@@ -378,7 +386,7 @@ func Normalize(path string, cfg Config) (Config, error) {
 		return Config{}, errors.New("at least one server key must remain enabled")
 	}
 	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 {
-		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key unless anonymous is enabled")
+		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key unless anonymous is enabled (documentation placeholders such as sk-your-zen-key are ignored, so a config that only lists one has no usable key)")
 	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
@@ -403,6 +411,16 @@ func Normalize(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Performance.FreeTierBlockSeconds < 0 {
 		return Config{}, errors.New("performance.free_tier_block_seconds must not be negative (0 uses the built-in cool-down)")
+	}
+	// Fill the two anonymous-lane bounds in rather than leaving them at the
+	// usage-site fallbacks: every other performance field is concrete after
+	// Normalize, and the console form renders what GET /api/config returns. A
+	// zero here reached the UI as "0" next to a README that says 8 and 900.
+	if cfg.Performance.MaxAnonymousExits == 0 {
+		cfg.Performance.MaxAnonymousExits = DefaultMaxAnonymousExits
+	}
+	if cfg.Performance.FreeTierBlockSeconds == 0 {
+		cfg.Performance.FreeTierBlockSeconds = DefaultFreeTierBlockSeconds
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
@@ -577,6 +595,13 @@ func Clone(cfg Config) Config {
 			protocols[key] = value
 		}
 		cfg.Models.Protocols = protocols
+	}
+	// A pointer field, so the struct copy above still shares it. Normalize
+	// writes this block in place, and the copy a runtime swap or GET /api/config
+	// hand out must not be able to mutate the configuration in force.
+	if cfg.Models.AnonymousBackoff != nil {
+		backoff := *cfg.Models.AnonymousBackoff
+		cfg.Models.AnonymousBackoff = &backoff
 	}
 	if cfg.Reasoning.EffortByModel != nil {
 		efforts := make(map[string]string, len(cfg.Reasoning.EffortByModel))

@@ -217,7 +217,9 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 匿名阶段不受 `retry.max_attempts` 截断，但所有阶段共享请求总超时。网络错误、认证失败、限流和服务端错误可以触发出口轮换。请求级 `400`/`413`/`422`（例如 `context_length_exceeded`）会立即结束请求：换出口或换 Tier 都无法改变请求本身。IP 级 abuse `403` 只淘汰当前出口；所有出口都被封时停止扫描，已配置的 Go Key 仍可继续服务。
 
-配置 `models.anonymous_backoff` 后，连续 `threshold` 次匿名失败或所有出口都被 IP 封禁会暂停整条匿名通道 `base_hours`，之后每次再触发翻倍，直到 `max_hours`。单个非滥用 `403` 或 `429` 不会立即熔断，只计入连续失败。暂停期间不取代理、不发任何上游请求（包括模型目录刷新和可用性探测），路由直接落到认证通道。窗口到期后只允许一个请求做半开探测：成功关闭熔断并恢复匿名通道，失败则开启下一个更长的窗口。省略该配置块时熔断关闭。
+匿名通道也可能自己答 `503`，用 `code` 区分是哪一侧出的问题：`proxy_error` = 没有出口可连；`free_tier_ip_blocked` = 出口 IP 被免费层判为滥用（该出口停用 `performance.free_tier_block_seconds` 秒）；`free_tier_lane_paused` = lane 级熔断已打开。只是出口在冷却时答 `429` + `Retry-After`。
+
+配置 `models.anonymous_backoff` 后，连续 `threshold` 次匿名失败或所有出口都被 IP 封禁会暂停整条匿名通道 `base_hours`，之后每次再触发翻倍，直到 `max_hours`。单个非滥用 `403` 不会立即熔断，只计入连续失败；`429` 及其它额度/限流应答**不计入**——那条路径走短冷却 + `Retry-After`，配额烧完应该等几秒，而不是被暂停一小时。暂停期间不取代理、不发任何上游请求（包括模型目录刷新和可用性探测），路由直接落到认证通道。窗口到期后只允许一个请求做半开探测：成功关闭熔断并恢复匿名通道，失败则开启下一个更长的窗口。省略该配置块时熔断关闭。
 
 每个 Tier 使用自己的原生协议编码请求。启用 `performance.first_event_timeout_seconds` 后，会先等待完整的 SSE data 事件再向客户端交付响应；注释心跳不算首事件。首事件前超时或断开会沿用现有 Key / 代理重试预算，交付后不再重放。默认 `0` 关闭，可对接受请求后无事件的上游尝试设置为 `15` 秒。它限制首事件而非首个文本 token，不适用于 System One；轮转别名使用独立的 `rotation.first_output_seconds`。识别到过期的 Responses reasoning 引用时，可执行一次修复重试；指定 Key 的诊断不会执行该重试。
 
@@ -332,7 +334,8 @@ pool+http://127.0.0.1:7891
 | 连接复用     | Keep-alive + HTTP/2 多路复用（`performance.*` 连接池参数） | 每次请求新建 TCP + CONNECT 隧道（`DisableKeepAlives`，禁用 HTTP/2） |
 | 失败冷却     | 15s–120s 指数退避，并受 `Retry-After` 影响  | 无冷却：下一次请求直接换一个新出口 IP                     |
 | 可用性剔除   | 标记不可用、迁移 Key、每 15 分钟复检        | 永不剔除，完全跳过健康检查                                |
-| 匿名通道重试 | 每个出口最多访问一次，最多 `performance.max_anonymous_exits` 个出口 | 最多尝试 `retry.max_attempts` 次，循环该池条目            |
+| IP 滥用封禁（`403`） | 停用 `performance.free_tier_block_seconds` 秒 | 不适用：该条目每次尝试都会换自己的出口 IP        |
+| 匿名通道重试 | 每个出口最多访问一次，最多 `performance.max_anonymous_exits` 个出口 | 最多尝试 `max(performance.max_anonymous_exits, retry.max_attempts)` 次，循环该池条目 |
 
 当 URL 背后的服务本身就在做轮换、而池内出口 IP 会被单独限流或不稳定时使用它：网关会把每次尝试都当作新出口，而不是把整个会话固定在某个出口上。只要一条 `#pool` 条目即可，无需再罗列几十个出口。静态条目仍然保留下文的连接池行为。
 

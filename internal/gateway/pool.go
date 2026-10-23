@@ -57,11 +57,27 @@ func (t *proxyTransport) blocked(now time.Time) bool {
 // markBlocked keeps this exit out of the anonymous cursor until until. The
 // block is a property of the egress IP, so it is never cleared by a response
 // from the same exit: only another exit can serve traffic in the meantime.
+//
+// A rotating #pool entry is exempt, for the same reason it is exempt from
+// cooldowns: it opens a fresh connection (and a new exit IP) on every attempt,
+// so the blocked IP is not the IP the next attempt would leave from. Blocking
+// the entry would bench a whole rotating endpoint — and, when it is the only
+// entry, trip the lane breaker — over one exit the entry itself no longer uses.
 func (t *proxyTransport) markBlocked(until time.Time) {
-	if t == nil {
+	if t == nil || t.pool {
 		return
 	}
 	t.blockedUntil.Store(until.UnixNano())
+}
+
+// clearBlocked returns this exit to the anonymous cursor. It is used when
+// something proves the IP works again: the health check recovering the proxy,
+// or a forced watchdog probe answering 2xx through it.
+func (t *proxyTransport) clearBlocked() {
+	if t == nil {
+		return
+	}
+	t.blockedUntil.Store(0)
 }
 
 // anonymousNodes gives the shared OpenCode "public" credential an independent
@@ -175,6 +191,41 @@ func (p *anonymousNodes) blockedExits(now time.Time) bool {
 		}
 	}
 	return true
+}
+
+// blockedExitCount reports how many exits are inside the free tier's IP block.
+// The status feed publishes it: "every request answers free_tier_ip_blocked" is
+// invisible in the cooldown snapshot, which stays empty once the 15s cooldown
+// that came with the 403 expires.
+func (p *anonymousNodes) blockedExitCount(now time.Time) int {
+	if p == nil {
+		return 0
+	}
+	count := 0
+	for _, node := range p.nodes {
+		if node.proxy != nil && node.proxy.blocked(now) {
+			count++
+		}
+	}
+	return count
+}
+
+// pausedFor reports how long the lane-level breaker still holds the lane shut.
+// A half-open lane (window expired, probe in flight) reports false: the lane is
+// answering again, just not to more than one request at a time.
+func (p *anonymousNodes) pausedFor() (time.Duration, bool) {
+	if p == nil {
+		return 0, false
+	}
+	until := p.breakerUntil.Load()
+	if until == 0 {
+		return 0, false
+	}
+	remain := time.Until(time.Unix(0, until))
+	if remain <= 0 {
+		return 0, false
+	}
+	return remain, true
 }
 
 // HasPool reports whether any node uses a rotating proxy pool (#pool), which
@@ -548,6 +599,12 @@ func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 		node.coolCause.Store("")
 		node.lastCause.Store("")
 		node.causeExpires.Store(0)
+		// A recovered proxy is also un-blocked: the health check just reached
+		// the upstream through this exit, which is strictly better evidence
+		// than the 403 that put it out of rotation. Without this the exit sat
+		// out the rest of free_tier_block_seconds while every request answered
+		// free_tier_ip_blocked, and nothing short of a restart cleared it.
+		proxy.clearBlocked()
 		cleared++
 	}
 	return cleared

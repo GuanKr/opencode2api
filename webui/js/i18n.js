@@ -1858,8 +1858,14 @@ let locale = DEFAULT_LOCALE;
 const fill = (text, args) =>
   args.reduce((value, item, index) => value.replaceAll(`{${index}}`, String(item)), text);
 
+// lookup falls back through zh-CN and then English. The Chinese dictionary is
+// deliberately empty (the authored strings are the source text), and a locale
+// that lags behind the source gains keys on every feature — the Italian block
+// was merged from upstream without this build's usage-records page. Falling
+// back to English keeps a new page readable in every locale instead of
+// rendering the raw Chinese.
 const lookup = (key) => {
-  for (const code of [locale, DEFAULT_LOCALE]) {
+  for (const code of [locale, DEFAULT_LOCALE, "en"]) {
     const value = DICTIONARY[code]?.[key];
     if (value !== undefined) return value;
   }
@@ -1879,10 +1885,9 @@ export const t = (original, key, ...args) => {
 // apply re-renders every node carrying a static translation attribute. Any
 // node created after a language switch is picked up by the next apply() call.
 export const apply = (root = document) => {
-  const dictionary = DICTIONARY[locale] || {};
   root.querySelectorAll("[data-i18n]").forEach((node) => {
     if (!originals.has(node)) originals.set(node, node.innerHTML);
-    const value = dictionary[node.dataset.i18n];
+    const value = lookup(node.dataset.i18n);
     node.innerHTML = value === undefined ? originals.get(node) : value;
   });
   root.querySelectorAll("[data-i18n-attr]").forEach((node) => {
@@ -1894,7 +1899,7 @@ export const apply = (root = document) => {
       );
     const snapshot = originals.get(node);
     targets.forEach(([attribute, key], index) => {
-      const value = dictionary[key];
+      const value = lookup(key);
       node.setAttribute(attribute, value === undefined ? snapshot[index] : value);
     });
   });

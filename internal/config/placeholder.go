@@ -5,6 +5,10 @@ import "strings"
 // placeholderKeys are the example values the shipped documentation uses. They
 // are not secrets and no upstream accepts them: a configuration that still
 // carries one has simply not been filled in yet.
+//
+// "change-this-local-key" only ever appears under server_keys, which this file
+// does not filter (a local key is not used against an upstream); it is listed
+// so IsPlaceholderKey answers correctly wherever it is asked.
 var placeholderKeys = []string{
 	"sk-your-zen-key",
 	"change-this-local-key",
@@ -26,15 +30,19 @@ func IsPlaceholderKey(key string) bool {
 // DropPlaceholderKeys removes placeholder credentials from the key pools. A
 // placeholder can never authenticate, so keeping it only turns every fallback
 // that reaches the keyed tiers into a 401 — which then hides the real error
-// (the cause of the failover) from the client. Callers still see the configured
-// list through the management API; the pools simply behave as if the tier was
-// left empty.
+// (the cause of the failover) from the client.
+//
+// Normalize runs this before the "at least one upstream key" check and before
+// anything is persisted, so the running configuration, the console view and the
+// file a save writes back all agree: a dropped key is gone, not merely ignored.
+// That is the intended reading — an operator who left the example in place has
+// no usable key, and the startup error says so explicitly.
 func DropPlaceholderKeys(cfg Config) Config {
 	drop := func(keys []string) []string {
 		if len(keys) == 0 {
 			return keys
 		}
-		kept := keys[:0]
+		kept := make([]string, 0, len(keys))
 		for _, key := range keys {
 			if IsPlaceholderKey(key) {
 				continue

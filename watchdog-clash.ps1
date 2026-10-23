@@ -991,6 +991,15 @@ function Test-GatewayNodeLegacy {
     # 无关：换节点只会拿到同一个 503。不摘出的话它会掉进下面的 502/503/504 → transport
     # 分支，逐候选切一遍再回滚——改动前它答 400，走的正是上面那条 config（立即停轮）。
     elseif ($info.Status -eq 503 -and $body.Contains('ModelUnavailable')) { $class = 'config' }
+    # 2026-10-23：网关新增两条 503 —— free_tier_ip_blocked（出口 IP 被免费层判滥用）
+    # 与 free_tier_lane_paused（lane 级熔断暂停）。两者都是**网关侧状态**，不摘出来
+    # 就会掉进下面的 503 → transport，逐候选切一遍再回滚 —— 正是本地 2026-10-20 修过的
+    # 「把网关退避当节点坏了」那个坑。
+    #   - ip_blocked：换出口 IP 是唯一解法，但 Clash 换节点未必换 IP，且同轮里可能真能
+    #     换到干净出口，所以按 quota 记（只降权、不 break，候选循环继续）。
+    #   - lane_paused：窗口内换任何节点都无效，按 cooling 只等，不刷新不切换。
+    elseif ($info.Status -eq 503 -and $body.Contains('free_tier_lane_paused')) { $class = 'cooling' }
+    elseif ($info.Status -eq 503 -and $body.Contains('free_tier_ip_blocked')) { $class = 'quota' }
     elseif ($body.Contains('FreeUsageLimit') -or $body.Contains('BlackUsageLimit')) { $class = 'quota' }
     elseif ($info.Status -eq 502 -or $info.Status -eq 503 -or $info.Status -eq 504 -or $body.Contains('gateway_transport')) {
       $class = 'transport'

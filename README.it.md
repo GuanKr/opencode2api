@@ -211,7 +211,7 @@ L'idoneità determina l'instradamento; l'upstream può comunque rifiutare o limi
 
 L'ordine di instradamento è:
 
-1. Per un modello idoneo, prova una volta ciascun proxy anonimo disponibile.
+1. Per un modello idoneo, prova fino a `performance.max_anonymous_exits` proxy anonimi disponibili, una volta ciascuno; ogni proxy segue `upstream.anonymous_lane_order` (per impostazione predefinita solo la corsia v2 `/inference`, quella v1 `/zen` solo se elencata come `"legacy"`).
 2. Prova i tier autenticati nell'ordine `prefer`, usando solo i tier con una chiave configurata e una route per quel modello.
 3. Applica `retry.max_attempts` separatamente a ogni tier autenticato.
 
@@ -245,6 +245,8 @@ Un hash di sessione stabile seleziona la chiave o il proxy anonimo preferito. In
 
 Senza un ID esplicito, il primo messaggio dell'utente viene usato come seme. Conversazioni che iniziano con lo stesso contenuto possono quindi condividere l'affinità. Modificare i membri del pool può cambiare il nodo selezionato.
 
+La corsia anonima può rispondere `503` da sola, e il campo `code` dice quale lato ha fallito: `proxy_error` = nessuna uscita raggiungibile; `free_tier_ip_blocked` = il tier gratuito ha segnalato l'IP di uscita come abusivo (quell'uscita resta fuori rotazione per `performance.free_tier_block_seconds`); `free_tier_lane_paused` = l'interruttore della corsia è aperto. Un'uscita solo in cooldown risponde invece `429` con `Retry-After`.
+
 I cooldown aumentano esponenzialmente fino a otto volte `performance.failure_cooldown_seconds`; viene rispettato anche un valore `Retry-After` più lungo. Se tutte le chiavi autenticate sono in cooldown, l'instradamento può provare quella il cui cooldown termina prima. I nodi anonimi ancora in cooldown vengono ignorati.
 
 ## Riferimento della configurazione
@@ -260,13 +262,16 @@ Consulta [config.example.json](config.example.json) per una configurazione inizi
 | `zen_keys`, `go_keys`       | È richiesta una chiave upstream, salvo accesso anonimo abilitato.            |
 | `anonymous`                 | `false`.                                                                      |
 | `prefer`                    | `go`; accetta `go` o `zen`.                                                   |
-| `upstream.zen`              | `https://opencode.ai/inference/openai`.                                       |
+| `upstream.zen`              | `https://opencode.ai/zen`.                                                    |
 | `upstream.go`               | `https://opencode.ai/zen/go`.                                                 |
+| `upstream.anonymous`        | `https://opencode.ai/inference`; base predefinita (e, con la configurazione predefinita, unica) della corsia anonima. |
+| `upstream.anonymous_lane_order` | `["inference"]`; basi della corsia anonima provate in ordine. `"inference"` = `upstream.anonymous`, `"legacy"` = `https://opencode.ai/zen` (corsia v1). |
 | `proxies`                   | Fallback a `["direct"]` se entrambe le fonti proxy sono vuote.              |
 | `proxyfile`                 | Opzionale; i percorsi relativi sono risolti accanto al file di configurazione. |
 | `models.refresh_seconds`    | `300`; minimo 1.                                                              |
 | `models.protocols`          | `{}`; override del protocollo nativo per modello.                             |
 | `models.free_only`          | `false`; mostra e instrada solo modelli gratuiti, anche con chiavi Zen o Go.  |
+| `models.anonymous_backoff`  | Assente (disattivato); `{threshold, base_hours, max_hours}`, predefiniti `6`, `1`, `24`. |
 | `reasoning.effort`          | Vuoto (disattivato); `minimal`, `low`, `medium`, `high`, `xhigh`, `max` o `none`. |
 | `reasoning.effort_by_model` | `{}`; override di `reasoning.effort` per modello.                             |
 
@@ -319,7 +324,8 @@ Una voce pool viene gestita diversamente da un proxy statico:
 | Riutilizzo connessioni    | Keep-alive e multiplexing HTTP/2 (impostazioni `performance.*`)     | Nuovo tunnel TCP + CONNECT per richiesta (`DisableKeepAlives`, senza HTTP/2) |
 | Cooldown dopo un errore   | Backoff esponenziale 15–120 s, esteso da `Retry-After`              | Nessuno: la richiesta successiva usa un nuovo IP di uscita                 |
 | Esclusione per stato      | Segnalato come non integro, chiavi riassegnate, verifica ogni 15 min | Mai escluso; il controllo di integrità viene saltato                       |
-| Retry del canale anonimo  | Al massimo un tentativo per proxy configurato                       | Fino a `retry.max_attempts`, ruotando la voce del pool                     |
+| Blocco IP per abuso (`403`) | Fuori rotazione per `performance.free_tier_block_seconds`         | Non applicato: la voce cambia il proprio IP di uscita a ogni tentativo      |
+| Retry del canale anonimo  | Fino a `performance.max_anonymous_exits` proxy, uno per proxy       | Fino a `max(performance.max_anonymous_exits, retry.max_attempts)`, ruotando la voce del pool |
 
 Usalo quando l'endpoint dietro l'URL esegue già la rotazione e i singoli IP di uscita sono soggetti a limiti o instabilità. Il gateway tratterà ogni tentativo come un endpoint nuovo invece di fissare la conversazione a un solo IP. Basta una voce `#pool`: non serve elencare decine di indirizzi. Le voci statiche mantengono il comportamento del pool di connessioni descritto sotto.
 
@@ -336,6 +342,8 @@ Usalo quando l'endpoint dietro l'URL esegue già la rotazione e i singoli IP di 
 | `performance.max_idle_conns_per_host`      | `256`       | Limite connessioni inattive per host e trasporto.          |
 | `performance.max_conns_per_host`           | `0`         | Limite connessioni per host; 0 significa illimitato.       |
 | `performance.idle_conn_timeout_seconds`    | `120`       | Durata delle connessioni inattive.                        |
+| `performance.max_anonymous_exits`          | `8`         | Proxy statici distinti per richiesta anonima.             |
+| `performance.free_tier_block_seconds`      | `900`       | Cooldown per un'uscita segnalata dal tier gratuito.       |
 
 Il timeout degli header per tentativo è limitato dal timeout della richiesta. Impostalo sotto il timeout totale se vuoi lasciare tempo per il fallback in caso di upstream lento. La scadenza del contesto della richiesta interrompe i tentativi successivi senza penalizzare chiavi o proxy non usati.
 

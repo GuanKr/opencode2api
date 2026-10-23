@@ -62,6 +62,15 @@ type watchdogStatusResponse struct {
 		// one residual cooldown can recommend a switch the next turn does
 		// not need, so the script should confirm twice before switching.
 		Verdict string `json:"verdict"`
+		// BlockedExits counts exits the free tier flagged as abusive. It is
+		// reported because the block is invisible in CoolingSeconds: the 403
+		// also starts a short cooldown, and once that expires the snapshot goes
+		// empty while every request still answers free_tier_ip_blocked.
+		BlockedExits int `json:"blocked_exits,omitempty"`
+		// PausedSeconds is how long the lane-level circuit breaker still holds
+		// the anonymous lane shut. Non-zero means user traffic is not reaching
+		// the free tier at all, which no cooldown snapshot can show.
+		PausedSeconds int64 `json:"paused_seconds,omitempty"`
 		// LastSuccessAgeS is how long ago the last user-traffic anonymous
 		// success landed (omitted when none recorded this process). It is
 		// the positive recovery proof: a verdict flip to ok with an old
@@ -99,6 +108,25 @@ func (g *Gateway) handleWatchdogStatus(w http.ResponseWriter, _ *http.Request) {
 		// intentionally dropped here (see staleCauseSnapshot) so an old
 		// quota/ratelimit cannot hold recommend_switch or park the script.
 		cause = g.anonymous.staleCauseSnapshot()
+	}
+	// Lane-wide states that outlive any single cooldown, and are therefore
+	// invisible to the snapshot above: every exit inside the free tier's IP
+	// block (only another exit helps, so this votes quota), and the breaker
+	// holding the whole lane shut (nothing to switch to, so it votes cooling).
+	// Both are reported even while a cooldown is active, so an operator reading
+	// the feed can tell "one exit is cooling" from "the lane is unusable".
+	now := time.Now()
+	resp.Anonymous.BlockedExits = g.anonymous.blockedExitCount(now)
+	if paused, ok := g.anonymous.pausedFor(); ok {
+		resp.Anonymous.PausedSeconds = int64(math.Ceil(paused.Seconds()))
+	}
+	if cause == "" || classifyAnonymousVerdict(cause, remain > 0) == "cooling" {
+		switch {
+		case resp.Anonymous.BlockedExits > 0 && g.anonymous.blockedExits(now):
+			cause = "NetworkAbuseBlock (free tier IP block)"
+		case resp.Anonymous.PausedSeconds > 0:
+			cause = "anonymous lane paused (circuit breaker)"
+		}
 	}
 	resp.Anonymous.Cause = cause
 	resp.Anonymous.Verdict = classifyAnonymousVerdict(resp.Anonymous.Cause, resp.Anonymous.CoolingSeconds > 0)
@@ -345,6 +373,13 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 		// The free lane answers as a stream; all the watchdog needs to know is
 		// that this node was willing to serve it.
 		httpx.DrainAndClose(resp.Body)
+		// This probe is the recovery proof the block otherwise never gets: a
+		// 403 put the exit out of rotation for free_tier_block_seconds, and the
+		// operator switched nodes because of it. The 2xx just came back through
+		// that same exit, so the block (and any cooldown it started) is stale.
+		// Nothing else in the process clears it — the operator would otherwise
+		// keep receiving free_tier_ip_blocked long after the fix.
+		g.anonymous.RestoreProxy(node.proxy)
 		result.Verdict = "ok"
 		return result
 	}
@@ -438,6 +473,18 @@ func classifyAnonymousVerdict(cause string, cooling bool) string {
 	}
 	if status := upstreamStatusFromCause(cause); status >= 500 {
 		return "transport"
+	}
+	// An IP-level abuse block is the one 403 a different exit does fix, so it
+	// votes quota: the script switches, and a new node that is not blocked
+	// answers. Without this it fell through to cooling (wait) and the only
+	// remedy went unused.
+	if strings.Contains(lower, "abuse") {
+		return "quota"
+	}
+	// A paused lane has nothing to switch to until its window expires; the
+	// honest answer is "wait", not "the node is broken".
+	if strings.Contains(lower, "paused") {
+		return "cooling"
 	}
 	for _, quota := range []string{"freetier", "freeusagelimit", "blackusagelimit", "usage_limit", "quota", "exhausted", "insufficient", "credit", "balance"} {
 		if strings.Contains(lower, quota) {
