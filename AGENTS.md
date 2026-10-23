@@ -107,7 +107,7 @@
   - **独立子代理审查后的修正（第二轮，`breaker_test.go` / `placeholder_test.go` / `config_backfill_test.go` 钉住）**：
     ① **`#pool` 豁免 IP 封禁**：`markBlocked` 对 `proxy.pool` 直接 no-op——它每次尝试换出口 IP，封整条轮换端点等于连坐；原先一次 403 会让唯一的 `#pool` 条目停 900s 并 `ForceOpen` 熔断整条通道。README 四语池对照表补了「IP 滥用封禁」行。
     ② **封禁/暂停进入判决通道**：`status.anonymous` 新增 `blocked_exits` 与 `paused_seconds`；全出口被封 → cause `NetworkAbuseBlock …` → `classifyAnonymousVerdict` 归 **quota**（换节点是唯一解法，脚本要换）；熔断打开 → cause `anonymous lane paused …` → **cooling**（窗口内换节点无效，只等）。原先 403 的 15s 冷却一过，status 就报 `verdict=ok`，而每个请求都在 503。
-    ③ **封禁的清除路径**：原先只有 TTL 到期一条。现在 `RestoreProxy`（健康检查/重启用恢复）清 `blockedUntil`，看门狗**强制探针 2xx** 也清——那是「出口已换、IP 已干净」唯一的过程内证据。
+    ③ **封禁的清除路径**：原先只有 TTL 到期一条。现在 `RestoreProxy`（健康检查/重启用恢复）清 `blockedUntil`，而且**放在冷却守卫之前**——诊断请求（WebUI 调试页）能把出口标成 blocked 却不写冷却，旧顺序会让这类出口永远清不掉；看门狗**强制探针 2xx** 只调 `node.proxy.clearBlocked()`，**不调** `RestoreProxy`：后者会连冷却与 cause 记忆一起抹掉，而那正是 `transport_confirm_rounds` 还在收集的证据，一次 2xx 就会让一轮传输争议提前收尾。探针合约从「不写任何池状态」改为「只清 IP 封禁」。
     ④ **429 不再计入熔断 strike**：`observeAnonymousResult` 用 `classifyAnonymousVerdict` 判 quota/ratelimit 就跳过 `NoteFailure`。否则一次全 429 请求（8 出口 × threshold 6）就能把这条 lane 停 1h，与本地 D3「冷却期答 429 + Retry-After、封顶 15s」直接冲突。四语 README 的熔断段落已同步。
     ⑤ **`blocked` 不再被覆盖**：`blocked = blocked || blockedExits(...)`。原先某出口已 403、剩余出口只是 unhealthy 时会被重置成 false，于是 Zen key tier 又拿着同一个被封 IP 去撞。
     ⑥ **确定性拒绝收窄**：`deterministicMarkers` 只留 context-length 类（`context_length_exceeded` / `maximum context length` / `string_above_max_length` / `prompt is too long`），并接受 413。原先把 `invalid_request_error`/`invalid_request` 也算进去，而匿名 body 是网关整形过的（`max_completion_tokens:32000`、工具定义），整形引入的 400 会被误判成「客户端的错」并跳过可能可用的 key tier。
@@ -116,7 +116,10 @@
     ⑨ **占位符 key 的报错**：「无可用 key」的启动错误现在点明「文档占位符被忽略」，否则运维看着文件里明明有 `sk-your-zen-key` 却被告知没配 key。`DropPlaceholderKeys` 的注释改为如实描述（落盘会真的删掉，不只是忽略），切片改为新建而非复用后备数组。
     ⑩ **i18n 兜底**：`lookup()` 与 `apply()` 从「locale → zh-CN」改为「locale → zh-CN → en」。意大利语块来自上游，比本基线少 78 个键（整个使用记录页 + 两个 context 列），原先会直接渲染成中文。
     ⑪ 文档：四语 README 补 `anonymous_lane_order`/`anonymous_backoff`/两个 `performance.*` 行与两条新 503 码说明；`README.it.md` 的 `upstream.zen` 默认值（写成 `/inference/openai`）改正为 `/zen`；`#pool` 重试次数改为 `max(max_anonymous_exits, max_attempts)`（代码就是这么取的）。
-  - ⚠️ **审查中识别但未改的既有取舍**：① 半开探针名额被后台刷新/可用性探测整段持有时，用户请求会拿到 `errAnonymousLanePaused` 并落到 key tier（有 key 时无感；无 key 时答 503，措辞是「paused」而非「probing」）；② `blocked` 成立时优先返回 `free_tier_ip_blocked`，即使另一个出口实际答的是带 `Retry-After` 的 429；③ `NoteNeutral` 会清掉别的请求刚打开的熔断（半开名额意味着同一时刻只有一个请求在跑，影响面很小）；④ `v2ShellDescription` 只在 Windows 上改写，Linux 网关仍按钉住的 Windows 措辞发（`opencode_tools.json` 的既定取舍，不要为此把文件换回 Linux 版）。
+    ⑫ **`NoteNeutral` 只在持有半开名额时关熔断**：`probing` 为 false（普通流量拿到请求级拒绝）时只清 `consecutive`，不动 `breakerUntil`。原先无条件清零，会把**另一个请求**刚 trip 的熔断关掉。
+    ⑬ **413 直接判确定性拒绝**：典型 413 正文是 `Request Entity Too Large`，不含任何长度类 marker，先判状态再匹配正文，否则新加的 413 分支是死代码。
+    ⑭ **status 的 cause 与 seconds 同源**：改写成长度级 cause（abuse/paused）时把 `cooling_seconds` 清零，否则报出的秒数属于被替换掉的那次冷却。
+  - ⚠️ **审查中识别但未改的既有取舍**：① 半开探针名额被后台刷新/可用性探测整段持有时，用户请求会拿到 `errAnonymousLanePaused` 并落到 key tier（有 key 时无感；无 key 时答 503，措辞是「paused」而非「probing」）；② `blocked` 成立时优先返回 `free_tier_ip_blocked`，即使另一个出口实际答的是带 `Retry-After` 的 429；③ `v2ShellDescription` 只在 Windows 上改写，Linux 网关仍按钉住的 Windows 措辞发（`opencode_tools.json` 的既定取舍，不要为此把文件换回 Linux 版）；④ 门 `403`（`FreeTierError`）按 quota 归类后被排除在熔断计数之外，所以「整形逻辑坏掉导致每个出口都过不了门」不会触发熔断，只会一直按 quota 换节点——这是本地 2026-10-17 裁决的直接结果，不是本轮引入的。
 
 - **合并状态（2026-10-20，已完成）**：上游 `main` 3 个提交并入（`3f8157c` → `d04ff33`：`81ad284` 命名重构 / `a70e77f` 审计修复 / `d04ff33` Bun 伪装；67 文件 +4242/−986），在 `local-merge` 上**一次 merge** 合完（`aec8053`），14 个冲突文件全部手工解（8 个 hunk 在 gateway 热路径）。回退点 `local-pre-upstream-20261020`。
 

@@ -311,8 +311,16 @@ func (p *anonymousNodes) NoteNeutral() {
 		return
 	}
 	p.consecutive.Store(0)
-	p.breakerUntil.Store(0)
-	p.probing.Store(false)
+	// Only the request holding the half-open slot may close the breaker. A
+	// request-level rejection usually arrives on the normal path (probing ==
+	// false), where clearing breakerUntil would undo a trip another request just
+	// recorded: the lane would resume hammering the upstream that is failing,
+	// and the request that reported it was neutral was never in a position to
+	// know the lane is reachable.
+	if p.probing.Load() {
+		p.breakerUntil.Store(0)
+		p.probing.Store(false)
+	}
 }
 
 // NoteFailure records one failed attempt. It reports the pause window when the
@@ -582,6 +590,10 @@ func (n *anonymousNode) hasCauseMemory() bool {
 // back, and the watchdog would switch a healthy node once for nothing.
 // lastSuccess and lastFailure stay untouched: they are user-traffic evidence,
 // so the script still has to see a real turn before it calls the node recovered.
+//
+// The free-tier IP block is cleared as well, because it is the same kind of
+// question answered by the same probe: a route that just completed an HTTP
+// round trip is not one the upstream is refusing from that IP.
 func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 	if p == nil || proxy == nil {
 		return 0
@@ -591,6 +603,13 @@ func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 		if node.proxy != proxy {
 			continue
 		}
+		// Un-block before the cooldown guard: a diagnostic request (the WebUI
+		// debug page) can put the exit under the abuse block while
+		// observeAnonymousResult deliberately records no cooldown for it. Such
+		// an exit has no cooldown, no failures and no cause memory, so the
+		// guard below would skip it and leave the block in place with nothing
+		// able to clear it short of the TTL.
+		proxy.clearBlocked()
 		if node.cooldownUntil.Load() == 0 && node.failures.Load() == 0 && !node.hasCauseMemory() {
 			continue
 		}
@@ -599,12 +618,6 @@ func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 		node.coolCause.Store("")
 		node.lastCause.Store("")
 		node.causeExpires.Store(0)
-		// A recovered proxy is also un-blocked: the health check just reached
-		// the upstream through this exit, which is strictly better evidence
-		// than the 403 that put it out of rotation. Without this the exit sat
-		// out the rest of free_tier_block_seconds while every request answered
-		// free_tier_ip_blocked, and nothing short of a restart cleared it.
-		proxy.clearBlocked()
 		cleared++
 	}
 	return cleared

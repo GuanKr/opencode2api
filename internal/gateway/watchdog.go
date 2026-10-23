@@ -121,11 +121,22 @@ func (g *Gateway) handleWatchdogStatus(w http.ResponseWriter, _ *http.Request) {
 		resp.Anonymous.PausedSeconds = int64(math.Ceil(paused.Seconds()))
 	}
 	if cause == "" || classifyAnonymousVerdict(cause, remain > 0) == "cooling" {
+		replaced := false
 		switch {
 		case resp.Anonymous.BlockedExits > 0 && g.anonymous.blockedExits(now):
 			cause = "NetworkAbuseBlock (free tier IP block)"
+			replaced = true
 		case resp.Anonymous.PausedSeconds > 0:
 			cause = "anonymous lane paused (circuit breaker)"
+			replaced = true
+		}
+		// The pair stays same-source: the seconds above belong to the cooldown
+		// that was replaced, so reporting them next to a lane-level cause would
+		// describe two different events. Dropping the pair's seconds is
+		// deliberate — the message carries its own horizon (block TTL / pause
+		// window) through blocked_exits and paused_seconds.
+		if replaced {
+			resp.Anonymous.CoolingSeconds = 0
 		}
 	}
 	resp.Anonymous.Cause = cause
@@ -235,8 +246,9 @@ func (g *Gateway) handleWatchdogProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Diagnostic context: a probe is not user traffic. The path below calls the
-	// upstream client directly and writes no pool state, so this is belt and
-	// braces against a future refactor routing probes through doUpstream.
+	// upstream client directly and writes no pool state except clearing an IP
+	// abuse block (see runWatchdogProbe), so this is belt and braces against a
+	// future refactor routing probes through doUpstream.
 	result := g.runWatchdogProbe(WithDiagnosticRequest(r.Context()), model)
 	// A finished probe answers 200 whatever the upstream said, so the monitor's
 	// success/error split has to come from the verdict rather than the status.
@@ -255,12 +267,15 @@ func (g *Gateway) handleWatchdogProbe(w http.ResponseWriter, r *http.Request) {
 // classifies the answer with the status feed's own vocabulary, so the two can
 // never drift apart.
 //
-// It writes no pool state whatsoever: no cooldown, no health verdict, no
+// It writes almost no pool state: no cooldown, no health verdict, no
 // lastSuccess/lastFailure, no stale-reasoning memo, and it never triggers a
-// background proxy check. The node is left exactly as the pool found it, which
-// is what makes the bypass free — and what keeps the feed's "user traffic only"
-// contract intact, so a probe can never fake the recovery evidence the script
-// waits for.
+// background proxy check. The one exception is an IP abuse block, which a 2xx
+// clears — that block is a property of the egress IP, the probe just proved the
+// IP works, and nothing else in the process would ever clear it before
+// performance.free_tier_block_seconds expired. The feed's "user traffic only"
+// recovery evidence stays intact either way: a probe never advances lastSuccess
+// and never shortens a transport cooldown, so it cannot fake a recovery the
+// script is waiting to confirm.
 func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogProbeResponse {
 	result := watchdogProbeResponse{Probe: "anonymous", Model: model}
 	proxyName := ""
@@ -376,10 +391,14 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 		// This probe is the recovery proof the block otherwise never gets: a
 		// 403 put the exit out of rotation for free_tier_block_seconds, and the
 		// operator switched nodes because of it. The 2xx just came back through
-		// that same exit, so the block (and any cooldown it started) is stale.
-		// Nothing else in the process clears it — the operator would otherwise
-		// keep receiving free_tier_ip_blocked long after the fix.
-		g.anonymous.RestoreProxy(node.proxy)
+		// that same exit, so the block is stale.
+		//
+		// Only the block: RestoreProxy would also wipe the cooldown and the
+		// cause memory, which is exactly the evidence the script's
+		// transport_confirm_rounds gate is still collecting. A probe that
+		// erased it would let one 2xx end a transport dispute in the upstream's
+		// favour after a single round.
+		node.proxy.clearBlocked()
 		result.Verdict = "ok"
 		return result
 	}

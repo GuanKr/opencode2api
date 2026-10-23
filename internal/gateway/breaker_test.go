@@ -66,10 +66,11 @@ func TestAnonymousBreakerPauseDoublesAndCaps(t *testing.T) {
 	}
 }
 
-// A request-level rejection proves the lane is reachable. NoteNeutral must
-// close the breaker without counting a strike, or a client sending one bad
-// payload would keep the lane paused.
-func TestAnonymousNoteNeutralClosesWithoutStrike(t *testing.T) {
+// A request-level rejection proves the lane is reachable, but only the request
+// holding the half-open slot may say so. NoteNeutral must never clear a breaker
+// that another request just tripped: that request would have no idea whether the
+// lane is back, and the lane would resume hammering a failing upstream.
+func TestAnonymousNoteNeutralClosesOnlyForTheProbeHolder(t *testing.T) {
 	pool := &anonymousNodes{backoff: anonymousBackoff{threshold: 3, base: time.Hour, max: time.Hour}}
 	// Trip it once through the real path (expired window -> immediate trip), so
 	// the strike counter has something NoteNeutral could wrongly reset.
@@ -81,10 +82,17 @@ func TestAnonymousNoteNeutralClosesWithoutStrike(t *testing.T) {
 		t.Fatal("a tripped breaker must be paused")
 	}
 
+	// Normal traffic does not hold the probe slot: it must not close the breaker.
 	pool.NoteNeutral()
+	if _, paused := pool.pausedFor(); !paused {
+		t.Fatal("a request that does not hold the half-open slot must not close the breaker")
+	}
 
+	// The half-open winner does.
+	pool.probing.Store(true)
+	pool.NoteNeutral()
 	if _, paused := pool.pausedFor(); paused {
-		t.Fatal("NoteNeutral must close the breaker")
+		t.Fatal("the half-open holder must close the breaker on a neutral answer")
 	}
 	if got := pool.breakerStrikes.Load(); got != 1 {
 		t.Fatalf("NoteNeutral must not reset the trip count, got %d", got)
@@ -145,26 +153,38 @@ func TestObserveAnonymousResultStrikesOnTransportFailure(t *testing.T) {
 // invisible there: the 403's short cooldown expired, the snapshot went empty and
 // the feed said verdict=ok while every request answered free_tier_ip_blocked.
 func TestWatchdogStatusSurfacesBlockedAndPausedLane(t *testing.T) {
+	type anonymousStatus struct {
+		BlockedExits   int    `json:"blocked_exits"`
+		PausedSeconds  int64  `json:"paused_seconds"`
+		CoolingSeconds int64  `json:"cooling_seconds"`
+		Verdict        string `json:"verdict"`
+		Cause          string `json:"cause"`
+	}
+	type statusBody struct {
+		Anonymous       anonymousStatus `json:"anonymous"`
+		RecommendSwitch bool            `json:"recommend_switch"`
+	}
+	read := func(g *Gateway) statusBody {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		g.handleWatchdogStatus(rec, httptest.NewRequest(http.MethodGet, "/v1/watchdog/status", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status must be 200, got %d", rec.Code)
+		}
+		// A fresh value every call: the fields carry omitempty, so reusing one
+		// struct across scenarios would keep stale values for omitted fields.
+		var body statusBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+
 	g, node := breakerGateway(t)
 	g.cfg.Anonymous = true
 	node.proxy.markBlocked(time.Now().Add(10 * time.Minute))
 
-	rec := httptest.NewRecorder()
-	g.handleWatchdogStatus(rec, httptest.NewRequest(http.MethodGet, "/v1/watchdog/status", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status must be 200, got %d", rec.Code)
-	}
-	var body struct {
-		Anonymous struct {
-			BlockedExits int    `json:"blocked_exits"`
-			Verdict      string `json:"verdict"`
-			Cause        string `json:"cause"`
-		} `json:"anonymous"`
-		RecommendSwitch bool `json:"recommend_switch"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
+	body := read(g)
 	if body.Anonymous.BlockedExits != 1 {
 		t.Fatalf("blocked_exits must be reported, got %d", body.Anonymous.BlockedExits)
 	}
@@ -179,16 +199,68 @@ func TestWatchdogStatusSurfacesBlockedAndPausedLane(t *testing.T) {
 	// so the feed must say "wait" rather than "the node is broken".
 	g.anonymous.breakerUntil.Store(time.Now().Add(time.Hour).UnixNano())
 	node.proxy.clearBlocked()
-	rec = httptest.NewRecorder()
-	g.handleWatchdogStatus(rec, httptest.NewRequest(http.MethodGet, "/v1/watchdog/status", nil))
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
+	body = read(g)
 	if body.Anonymous.Verdict != "cooling" {
 		t.Fatalf("a paused lane must vote cooling, got %q (%s)", body.Anonymous.Verdict, body.Anonymous.Cause)
 	}
+	if body.Anonymous.PausedSeconds <= 0 {
+		t.Fatalf("paused_seconds must be reported, got %d", body.Anonymous.PausedSeconds)
+	}
 	if body.RecommendSwitch {
 		t.Fatal("a paused lane must not recommend a switch")
+	}
+}
+
+// A fully blocked lane outranks a cooling one: the block lasts
+// free_tier_block_seconds, the cooldown 15s, and only another exit helps. The
+// reported seconds must go with the cause that is actually reported, so the
+// replaced cooldown's remainder is dropped rather than paired with a
+// lane-level cause.
+func TestWatchdogStatusBlockedWinsOverACoolingCause(t *testing.T) {
+	g, node := breakerGateway(t)
+	g.cfg.Anonymous = true
+	// A cooling cause that would normally vote cooling, plus a live cooldown.
+	g.anonymous.markUserFailure(node, nil, errors.New("upstream HTTP 400"), "upstream error (upstream HTTP 400)", "turn")
+	if node.cooldownUntil.Load() == 0 {
+		t.Fatal("fixture must leave a live cooldown")
+	}
+	node.proxy.markBlocked(time.Now().Add(10 * time.Minute))
+
+	rec := httptest.NewRecorder()
+	g.handleWatchdogStatus(rec, httptest.NewRequest(http.MethodGet, "/v1/watchdog/status", nil))
+	var body struct {
+		Anonymous struct {
+			CoolingSeconds int64  `json:"cooling_seconds"`
+			Verdict        string `json:"verdict"`
+			Cause          string `json:"cause"`
+		} `json:"anonymous"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Anonymous.Verdict != "quota" {
+		t.Fatalf("a blocked lane must vote quota even with a cooling cause, got %q (%s)", body.Anonymous.Verdict, body.Anonymous.Cause)
+	}
+	if body.Anonymous.CoolingSeconds != 0 {
+		t.Fatalf("the replaced cooldown's seconds must be dropped, got %d", body.Anonymous.CoolingSeconds)
+	}
+}
+
+// RestoreProxy must clear a block even when the node has no cooldown to clear.
+// A diagnostic request (the WebUI debug page) can mark the exit blocked while
+// observeAnonymousResult deliberately records no cooldown, and the old guard
+// skipped exactly that node.
+func TestRestoreProxyClearsBlockWithoutACooldown(t *testing.T) {
+	g, node := breakerGateway(t)
+	node.proxy.markBlocked(time.Now().Add(10 * time.Minute))
+	if node.cooldownUntil.Load() != 0 || node.failures.Load() != 0 {
+		t.Fatal("fixture must leave the node without cooldown evidence")
+	}
+
+	g.anonymous.RestoreProxy(node.proxy)
+
+	if node.proxy.blocked(time.Now()) {
+		t.Fatal("a restored proxy must be un-blocked even when it had no cooldown")
 	}
 }
 

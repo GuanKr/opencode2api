@@ -135,7 +135,12 @@ var deterministicMarkers = []string{
 // isDeterministicClientResponse reports whether status and body describe a
 // request-level rejection rather than a credential or availability problem.
 func isDeterministicClientResponse(status int, body []byte) bool {
-	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity && status != http.StatusRequestEntityTooLarge {
+	// 413 is the upstream's own verdict on the payload size: no other exit can
+	// make the body smaller, and the body carries no marker to match on.
+	if status == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
 		return false
 	}
 	text := strings.ToLower(string(body))
