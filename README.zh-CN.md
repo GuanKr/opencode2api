@@ -215,9 +215,9 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 2. 按 `prefer` 顺序尝试认证通道，仅包含已配置 Key 且可以提供该模型的 Tier。
 3. 每个认证 Tier 分别使用 `retry.max_attempts` 预算。
 
-匿名阶段不受 `retry.max_attempts` 截断，但所有阶段共享请求总超时。网络错误、认证失败、限流和服务端错误可以触发出口轮换。请求级 `400`/`413`/`422`（例如 `context_length_exceeded`）会立即结束请求：换出口或换 Tier 都无法改变请求本身。IP 级 abuse `403` 只淘汰当前出口；所有出口都被封时停止扫描，已配置的 Go Key 仍可继续服务。
+匿名阶段不受 `retry.max_attempts` 截断，但所有阶段共享请求总超时。网络错误、认证失败、限流和服务端错误可以触发出口轮换。长度/上下文类拒绝（`413`，或正文含 `context_length_exceeded`、`maximum context length`、`string_above_max_length`、`prompt is too long` 的 `400`/`422`）会立即结束请求：换出口或换 Tier 都无法改变请求本身。IP 级 abuse `403` 只淘汰当前出口；所有出口都被封时停止扫描，已配置的 Go Key 仍可继续服务。
 
-匿名通道也可能自己答 `503`，用 `code` 区分是哪一侧出的问题：`proxy_error` = 没有出口可连；`free_tier_ip_blocked` = 出口 IP 被免费层判为滥用（该出口停用 `performance.free_tier_block_seconds` 秒）；`free_tier_lane_paused` = lane 级熔断已打开。只是出口在冷却时答 `429` + `Retry-After`。
+匿名通道也可能自己答 `503`，用 `error.type` 区分是哪一侧出的问题：`proxy_error` = 没有出口可连；`free_tier_ip_blocked` = 出口 IP 被免费层判为滥用（该出口停用 `performance.free_tier_block_seconds` 秒）；`free_tier_lane_paused` = lane 级熔断已打开。只是出口在冷却时答 `429` + `Retry-After`。
 
 配置 `models.anonymous_backoff` 后，连续 `threshold` 次匿名失败或所有出口都被 IP 封禁会暂停整条匿名通道 `base_hours`，之后每次再触发翻倍，直到 `max_hours`。单个非滥用 `403` 只计入连续失败（不会立即熔断）；`429` 及其它额度/限流应答**不计入**——那条路径走短冷却 + `Retry-After`，配额烧完应该等几秒，而不是被暂停一小时。免费层自己的门 `403`（`FreeTierError`）同样不计入：它是对该出口所发请求形状的判决，不是「通道坏了」的证据。暂停期间不取代理、不发任何上游请求（包括模型目录刷新和可用性探测），路由直接落到认证通道。窗口到期后只允许一个请求做半开探测：成功关闭熔断并恢复匿名通道，失败则开启下一个更长的窗口。省略该配置块时熔断关闭。
 
@@ -413,7 +413,7 @@ Playground 需要已登录的 Session 和 `X-CSRF-Token`，每个客户端 IP �
 
 ### 界面语言
 
-WebUI 从 `webui/js/i18n.js` 加载翻译，内置 **简体中文**（默认）、**English**、**Tiếng Việt** 和 **Italiano**。原始简体中文文案保留在 `index.html` 和 `webui/js/` 中，并始终作为缺少翻译时的回退，因此新增语言不会覆盖原文。
+WebUI 从 `webui/js/i18n.js` 加载翻译，内置 **简体中文**（默认）、**English**、**Tiếng Việt** 和 **Italiano**。原始简体中文文案保留在 `index.html` 和 `webui/js/` 中，就是中文界面本身。其它语言缺某条翻译时先回退到 **English**（翻译块可能落后于新增页面），英文也没有才回退原文；因此新增语言不会覆盖原文。
 
 - 语言选择器位于顶部工具栏右侧，登录卡片上也有一个。
 - 选择结果保存在 `localStorage`，键名为 `opencode2api.ui.lang`。

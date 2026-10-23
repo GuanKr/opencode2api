@@ -245,7 +245,7 @@ Un hash di sessione stabile seleziona la chiave o il proxy anonimo preferito. In
 
 Senza un ID esplicito, il primo messaggio dell'utente viene usato come seme. Conversazioni che iniziano con lo stesso contenuto possono quindi condividere l'affinità. Modificare i membri del pool può cambiare il nodo selezionato.
 
-La corsia anonima può rispondere `503` da sola, e il campo `code` dice quale lato ha fallito: `proxy_error` = nessuna uscita raggiungibile; `free_tier_ip_blocked` = il tier gratuito ha segnalato l'IP di uscita come abusivo (quell'uscita resta fuori rotazione per `performance.free_tier_block_seconds`); `free_tier_lane_paused` = l'interruttore della corsia è aperto. Un'uscita solo in cooldown risponde invece `429` con `Retry-After`.
+La corsia anonima può rispondere `503` da sola, e il campo `error.type` dice quale lato ha fallito: `proxy_error` = nessuna uscita raggiungibile; `free_tier_ip_blocked` = il tier gratuito ha segnalato l'IP di uscita come abusivo (quell'uscita resta fuori dalla rotazione per `performance.free_tier_block_seconds`); `free_tier_lane_paused` = l'interruttore automatico (breaker) della corsia è aperto. Un'uscita solo in cooldown risponde invece `429` con `Retry-After`.
 
 I cooldown aumentano esponenzialmente fino a otto volte `performance.failure_cooldown_seconds`; viene rispettato anche un valore `Retry-After` più lungo. Se tutte le chiavi autenticate sono in cooldown, l'instradamento può provare quella il cui cooldown termina prima. I nodi anonimi ancora in cooldown vengono ignorati.
 
@@ -324,8 +324,8 @@ Una voce pool viene gestita diversamente da un proxy statico:
 | Riutilizzo connessioni    | Keep-alive e multiplexing HTTP/2 (impostazioni `performance.*`)     | Nuovo tunnel TCP + CONNECT per richiesta (`DisableKeepAlives`, senza HTTP/2) |
 | Cooldown dopo un errore   | Backoff esponenziale 15–120 s, esteso da `Retry-After`              | Nessuno: la richiesta successiva usa un nuovo IP di uscita                 |
 | Esclusione per stato      | Segnalato come non integro, chiavi riassegnate, verifica ogni 15 min | Mai escluso; il controllo di integrità viene saltato                       |
-| Blocco IP per abuso (`403`) | Fuori rotazione per `performance.free_tier_block_seconds`         | Non applicato: la voce cambia il proprio IP di uscita a ogni tentativo      |
-| Retry del canale anonimo  | Fino a `performance.max_anonymous_exits` proxy, uno per proxy       | Fino a `max(performance.max_anonymous_exits, retry.max_attempts)`, ruotando la voce del pool |
+| Blocco IP per abuso (`403`) | Fuori dalla rotazione per `performance.free_tier_block_seconds`, fino all'utile riprova         | Non applicato: la voce cambia il proprio IP di uscita a ogni tentativo      |
+| Retry del canale anonimo  | Al massimo un tentativo per proxy, fino a `performance.max_anonymous_exits` proxy | Fino a `max(performance.max_anonymous_exits, retry.max_attempts)`, ruotando la voce del pool |
 
 Usalo quando l'endpoint dietro l'URL esegue già la rotazione e i singoli IP di uscita sono soggetti a limiti o instabilità. Il gateway tratterà ogni tentativo come un endpoint nuovo invece di fissare la conversazione a un solo IP. Basta una voce `#pool`: non serve elencare decine di indirizzi. Le voci statiche mantengono il comportamento del pool di connessioni descritto sotto.
 

@@ -48,8 +48,10 @@ func TestDropPlaceholderKeysOnlyTouchesUpstreamPools(t *testing.T) {
 	if len(got.ServerKeys) != 1 || got.ServerKeys[0] != "change-this-local-key" {
 		t.Fatalf("server_keys must be left alone, got %v", got.ServerKeys)
 	}
-	// The input must not be mutated through a shared backing array.
-	if len(cfg.ZenKeys) != 2 {
+	// The input must not be mutated through a shared backing array. Checking
+	// the length is not enough: an in-place `keys[:0]` compaction keeps len 2
+	// and only moves the contents, so assert the element itself.
+	if len(cfg.ZenKeys) != 2 || cfg.ZenKeys[0] != "sk-your-zen-key" || cfg.ZenKeys[1] != "sk-live-zen" {
 		t.Fatalf("the caller's slice must not be rewritten in place, got %v", cfg.ZenKeys)
 	}
 }

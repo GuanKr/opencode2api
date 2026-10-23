@@ -2159,6 +2159,10 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 	if err == nil && status/100 == 2 {
 		g.anonymous.MarkSuccess(node)
 		g.anonymous.NoteSuccess()
+		// A 2xx on the free lane is proof this egress IP is served again, which
+		// is the only evidence that may end an abuse block early (a proxy health
+		// check proves the tunnel, not the upstream's verdict).
+		node.proxy.clearBlocked()
 	} else {
 		// watchdogCause only labels the failure for the watchdog feed; the
 		// upstream error document itself is still passed through untouched
@@ -2181,6 +2185,13 @@ func (g *Gateway) observeAnonymousResult(ctx context.Context, node *anonymousNod
 		// hour-long 503 while the client was told to retry in seconds.
 		// Transport and 5xx still count: those say the lane itself is unreachable.
 		if verdict := classifyAnonymousVerdict(cause, false); verdict == "quota" || verdict == "ratelimit" {
+			return
+		}
+		// An upstream that names no error class at all still answered "too many
+		// requests", and classifyAnonymousVerdict cannot see that without a
+		// type. The status can: a bare 429 is throttling, not a broken lane, and
+		// it already took the short cooldown above.
+		if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 			return
 		}
 		if pause, tripped := g.anonymous.NoteFailure(); tripped {

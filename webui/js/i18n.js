@@ -1858,14 +1858,18 @@ let locale = DEFAULT_LOCALE;
 const fill = (text, args) =>
   args.reduce((value, item, index) => value.replaceAll(`{${index}}`, String(item)), text);
 
-// lookup falls back through zh-CN and then English. The Chinese dictionary is
-// deliberately empty (the authored strings are the source text), and a locale
-// that lags behind the source gains keys on every feature — the Italian block
-// was merged from upstream without this build's usage-records page. Falling
-// back to English keeps a new page readable in every locale instead of
-// rendering the raw Chinese.
+// lookup falls back to English for locales that lag behind the source: the
+// authored strings ARE the Chinese text, so zh-CN needs no dictionary, and a
+// contributed locale gains keys on every feature — the Italian block was merged
+// from upstream without this build's usage-records page, and rendering that
+// page in Chinese is worse than rendering it in English.
+//
+// zh-CN must NOT fall back to English: the original string is already Chinese,
+// and the dictionary has no zh-CN block, so a blanket chain would translate the
+// whole default UI into English.
 const lookup = (key) => {
-  for (const code of [locale, DEFAULT_LOCALE, "en"]) {
+  const chain = locale === DEFAULT_LOCALE ? [DEFAULT_LOCALE] : [locale, "en"];
+  for (const code of chain) {
     const value = DICTIONARY[code]?.[key];
     if (value !== undefined) return value;
   }

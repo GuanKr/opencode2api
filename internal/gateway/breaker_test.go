@@ -138,6 +138,20 @@ func TestObserveAnonymousResultDoesNotStrikeOnQuotaAnswers(t *testing.T) {
 	}
 }
 
+// An upstream that names no error class still said "too many requests". The
+// classifier keys on the cause string, which carries only the status here, so
+// the status itself has to keep this out of the strike counter.
+func TestObserveAnonymousResultDoesNotStrikeOnBare429(t *testing.T) {
+	g, node := breakerGateway(t)
+	resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"error":{"message":"Too Many Requests"}}`))}
+
+	g.observeAnonymousResult(context.Background(), node, resp, nil, "turn")
+
+	if _, paused := g.anonymous.pausedFor(); paused {
+		t.Fatal("a 429 without an error class must not trip the lane breaker")
+	}
+}
+
 // A transport failure is the opposite case: nothing reached the upstream, so
 // the lane itself is the suspect and the breaker is exactly the right answer.
 func TestObserveAnonymousResultStrikesOnTransportFailure(t *testing.T) {
@@ -246,21 +260,25 @@ func TestWatchdogStatusBlockedWinsOverACoolingCause(t *testing.T) {
 	}
 }
 
-// RestoreProxy must clear a block even when the node has no cooldown to clear.
-// A diagnostic request (the WebUI debug page) can mark the exit blocked while
-// observeAnonymousResult deliberately records no cooldown, and the old guard
-// skipped exactly that node.
-func TestRestoreProxyClearsBlockWithoutACooldown(t *testing.T) {
+// A proxy health check fetches a third-party URL: it proves the tunnel works,
+// not that OpenCode stopped refusing this egress IP. Clearing the block on that
+// evidence would cancel a 900s backoff after one unrelated 200, so RestoreProxy
+// must leave the block alone. Only free-lane evidence clears it.
+func TestRestoreProxyLeavesTheIPBlockAlone(t *testing.T) {
 	g, node := breakerGateway(t)
 	node.proxy.markBlocked(time.Now().Add(10 * time.Minute))
-	if node.cooldownUntil.Load() != 0 || node.failures.Load() != 0 {
-		t.Fatal("fixture must leave the node without cooldown evidence")
-	}
 
 	g.anonymous.RestoreProxy(node.proxy)
 
+	if !node.proxy.blocked(time.Now()) {
+		t.Fatal("a proxy health recovery must not clear the free-tier IP block")
+	}
+
+	// A 2xx on the free lane is the evidence that does clear it.
+	ok := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("data: {}\n\n"))}
+	g.observeAnonymousResult(context.Background(), node, ok, nil, "turn")
 	if node.proxy.blocked(time.Now()) {
-		t.Fatal("a restored proxy must be un-blocked even when it had no cooldown")
+		t.Fatal("a 2xx on the free lane must clear the block")
 	}
 }
 

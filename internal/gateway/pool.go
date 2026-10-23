@@ -55,8 +55,11 @@ func (t *proxyTransport) blocked(now time.Time) bool {
 }
 
 // markBlocked keeps this exit out of the anonymous cursor until until. The
-// block is a property of the egress IP, so it is never cleared by a response
-// from the same exit: only another exit can serve traffic in the meantime.
+// block is a property of the egress IP, so it ends only two ways: the TTL
+// expiring, or evidence that the free lane answers this exit again — a 2xx
+// through it on live anonymous traffic or on a forced watchdog probe
+// (clearBlocked). A plain proxy health check is NOT that evidence: it fetches a
+// third-party URL and says nothing about whether OpenCode still refuses this IP.
 //
 // A rotating #pool entry is exempt, for the same reason it is exempt from
 // cooldowns: it opens a fresh connection (and a new exit IP) on every attempt,
@@ -70,9 +73,9 @@ func (t *proxyTransport) markBlocked(until time.Time) {
 	t.blockedUntil.Store(until.UnixNano())
 }
 
-// clearBlocked returns this exit to the anonymous cursor. It is used when
-// something proves the IP works again: the health check recovering the proxy,
-// or a forced watchdog probe answering 2xx through it.
+// clearBlocked returns this exit to the anonymous cursor. Call it only with
+// free-lane evidence — a 2xx through this exit from the anonymous upstream or
+// the forced watchdog probe — never from a generic proxy health check.
 func (t *proxyTransport) clearBlocked() {
 	if t == nil {
 		return
@@ -591,9 +594,12 @@ func (n *anonymousNode) hasCauseMemory() bool {
 // lastSuccess and lastFailure stay untouched: they are user-traffic evidence,
 // so the script still has to see a real turn before it calls the node recovered.
 //
-// The free-tier IP block is cleared as well, because it is the same kind of
-// question answered by the same probe: a route that just completed an HTTP
-// round trip is not one the upstream is refusing from that IP.
+// The free-tier IP block is deliberately NOT cleared here. The recovery that
+// reaches this function is a proxy health check against a third-party URL: it
+// proves the tunnel works, not that OpenCode stopped refusing this egress IP.
+// Clearing the block on that evidence would cancel the backoff the block exists
+// to enforce after one unrelated 200. Only free-lane evidence clears it — see
+// clearBlocked.
 func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 	if p == nil || proxy == nil {
 		return 0
@@ -603,13 +609,6 @@ func (p *anonymousNodes) RestoreProxy(proxy *proxyTransport) int {
 		if node.proxy != proxy {
 			continue
 		}
-		// Un-block before the cooldown guard: a diagnostic request (the WebUI
-		// debug page) can put the exit under the abuse block while
-		// observeAnonymousResult deliberately records no cooldown for it. Such
-		// an exit has no cooldown, no failures and no cause memory, so the
-		// guard below would skip it and leave the block in place with nothing
-		// able to clear it short of the TTL.
-		proxy.clearBlocked()
 		if node.cooldownUntil.Load() == 0 && node.failures.Load() == 0 && !node.hasCauseMemory() {
 			continue
 		}
