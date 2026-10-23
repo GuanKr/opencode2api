@@ -78,3 +78,70 @@ func TestPreserveUnrenderedSettingsPrefersExplicitValues(t *testing.T) {
 		t.Fatalf("explicit backoff must win: %+v", got.Models.AnonymousBackoff)
 	}
 }
+
+// The assembly, not just the helper, has to carry the unrendered settings
+// through: a unit test on preserveUnrenderedSettings stays green if this call
+// site ever drops it, which is the exact bug the backfill exists to prevent.
+func TestBuildConfigCandidateCarriesUnrenderedSettings(t *testing.T) {
+	current := config.Config{
+		Listen:     "127.0.0.1:8080",
+		ServerKeys: []string{"local-key"},
+		Rotation:   config.RotationConfig{},
+		Upstream: config.UpstreamConfig{
+			Zen:                "https://opencode.ai/zen",
+			Go:                 "https://opencode.ai/zen/go",
+			Anonymous:          "https://opencode.ai/inference",
+			AnonymousLaneOrder: []string{"inference", "legacy"},
+		},
+		Performance: config.PerformanceConfig{
+			MaxIdleConns:         2048,
+			MaxAnonymousExits:    40,
+			FreeTierBlockSeconds: 1800,
+		},
+		Models: config.ModelsConfig{AnonymousBackoff: &config.AnonymousBackoffConfig{Threshold: 3, BaseHours: 2, MaxHours: 8}},
+		WebUI:  config.WebUIConfig{Enabled: true, Listen: "127.0.0.1:8081", Username: "admin", PasswordHash: "hash", SessionTTLMinutes: 720},
+	}
+	// Exactly what webui/js/pages/config.js submits: no lane order, no exit
+	// cap, no block window, no backoff block.
+	update := ConfigUpdate{
+		Listen:      "127.0.0.1:9090",
+		ServerKeys:  []SecretInput{{Value: "local-key"}},
+		Anonymous:   true,
+		Upstream:    config.UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
+		Performance: config.PerformanceConfig{MaxIdleConns: 64, FailureCooldownSeconds: 15},
+		Models:      config.ModelsConfig{RefreshSeconds: 300},
+		WebUI:       WebUIView{Enabled: true, Listen: "127.0.0.1:8081", SessionTTLMinutes: 720},
+	}
+
+	candidate, code, err := buildConfigCandidate(current, update)
+	if err != nil {
+		t.Fatalf("unexpected rejection (%s): %v", code, err)
+	}
+	if candidate.Listen != "127.0.0.1:9090" || candidate.Performance.MaxIdleConns != 64 {
+		t.Fatalf("submitted fields must be applied: %+v", candidate)
+	}
+	if len(candidate.Upstream.AnonymousLaneOrder) != 2 {
+		t.Fatalf("anonymous_lane_order was dropped by the assembly: %v", candidate.Upstream.AnonymousLaneOrder)
+	}
+	if candidate.Performance.MaxAnonymousExits != 40 || candidate.Performance.FreeTierBlockSeconds != 1800 {
+		t.Fatalf("anonymous exit knobs were dropped by the assembly: %+v", candidate.Performance)
+	}
+	if candidate.Models.AnonymousBackoff == nil || candidate.Models.AnonymousBackoff.MaxHours != 8 {
+		t.Fatalf("anonymous_backoff was dropped by the assembly: %+v", candidate.Models.AnonymousBackoff)
+	}
+	if candidate.WebUI.Username != "admin" || candidate.WebUI.PasswordHash != "hash" {
+		t.Fatalf("credentials the form does not carry must come from current: %+v", candidate.WebUI)
+	}
+}
+
+func TestBuildConfigCandidateReportsTheFailingSecret(t *testing.T) {
+	current := config.Config{ServerKeys: []string{"local-key"}}
+	// A stale fingerprint: the form sent the id of a key that no longer exists.
+	_, code, err := buildConfigCandidate(current, ConfigUpdate{ServerKeys: []SecretInput{{ID: "deadbeef"}}})
+	if err == nil {
+		t.Fatal("an unknown secret id must be rejected")
+	}
+	if code != "invalid_server_keys" {
+		t.Fatalf("the rejection must name the field, got %q", code)
+	}
+}

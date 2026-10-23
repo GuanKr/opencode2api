@@ -225,38 +225,10 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	current := a.manager.Config()
-	serverKeys, err := resolveSecrets(update.ServerKeys, current.ServerKeys)
+	candidate, code, err := buildConfigCandidate(current, update)
 	if err != nil {
-		writeAdminError(w, http.StatusBadRequest, "invalid_server_keys", err.Error())
+		writeAdminError(w, http.StatusBadRequest, code, err.Error())
 		return
-	}
-	zenKeys, err := resolveSecrets(update.ZenKeys, current.ZenKeys)
-	if err != nil {
-		writeAdminError(w, http.StatusBadRequest, "invalid_zen_keys", err.Error())
-		return
-	}
-	goKeys, err := resolveSecrets(update.GoKeys, current.GoKeys)
-	if err != nil {
-		writeAdminError(w, http.StatusBadRequest, "invalid_go_keys", err.Error())
-		return
-	}
-	proxies, err := resolveSecrets(update.Proxies, current.Proxies)
-	if err != nil {
-		writeAdminError(w, http.StatusBadRequest, "invalid_proxies", err.Error())
-		return
-	}
-	update = preserveUnrenderedSettings(current, update)
-	reasoning := current.Reasoning
-	if update.Reasoning != nil {
-		reasoning = *update.Reasoning
-	}
-	candidate := config.Config{
-		ServerKeyMetadata: current.ServerKeyMetadata,
-		Rotation:          current.Rotation,
-		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Proxies: proxies, ProxyFile: update.ProxyFile,
-		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
-		Reasoning: reasoning,
-		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}
 	result, err := a.manager.Apply(candidate, true)
 	if err != nil {
@@ -265,6 +237,50 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"result": result, "config": a.configView()})
+}
+
+// buildConfigCandidate turns a submitted form into the configuration the
+// runtime should validate. Secrets are resolved against the current values, the
+// fields the form does not render are carried over, and everything the update
+// cannot express (rotation, server key metadata, the WebUI username and password
+// hash) comes from current.
+//
+// It is a function rather than inline code in handlePutConfig so the carry-over
+// is covered by a test that goes through this assembly: a unit test on
+// preserveUnrenderedSettings alone would stay green if this call site ever
+// dropped it, which is exactly the failure mode it exists to prevent.
+//
+// The returned code is the admin error code for a secret the update got wrong.
+func buildConfigCandidate(current config.Config, update ConfigUpdate) (config.Config, string, error) {
+	serverKeys, err := resolveSecrets(update.ServerKeys, current.ServerKeys)
+	if err != nil {
+		return config.Config{}, "invalid_server_keys", err
+	}
+	zenKeys, err := resolveSecrets(update.ZenKeys, current.ZenKeys)
+	if err != nil {
+		return config.Config{}, "invalid_zen_keys", err
+	}
+	goKeys, err := resolveSecrets(update.GoKeys, current.GoKeys)
+	if err != nil {
+		return config.Config{}, "invalid_go_keys", err
+	}
+	proxies, err := resolveSecrets(update.Proxies, current.Proxies)
+	if err != nil {
+		return config.Config{}, "invalid_proxies", err
+	}
+	update = preserveUnrenderedSettings(current, update)
+	reasoning := current.Reasoning
+	if update.Reasoning != nil {
+		reasoning = *update.Reasoning
+	}
+	return config.Config{
+		ServerKeyMetadata: current.ServerKeyMetadata,
+		Rotation:          current.Rotation,
+		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Proxies: proxies, ProxyFile: update.ProxyFile,
+		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
+		Reasoning: reasoning,
+		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
+	}, "", nil
 }
 
 // preserveUnrenderedSettings copies the settings the console form does not

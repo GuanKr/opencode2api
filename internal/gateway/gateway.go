@@ -106,7 +106,7 @@ type Gateway struct {
 	// dedupes overlapping probes, not goroutine creation.
 	lastProxyKick atomic.Int64
 	// freeTierBlock is how long an exit the free tier flagged stays out of the
-	// anonymous cursor. Zero uses freeTierBlockTTL.
+	// anonymous cursor. Zero uses defaultFreeTierBlockTTL.
 	freeTierBlock time.Duration
 }
 
@@ -637,6 +637,20 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 		if errors.Is(err, errProxyUnavailable) {
 			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
 			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
+			return
+		}
+		// The two lane-level verdicts the inference path already reports. They
+		// used to fall through to 502 upstream_error here, which reads as "the
+		// upstream is broken" and sends the failover script switching nodes:
+		// wrong for a paused lane (nothing to switch to) and wrong for an IP
+		// block (the block is in the log, the node is fine). Same codes, same
+		// messages as handleInference so a client sees one vocabulary.
+		if errors.Is(err, errFreeTierIPBlocked) {
+			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, freeTierBlockedMessage, "free_tier_ip_blocked", ids.Request)
+			return
+		}
+		if errors.Is(err, errAnonymousLanePaused) {
+			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, anonymousLanePausedMessage, "free_tier_lane_paused", ids.Request)
 			return
 		}
 		g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)

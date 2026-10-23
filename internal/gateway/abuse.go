@@ -42,18 +42,19 @@ var errAnonymousLanePaused = errors.New("anonymous lane paused by its circuit br
 // Prefixed for the same reason as freeTierBlockedMessage.
 const anonymousLanePausedMessage = "opencode2api: The anonymous free tier is paused after repeated upstream failures. Configure an authenticated key, wait for the pause to expire, or restart the gateway after confirming the upstream block has lifted."
 
-// freeTierBlockTTL keeps a blocked exit out of the anonymous cursor. Upstream
-// does not publish the block duration, so this is a conservative backoff: long
-// enough to stop the retry storm, short enough that an unblocked IP recovers
-// without a restart.
-const freeTierBlockTTL = time.Duration(config.DefaultFreeTierBlockSeconds) * time.Second
+// defaultFreeTierBlockTTL keeps a blocked exit out of the anonymous cursor when
+// performance.free_tier_block_seconds is zero. Upstream does not publish the
+// block duration, so this is a conservative backoff: long enough to stop the
+// retry storm, short enough that an unblocked IP recovers without a restart.
+const defaultFreeTierBlockTTL = time.Duration(config.DefaultFreeTierBlockSeconds) * time.Second
 
-// freeTierBlockTTL returns the backoff applied to an exit the free tier flagged.
+// freeTierBlockTTL returns the backoff applied to an exit the free tier flagged,
+// which is performance.free_tier_block_seconds once Normalize has filled it in.
 func (g *Gateway) freeTierBlockTTL() time.Duration {
 	if g != nil && g.freeTierBlock > 0 {
 		return g.freeTierBlock
 	}
-	return freeTierBlockTTL
+	return defaultFreeTierBlockTTL
 }
 
 // abuseProbeLimit bounds how much of a 403 body is read to classify it.

@@ -9,7 +9,8 @@
   "upstream": {
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go",
-    "anonymous": "https://opencode.ai/inference"
+    "anonymous": "https://opencode.ai/inference",
+    "anonymous_lane_order": ["inference"]
   },
   "retry": {
     "max_attempts": 3,

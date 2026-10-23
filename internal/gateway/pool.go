@@ -524,9 +524,12 @@ func (c *anonymousCursor) NextForRequest(fingerprint string) *anonymousNode {
 //     node would answer now.
 //
 // Ordinary traffic must keep using NextForRequest. Widening this to every
-// request would turn the anonymous backoff into a no-op, and the probe it
-// serves writes no pool state at all (see handleWatchdogProbe), so bypassing
-// those gates costs nothing a later turn cannot restore on its own.
+// request would turn the anonymous backoff into a no-op, so bypassing these
+// gates is only free because the probe it serves writes almost no pool state
+// (see runWatchdogProbe): it records no cooldown, no health verdict and no
+// success/failure evidence. The single exception is a free-tier IP block, which
+// a 2xx through this exit clears — that is the only in-process evidence that can
+// retire a 900s block early, and the probe is how an operator asks for it.
 func (c *anonymousCursor) NextProbe() *anonymousNode {
 	if c.pool == nil || c.offset >= len(c.pool.nodes) {
 		return nil
