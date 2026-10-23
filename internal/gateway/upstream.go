@@ -837,7 +837,16 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				// exit and move on to another one instead of adding attempts
 				// that only lengthen the penalty. The body is restored, so the
 				// caller still forwards the upstream error.
-				node.proxy.markBlocked(time.Now().Add(g.freeTierBlockTTL()))
+				//
+				// Diagnostic traffic (the WebUI Playground, availability probes)
+				// must not bench a production exit for the whole block TTL: it
+				// leaves through the same pool, its failures say nothing about
+				// user traffic, and nothing would clear the block early — the
+				// exit is no longer drawn, so no live 2xx can prove it works.
+				// observeAnonymousResult skips diagnostics for the same reason.
+				if !isDiagnosticRequest(ctx) {
+					node.proxy.markBlocked(time.Now().Add(g.freeTierBlockTTL()))
+				}
 				lastErr = errFreeTierIPBlocked
 				blocked = true
 				g.logger.Warn("free tier blocked the egress IP; cooling the exit", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "block_for", g.freeTierBlockTTL().String())

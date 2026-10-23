@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"opencode2api/internal/config"
+	"opencode2api/internal/identity"
 )
 
 // The breaker's half-open window is the only thing standing between "the lane
@@ -279,6 +280,46 @@ func TestRestoreProxyLeavesTheIPBlockAlone(t *testing.T) {
 	g.observeAnonymousResult(context.Background(), node, ok, nil, "turn")
 	if node.proxy.blocked(time.Now()) {
 		t.Fatal("a 2xx on the free lane must clear the block")
+	}
+}
+
+// The WebUI Playground and availability probes leave through the production
+// pool. A 403 they receive must not bench an exit for the whole block TTL: that
+// exit is then no longer drawn, so no live 2xx can prove it works, and user
+// traffic pays for a diagnostic request.
+func TestDiagnosticTrafficDoesNotBlockTheExit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"Forbidden, OpenCode Free Model Gateway Detect Abuse Traffic"}}`))
+	}))
+	t.Cleanup(server.Close)
+	g := newStubGateway(t, server.URL)
+	freezeProxyHealth(g)
+	node := g.anonymous.nodes[0]
+	node.proxy.healthy.Store(true)
+
+	body := []byte(`{"model":"probe-free","stream":true,"messages":[]}`)
+	bodies := map[config.Tier][]byte{config.TierZen: body}
+	run := func(ctx context.Context, request, fingerprint string) {
+		t.Helper()
+		resp, _, _, _ := g.doUpstreamTiers(ctx, chatDumpRoute(), bodies, identity.RequestIDs{Request: request}, 0, fingerprint)
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+
+	// Distinct fingerprints: the 403 cools the exit for the turn that provoked
+	// it, and a different turn is exactly the case where it is retried.
+	run(context.Background(), "req-live", "turn-live")
+	if !node.proxy.blocked(time.Now()) {
+		t.Fatal("live anonymous traffic must bench an exit the free tier flagged")
+	}
+	node.proxy.clearBlocked()
+
+	run(WithDiagnosticRequest(context.Background()), "req-diagnostic", "turn-diagnostic")
+	if node.proxy.blocked(time.Now()) {
+		t.Fatal("diagnostic traffic must not bench a production exit")
 	}
 }
 

@@ -121,6 +121,7 @@
     ⑮ **裸 429 也不计 strike**：`classifyAnonymousVerdict` 只解析 cause 字符串，而 cause 的类别来自 `error.type`/`error.code`；上游只回 `{"error":{"message":"Too Many Requests"}}` 时会被归成 `ok` 并照样记一次 strike。现在 `observeAnonymousResult` 在分类之后再加一道 `StatusCode == 429`，语义与文档的「429 never counts」对齐。
     ⑯ **文档字段名**：503 的机器码落在 `error.type`（`wire.WriteError` 把 `code` 写成 null），四语 README 原先写成 `code`，已改。400/413/422 那句也收窄成「长度/上下文类」——确定性判据已经不再匹配通用 `invalid_request_error`，原文承诺过宽。
     ⑭ **status 的 cause 与 seconds 同源**：改写成长度级 cause（abuse/paused）时把 `cooling_seconds` 清零，否则报出的秒数属于被替换掉的那次冷却。
+    ⑰ **诊断流量不再封出口**：`markBlocked` 现在受 `isDiagnosticRequest` 约束。WebUI Playground 与可用性探测走同一个生产池，它们吃到的 abuse 403 会给出口种下 900s 封禁；而该出口此后不再被抽取，活流量也就永远等不到「2xx 解封」的证据，只能靠探针或 TTL。`observeAnonymousResult` 早就对诊断请求 early-return，写入侧此前漏了这道闸。
   - ⚠️ **审查中识别但未改的既有取舍**：① 半开探针名额被后台刷新/可用性探测整段持有时，用户请求会拿到 `errAnonymousLanePaused` 并落到 key tier（有 key 时无感；无 key 时答 503，措辞是「paused」而非「probing」）；② `blocked` 成立时优先返回 `free_tier_ip_blocked`，即使另一个出口实际答的是带 `Retry-After` 的 429；③ `v2ShellDescription` 只在 Windows 上改写，Linux 网关仍按钉住的 Windows 措辞发（`opencode_tools.json` 的既定取舍，不要为此把文件换回 Linux 版）；④ 门 `403`（`FreeTierError`）按 quota 归类后被排除在熔断计数之外，所以「整形逻辑坏掉导致每个出口都过不了门」不会触发熔断，只会一直按 quota 换节点——这是本地 2026-10-17 裁决的直接结果，不是本轮引入的。
 
 - **合并状态（2026-10-20，已完成）**：上游 `main` 3 个提交并入（`3f8157c` → `d04ff33`：`81ad284` 命名重构 / `a70e77f` 审计修复 / `d04ff33` Bun 伪装；67 文件 +4242/−986），在 `local-merge` 上**一次 merge** 合完（`aec8053`），14 个冲突文件全部手工解（8 个 hunk 在 gateway 热路径）。回退点 `local-pre-upstream-20261020`。
