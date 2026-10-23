@@ -160,14 +160,21 @@ func TestOutboundDumpRecordsTheShapedBytesSentUpstream(t *testing.T) {
 // The documented diagnostic property: equal digests mean the lane changed
 // nothing, so a shaped record identical to the client record is a real signal
 // and not a sign the dump is stale.
+//
+// The body has to be canonical for that to hold: since the 2.1 client
+// parity work, the v2 chat lane always re-encodes (model-first key order,
+// max_completion_tokens, no HTML escaping), so a payload encoded any other way
+// is reshaped by definition. Feeding it back through the same encoder is what
+// makes "nothing changed" the expected answer.
 func TestOutboundDumpShapedMatchesClientWhenShapingIsANoOp(t *testing.T) {
 	g, buf, sink := dumpTestGateway(t)
-	alreadyShaped, err := json.Marshal(map[string]any{
-		"model":          "probe-free",
-		"stream":         true,
-		"stream_options": map[string]any{"include_usage": true},
-		"messages":       []any{map[string]any{"role": "user", "content": "hi"}},
-		"tools":          anonymousToolset(wire.Chat, nil),
+	alreadyShaped, err := marshalV2ChatBody(map[string]any{
+		"model":                 "probe-free",
+		"stream":                true,
+		"stream_options":        map[string]any{"include_usage": true},
+		"messages":              []any{map[string]any{"role": "user", "content": "hi"}},
+		"tools":                 v2Toolset(wire.Chat, nil),
+		"max_completion_tokens": v2CompletionLimit,
 	})
 	if err != nil {
 		t.Fatal(err)

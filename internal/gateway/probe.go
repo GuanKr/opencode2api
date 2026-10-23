@@ -102,16 +102,30 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 		client             *http.Client
 	}
 	var lanes []lane
+	anonymousPaused := false
 	if g.cfg.Anonymous {
-		cursor := g.anonymous.CursorFor(ids.Session)
-		if node := cursor.Next(); node != nil {
-			// Try the lanes in the configured order (merge decision D1), which
-			// defaults to /inference alone. The order picks the client too:
-			// free-model traffic to /zen and /inference rides the Bun client
-			// (see inferenceClient).
-			for _, baseURL := range g.anonymousUpstreams() {
-				lanes = append(lanes, lane{anonymousZenKey, "anonymous", baseURL, g.inferenceClient(node.proxy, baseURL, model)})
+		if g.anonymous.AllowAttempt() {
+			defer g.anonymous.ReleaseProbe()
+			cursor := g.anonymous.CursorFor(ids.Session)
+			if node := cursor.Next(); node != nil {
+				// Try the lanes in the configured order (merge decision D1),
+				// which defaults to /inference alone. The order picks the
+				// client too: free-model traffic to /zen and /inference rides
+				// the Bun client (see inferenceClient).
+				for _, baseURL := range g.anonymousUpstreams() {
+					lanes = append(lanes, lane{anonymousZenKey, "anonymous", baseURL, g.inferenceClient(node.proxy, baseURL, model)})
+				}
+			} else {
+				// Every exit is cooling, blocked or unhealthy: there is no
+				// anonymous lane to probe this round, but a keyed lane still
+				// can.
+				anonymousPaused = true
 			}
+		} else {
+			// The breaker is open, or another half-open probe is already
+			// running. Skip only the anonymous lane: a configured Zen key
+			// still provides an independent probe channel.
+			anonymousPaused = true
 		}
 	}
 	cursor := g.zenNodes.CursorFor(ids.Session)
@@ -121,6 +135,9 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 		}
 	}
 	result := probeResult{reason: "no_probe_channel"}
+	if anonymousPaused && len(lanes) == 0 {
+		result.reason = "anonymous_paused"
+	}
 	inconclusive := ""
 	for _, lane := range lanes {
 		if ctx.Err() != nil {
@@ -131,6 +148,11 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 		}
 		result = run("")
 		result.channel = lane.name
+		if result.success && lane.name == "anonymous" {
+			// A successful anonymous probe proves the lane answers again;
+			// close the breaker so user traffic resumes immediately.
+			g.anonymous.NoteSuccess()
+		}
 		if result.success {
 			if g.cfg.ForcedEffort(model) == "auto" && protocol != wire.SystemOne {
 				if !g.catalog.MetadataForTier(model, config.TierZen).Reasoning {
@@ -204,6 +226,12 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		result.reason = fmt.Sprintf("http_%d", resp.StatusCode)
 		if readErr == nil {
+			// An egress block is not evidence about the model: report it as
+			// its own reason so operators see it in the WebUI instead of
+			// reading another anonymous "http_403".
+			if isNetworkAbuseBlock(resp.StatusCode, body) {
+				return probeResult{attempted: true, reason: "network_abuse_blocked"}
+			}
 			result.effortRejected = isEffortRejection(resp.StatusCode, string(body))
 			if isModelUnavailable(resp.StatusCode, string(body)) {
 				result.reason = "model_unavailable"

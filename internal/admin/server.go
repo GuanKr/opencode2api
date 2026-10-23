@@ -107,6 +107,10 @@ func (a *Server) staticHandler() http.Handler {
 				r.URL.Path = "/"
 			}
 		}
+		// Upstream added a weaker "no-cache" here; the header is already set
+		// above as "no-cache, no-store". Setting it twice would overwrite the
+		// stronger value with the weaker one, so the earlier set stays the only
+		// writer.
 		files.ServeHTTP(w, r)
 	})
 }
@@ -241,33 +245,16 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusBadRequest, "invalid_proxies", err.Error())
 		return
 	}
+	update = preserveUnrenderedSettings(current, update)
 	reasoning := current.Reasoning
 	if update.Reasoning != nil {
 		reasoning = *update.Reasoning
-	}
-	upstream := update.Upstream
-	// The console form has no input for every field of UpstreamConfig, so a PUT
-	// replaces the whole struct and silently resets whatever it did not send.
-	// An empty value is the wire's only way to say "not specified", and
-	// NormalizeConfig would then fill the built-in default back in and persist
-	// that — which is how an operator's upstream.anonymous_lane_order, the only
-	// lever for the anonymous lane order, disappeared on the next unrelated save
-	// made from the console, with applied:true and no log line.
-	//
-	// Backfilling keeps a partial form harmless. Nothing in the console offers a
-	// way to mean "clear this", and NormalizeConfig re-defaults it anyway, so
-	// there is no intent for the backfill to swallow.
-	if strings.TrimSpace(upstream.Anonymous) == "" {
-		upstream.Anonymous = current.Upstream.Anonymous
-	}
-	if len(upstream.AnonymousLaneOrder) == 0 {
-		upstream.AnonymousLaneOrder = current.Upstream.AnonymousLaneOrder
 	}
 	candidate := config.Config{
 		ServerKeyMetadata: current.ServerKeyMetadata,
 		Rotation:          current.Rotation,
 		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Proxies: proxies, ProxyFile: update.ProxyFile,
-		Upstream: upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
+		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		Reasoning: reasoning,
 		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}
@@ -278,6 +265,45 @@ func (a *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"result": result, "config": a.configView()})
+}
+
+// preserveUnrenderedSettings copies the settings the console form does not
+// render from current into update, so a PUT built from that form cannot reset
+// them by omission.
+//
+// The form replaces whole structs (upstream, models, performance), and an
+// omitted field arrives as its zero value — which is how an operator's
+// upstream.anonymous_lane_order once disappeared on the next unrelated save,
+// with applied:true and no log line. The same shape applies to the anonymous
+// lane knobs added with the 2.1 client parity work:
+// performance.max_anonymous_exits, performance.free_tier_block_seconds and
+// models.anonymous_backoff. Losing the last one silently disables the
+// lane-level breaker.
+//
+// Zero and nil are the wire's only way to say "not specified" for these
+// fields, and every one of them already means "use the built-in default" when
+// zero, so backfilling cannot swallow an intent the form is able to express.
+// They are edited in config.json, exactly like the lane order.
+func preserveUnrenderedSettings(current config.Config, update ConfigUpdate) ConfigUpdate {
+	if strings.TrimSpace(update.Upstream.Anonymous) == "" {
+		update.Upstream.Anonymous = current.Upstream.Anonymous
+	}
+	if len(update.Upstream.AnonymousLaneOrder) == 0 {
+		update.Upstream.AnonymousLaneOrder = current.Upstream.AnonymousLaneOrder
+	}
+	if update.Performance.MaxAnonymousExits == 0 {
+		update.Performance.MaxAnonymousExits = current.Performance.MaxAnonymousExits
+	}
+	if update.Performance.FreeTierBlockSeconds == 0 {
+		update.Performance.FreeTierBlockSeconds = current.Performance.FreeTierBlockSeconds
+	}
+	if update.Models.AnonymousBackoff == nil && current.Models.AnonymousBackoff != nil {
+		// Copied, not aliased: Normalize fills this block in place, and the
+		// pointer still refers to the live configuration the runtime is using.
+		backoff := *current.Models.AnonymousBackoff
+		update.Models.AnonymousBackoff = &backoff
+	}
+	return update
 }
 
 // handleReload re-reads config.json and applies it, so an edit made on disk

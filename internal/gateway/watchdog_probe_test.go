@@ -422,7 +422,7 @@ func TestNextProbeIgnoresGatesAndVisitsEachNodeOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := anonymousPool(true, transports, time.Second)
+	pool := anonymousPool(true, transports, time.Second, anonymousBackoff{})
 	if len(pool.nodes) != 2 {
 		t.Fatalf("fixture wants two anonymous nodes, got %d", len(pool.nodes))
 	}

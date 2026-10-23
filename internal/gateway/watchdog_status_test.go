@@ -1084,7 +1084,7 @@ func TestObserveAnonymousResultSlowBodyStillRecordsQuotaSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := anonymousPool(true, transports, 15*time.Second)
+	pool := anonymousPool(true, transports, 15*time.Second, anonymousBackoff{})
 	g := watchdogTestGateway(transports, pool)
 	freezeProxyHealth(g)
 	body := newGatedSlowBody(head)
@@ -1134,7 +1134,7 @@ func TestObserveAnonymousResultRecordsQuotaVerdict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := anonymousPool(true, transports, 15*time.Second)
+	pool := anonymousPool(true, transports, 15*time.Second, anonymousBackoff{})
 	g := watchdogTestGateway(transports, pool)
 	freezeProxyHealth(g)
 	node := pool.nodes[0]
@@ -1169,7 +1169,7 @@ func TestObserveAnonymousResultSkipsDiagnostic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := anonymousPool(true, transports, 15*time.Second)
+	pool := anonymousPool(true, transports, 15*time.Second, anonymousBackoff{})
 	g := watchdogTestGateway(transports, pool)
 	freezeProxyHealth(g)
 	node := pool.nodes[0]

@@ -94,7 +94,7 @@ func mergeDecisionPool(t *testing.T) (*anonymousNodes, *anonymousNode) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := anonymousPool(true, transports, 10*time.Second)
+	pool := anonymousPool(true, transports, 10*time.Second, anonymousBackoff{})
 	if pool.Len() != 1 {
 		t.Fatalf("fixture wants exactly one node, got %d", pool.Len())
 	}

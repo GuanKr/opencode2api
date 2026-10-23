@@ -41,11 +41,15 @@ func TestBunRequestHeadMatchesBunLayout(t *testing.T) {
 	if !strings.HasPrefix(got, "POST /inference/v1/chat/completions HTTP/1.1\r\n") {
 		t.Fatalf("request line = %q", strings.SplitN(got, "\r\n", 2)[0])
 	}
-	// WebKit-known headers keep their spelling and original order.
+	// WebKit-known headers keep their spelling and original order. fetch
+	// computes Content-Length itself when it has a body, so it lands in this
+	// block — between Authorization and Content-Type, per bunCommonHeaders —
+	// rather than trailing the request.
 	auth := strings.Index(got, "Authorization: Bearer public\r\n")
+	length := strings.Index(got, "Content-Length: "+strconv.Itoa(len(body))+"\r\n")
 	ctype := strings.Index(got, "Content-Type: application/json\r\n")
-	if auth < 0 || ctype < 0 || auth > ctype {
-		t.Fatalf("common header order wrong: Authorization at %d, Content-Type at %d\n%s", auth, ctype, got)
+	if auth < 0 || length < 0 || ctype < 0 || auth > length || length > ctype {
+		t.Fatalf("common header order wrong: Authorization at %d, Content-Length at %d, Content-Type at %d\n%s", auth, length, ctype, got)
 	}
 	// Unknown headers are lowercased and come after every common header.
 	client := strings.Index(got, "x-opencode-client: cli\r\n")
@@ -59,7 +63,6 @@ func TestBunRequestHeadMatchesBunLayout(t *testing.T) {
 		"Accept: */*\r\n",
 		"Host: opencode.ai\r\n",
 		"Accept-Encoding: gzip, deflate, br, zstd\r\n",
-		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n",
 	}
 	previous := -1
 	for _, want := range tail {

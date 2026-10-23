@@ -201,7 +201,7 @@ func observeGateFailure(t *testing.T, resp *http.Response) (*Gateway, *anonymous
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := anonymousPool(true, transports, 15*time.Second)
+	pool := anonymousPool(true, transports, 15*time.Second, anonymousBackoff{})
 	g := watchdogTestGateway(transports, pool)
 	freezeProxyHealth(g)
 	g.observeAnonymousResult(context.Background(), pool.nodes[0], resp, nil, "")
