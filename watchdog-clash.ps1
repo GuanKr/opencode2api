@@ -69,9 +69,13 @@
     排序：延迟从低到高（全部候选都没有测速数据时退化为名字序，日志会单独 WARN）；
     当前节点永不复选(换 IP 才有意义)。
 
-  订阅刷新与本地配置（2026-10-23）：
+  订阅刷新与本地配置（2026-10-23，selector 候选列表 2026-10-24）：
     Selector 是 Clash 里的「代理组名」，UID 是 Clash Verge profiles.yaml 里的 profile id。
     两者都可以写进 watchdog.json（selector / subscription_uid），不必改源码；
+    selector 支持字符串或字符串数组：数组是候选列表，启动与每轮 404 时都按顺序取第一个
+    在当前配置里存在、且 type=Selector 的组。默认候选是「🚀 节点选择 → 渔云CloudFisher」，
+    本地节点池与渔云订阅来回切时不用改配置。只认 type=Selector：url-test/fallback 组的
+    now 由内核测速决定，PUT 手动选择会被拒，不能当切换目标。
     -SubscriptionUid 留空时自动取 profiles.yaml 的 current:（当前激活的那份配置），
     所以每次重新导入「opencode2api-节点.yaml」（Verge 每次导入都会生成新 uid）都不用改参数；
     进程运行中重新导入时，下一次故障切换会重新解析 current: 并自动跟随新 uid。
@@ -81,7 +85,7 @@
   看门狗专用配置文件（-WatchdogConfig，默认脚本同目录 watchdog.json，只读从不写回）：
   这些项都不需要改脚本源码，直接在配置文件里增删，支持 // 与 /* */ 注释：
     {
-      "selector": "🚀 节点选择",
+      "selector": ["🚀 节点选择", "渔云CloudFisher"],
       "subscription_uid": "",
       "max_candidates": 120,
       "exclude_contains": ["剩余","到期","重置","流量","套餐","官网","中国"],
@@ -90,7 +94,8 @@
     }
   语义：exclude_contains / deprioritize.contains 是整体替换内置默认值（不是追加），
   [] 即关闭该项；省略的键仍用内置默认值。deprioritize.penalty_ms 省略即用 500。
-  selector 是 Clash 里的代理组名（省略 = 用命令行默认值）；subscription_uid 留空/省略 =
+  selector 是 Clash 里的代理组名，或组名数组（候选列表，按顺序取第一个存在的 Selector 组；
+  省略 = 用命令行默认值）；subscription_uid 留空/省略 =
   自动取 profiles.yaml 的 current:（重新导入配置后不需要改参数）。
   max_candidates 是单轮最多试多少个候选节点（1-300，省略即 120），等价于命令行 -MaxCandidates。
   transport_confirm_rounds 省略即用 2（1-10 的整数）：网关报 verdict=transport 时需连续
@@ -126,9 +131,10 @@
   当前配置若是本地文件（type: local，无 url:），订阅差异预览自动跳过，只打印候选与 selected 检查。
 
 .PARAMETER Selector
-  Clash 里的代理组名（默认「🚀 节点选择」）。看门狗只在这个组里换节点，
-  所以它必须与当前激活配置的 proxy-groups 名称一致；也可用 watchdog.json 的
-  selector 覆盖（命令行显式传参优先）。
+  代理组候选（默认 @('🚀 节点选择','渔云CloudFisher')）。看门狗只在这些组里换节点，
+  启动时按顺序取第一个在当前配置里存在、且 type=Selector 的组；每轮 404 也会按同一列表
+  重挑一次，所以本地节点池 ↔ 渔云订阅来回切不用改参数。
+  也可用 watchdog.json 的 selector 覆盖（字符串或数组都行；命令行显式传参优先）。
 
 .PARAMETER SubscriptionUid
   Clash Verge profiles.yaml 里的 profile uid（决定刷新哪份配置、selected.now 写到哪）。
@@ -144,7 +150,7 @@
 
 .PARAMETER WatchdogConfig
   看门狗专用配置文件路径，默认脚本同目录 watchdog.json。文件不存在即全部用内置默认值；
-  存在则用其中的 selector（代理组名）、subscription_uid（profile uid，空=自动）、
+  存在则用其中的 selector（代理组候选，字符串或数组）、subscription_uid（profile uid，空=自动）、
   max_candidates（候选上限）、exclude_contains（子串排除）、deprioritize（地区降权）与
   transport_confirm_rounds（transport 连续确认轮数）覆盖对应内置默认值，
   省略的键不受影响。除 exclude_contains 外，其余键在显式传同名命令行参数时以命令行优先
@@ -186,7 +192,9 @@
 param(
   [string]$ClashBase = 'http://127.0.0.1:9097',
   [string]$ClashSecret = '',
-  [string]$Selector = '🚀 节点选择',
+  # 代理组候选：按顺序取第一个在当前 Clash 配置里存在的 Selector 组。
+  # 换 profile（本地节点池 ↔ 渔云）时组名会变，写死单个名字会在换回另一端时 404 空转。
+  [string[]]$Selector = @('🚀 节点选择', '渔云CloudFisher'),
   [string]$GatewayBase = 'http://127.0.0.1:19880',
   [string]$GatewayKey = '',
   [string]$VerifyModel = 'big-pickle',
@@ -258,7 +266,17 @@ $script:ExplicitParams = @($PSBoundParameters.Keys)
 $script:WatchdogConfigPath = $WatchdogConfig
 $script:ClashBase = $ClashBase.TrimEnd('/')
 $script:ClashSecret = $ClashSecret
-$script:Selector = $Selector
+# selector 是「候选列表」：启动时按顺序取第一个在 /proxies 里存在的 Selector 组，
+# 404 时也会按同一列表重新挑（见 Resolve-SelectorCandidate）。
+# 兼容两种传法：数组（watchdog.json 的 JSON 数组 / 直接调用脚本时传数组）与
+# `pwsh -File ... -Selector a,b` —— 后者会被 -File 当成单个字符串，所以按逗号再拆一次。
+# Clash 组名里出现逗号属于病态命名（YAML flow 写法本身就会坏），拆开是安全的。
+$script:SelectorCandidates = @($Selector |
+  ForEach-Object { ([string]$_) -split ',' } |
+  ForEach-Object { $_.Trim() } |
+  Where-Object { $_ -ne '' })
+if (@($script:SelectorCandidates).Count -eq 0) { throw '-Selector 不能为空：至少给一个代理组名' }
+$script:Selector = $script:SelectorCandidates[0]
 $script:GatewayBase = $GatewayBase.TrimEnd('/')
 $script:GatewayKey = $GatewayKey
 $script:VerifyModel = $VerifyModel
@@ -508,7 +526,8 @@ function Read-WatchdogConfig {
   # 看门狗专用配置文件（默认 watchdog.json，与 config.json 同目录）。
   # 支持 // 与 /* */ 注释（与 config.json 同一套 Strip-JsonComments 语义）。
   # 只认以下键，都可整段省略，省略即用内置默认值：
-  #   selector                      代理组名（Clash /proxies 里的组，决定在哪个组里换节点）
+  #   selector                      代理组候选：字符串或字符串数组，按顺序取第一个存在的
+  #                                 type=Selector 组（决定在哪个组里换节点）
   #   subscription_uid              profile uid；空字符串 = 自动取 profiles.yaml 的 current:
   #   max_candidates                单轮候选上限（1-300）
   #   exclude_contains              子串排除：节点名含任一子串即丢弃（整体替换内置默认值；
@@ -570,18 +589,36 @@ function Read-WatchdogConfig {
   if (Test-HasKey $cfg 'selector') {
     $seen++
     $rawSel = Get-Prop $cfg 'selector'
-    # 必须是字符串：写成数字/数组时若静默转成 "System.Object[]"，selector 只会永远
-    # 404 空转，报错中止启动才看得见。
-    if (-not ($rawSel -is [string]) -or [string]::IsNullOrWhiteSpace($rawSel)) {
-      throw "看门狗配置 selector 非法：[$rawSel]（必须是非空字符串，如 `"🚀 节点选择`"）"
+    # 接受字符串（单个组名）或字符串数组（候选列表，按顺序取第一个存在的）。
+    # 数组是 2026-10-24 加的：本地节点池与渔云订阅的组名不同，写死单个名字换 profile 就 404。
+    $selList = @()
+    if ($rawSel -is [string]) {
+      if (-not [string]::IsNullOrWhiteSpace($rawSel)) { $selList = @($rawSel.Trim()) }
+    } elseif ($rawSel -is [System.Array]) {
+      $idx = 0
+      foreach ($s in @($rawSel)) {
+        $idx++
+        if ($s -isnot [string]) {
+          $tn = if ($null -eq $s) { 'null' } else { $s.GetType().Name }
+          throw "看门狗配置 selector 第 $idx 项不是字符串（$tn）：候选列表必须是字符串数组"
+        }
+        $t = $s.Trim()
+        if ($t -ne '') { $selList += $t }
+      }
+    }
+    # 与命令行同一套归一化：允许 ["a","b"]，也允许 "a,b" 这种单字符串写法。
+    $selList = @($selList | ForEach-Object { ([string]$_) -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    if (@($selList).Count -eq 0) {
+      throw "看门狗配置 selector 非法：[$rawSel]（必须是非空字符串，或字符串数组，如 [`"🚀 节点选择`", `"渔云CloudFisher`"]）"
     }
     if ($script:ExplicitParams -contains 'Selector') {
       $covered++
       Write-WdLog '命令行已显式传 -Selector，配置文件的 selector 不生效' 'INFO'
     } else {
-      $script:Selector = ([string]$rawSel).Trim()
+      $script:SelectorCandidates = @($selList)
+      $script:Selector = $selList[0]
       $applied++
-      Write-WdLog "配置生效：selector = $($script:Selector)"
+      Write-WdLog "配置生效：selector 候选 = $(@($selList) -join ' → ')（取第一个存在的）"
     }
   }
   if (Test-HasKey $cfg 'subscription_uid') {
@@ -1336,6 +1373,43 @@ function Resolve-ActiveProfileUid {
   return $m.Groups['u'].Value
 }
 
+function Resolve-SelectorCandidate {
+  # 按候选顺序挑第一个在 /proxies 里存在、且 type=Selector 的组。
+  # 必须限定 Selector：url-test / fallback 组的 now 由内核测速决定，PUT 手动选择会被拒；
+  # 若把「链尾正在决定出口的组」当目标，本地这份配置会落到 ♻️ 自动选择（URLTest）上。
+  param([string[]]$Candidates)
+  $map = Get-ProxyMap
+  if ($map -eq $null) { return $null }
+  foreach ($c in @($Candidates)) {
+    if ([string]::IsNullOrWhiteSpace($c)) { continue }
+    $entry = Get-Prop $map $c
+    if ($entry -eq $null) { continue }
+    $t = ''
+    try { $t = [string](Get-Prop $entry 'type') } catch { }
+    if ($t -eq 'Selector') { return $c }
+  }
+  return $null
+}
+
+function Get-SelectorGroupNames {
+  # 诊断用：列出当前配置里所有 Selector 组名（候选全不命中时提示用户改哪个）。
+  param($ProxyMap)
+  if ($ProxyMap -eq $null) { return @() }
+  $out = @()
+  try {
+    # Get-ProxyMap 正常返回 PSCustomObject；哈希表走 IDictionary 分支（Get-Prop 同款处理）。
+    $names = @()
+    if ($ProxyMap -is [System.Collections.IDictionary]) { $names = @($ProxyMap.Keys) }
+    else { $names = @($ProxyMap.PSObject.Properties | ForEach-Object { $_.Name }) }
+    foreach ($n in $names) {
+      $t = ''
+      try { $t = [string](Get-Prop (Get-Prop $ProxyMap $n) 'type') } catch { }
+      if ($t -eq 'Selector') { $out += $n }
+    }
+  } catch { }
+  return @($out)
+}
+
 function Get-ProfileType {
   # profile 条目的 type: remote / local / merge / script。只用于日志与「跳过刷新」判定。
   param([string]$Block)
@@ -2015,36 +2089,53 @@ function Invoke-WatchIteration {
 
   $detail = $null
   $map = $null
-  try {
-    $sel = [uri]::EscapeDataString($script:Selector)
-    $detail = Invoke-ClashGet -Path "/proxies/$sel"
-    $map = Get-ProxyMap
-    $script:LastClashErrSig = ''
-  } catch {
-    $errMsg = [string]$_.Exception.Message
-    if ($errMsg -match '404|NotFound') {
-      # selector 组名不存在（换订阅/重新导入本地 yaml 后最常见的配置错），不是 Clash 没起。
-      # 措辞必须分开，否则排障会去查 Clash 进程，而真正要改的是组名。
-      # 每轮都打会 15s 一条 ERROR 刷爆日志（5MB 轮转把排障记录滚掉），用签名去重：
-      # 同一 selector 只报一次，成功读到 /proxies 时清空（见上）。
-      $sig = "selector404|$($script:Selector)"
-      if ($script:LastClashErrSig -ne $sig) {
-        $script:LastClashErrSig = $sig
-        Write-WdLog "Selector [$($script:Selector)] 不在当前 Clash 配置里（404）：把 watchdog.json 的 selector 改成实际的代理组名并重启看门狗（配置只在启动时读一次），或用 -Selector 显式指定" 'ERROR'
+  # 最多两轮：第一轮 404 时按 selector 候选列表重挑一次（换 profile 后组名变了的自愈路径），
+  # 挑到不同组就用它再查一次；挑不到才记日志并放弃本轮。
+  for ($lookupTry = 0; $lookupTry -lt 2; $lookupTry++) {
+    try {
+      $sel = [uri]::EscapeDataString($script:Selector)
+      $detail = Invoke-ClashGet -Path "/proxies/$sel"
+      $map = Get-ProxyMap
+      $script:LastClashErrSig = ''
+      break
+    } catch {
+      $errMsg = [string]$_.Exception.Message
+      if ($errMsg -match '404|NotFound') {
+        $picked = $null
+        try { $picked = Resolve-SelectorCandidate -Candidates $script:SelectorCandidates } catch { $picked = $null }
+        if ($lookupTry -eq 0 -and $picked -and $picked -ne $script:Selector) {
+          Write-WdLog "Selector [$($script:Selector)] 不在当前配置里，按候选顺序改用 [$picked]" 'INFO'
+          $script:Selector = $picked
+          continue
+        }
+        # selector 组名不在当前配置里（换订阅/切 profile 后最常见），不是 Clash 没起。
+        # 每轮都打会 15s 一条 ERROR 刷爆日志（5MB 轮转把排障记录滚掉），用签名去重。
+        $sig = "selector404|$($script:Selector)"
+        if ($script:LastClashErrSig -ne $sig) {
+          $script:LastClashErrSig = $sig
+          $availTxt = '（读不到）'
+          try {
+            $avail = @(Get-SelectorGroupNames -ProxyMap (Get-ProxyMap))
+            # 不截断：真实组名往往排在第 10 个之后（本地这份里 🚀 节点选择 就排第 11），
+            # 截断等于把用户最该看到的那个名字藏起来。Selector 组一般也就十几个。
+            if (@($avail).Count -gt 0) { $availTxt = (@($avail) -join ' / ') }
+          } catch { }
+          Write-WdLog "Selector [$($script:Selector)] 不在当前 Clash 配置里（404），候选 [$($script:SelectorCandidates -join ' / ')] 均未命中。当前可用的 Selector 组：$availTxt。改 watchdog.json 的 selector 后需重启看门狗（配置只在启动时读一次），或用 -Selector 指定" 'ERROR'
+        }
+        $script:NeedRecoveryLog = $true
+      } else {
+        $sig = "clashdown|$errMsg"
+        if ($script:LastClashErrSig -ne $sig) {
+          $script:LastClashErrSig = $sig
+          Write-WdLog "Clash 接口不可达：$errMsg（Clash 未启动？稍后重试）" 'WARN'
+        }
+        # 同上：中断恢复后的首个正常轮次立即补一条。
+        $script:NeedRecoveryLog = $true
       }
-      $script:NeedRecoveryLog = $true
-    } else {
-      $sig = "clashdown|$errMsg"
-      if ($script:LastClashErrSig -ne $sig) {
-        $script:LastClashErrSig = $sig
-        Write-WdLog "Clash 接口不可达：$errMsg（Clash 未启动？稍后重试）" 'WARN'
-      }
-      # 同上：中断恢复后的首个正常轮次立即补一条。
-      $script:NeedRecoveryLog = $true
+      # 同网关不可达：verdict 未知轮不清零会把中断前的计数漏到恢复后。
+      $script:TransportStrikes = 0
+      return @{ Acted = $false }
     }
-    # 同网关不可达：verdict 未知轮不清零会把中断前的计数漏到恢复后。
-    $script:TransportStrikes = 0
-    return @{ Acted = $false }
   }
   $now = [string](Get-Prop $detail 'now')
   # 外部切换检测：本脚本的切换都会同步更新 LastSeenNow（成功/恢复/回滚三处），
@@ -2270,7 +2361,12 @@ function Invoke-DryRun {
   try { $detail = Invoke-ClashGet -Path "/proxies/$sel" }
   catch {
     if ([string]$_.Exception.Message -match '404|NotFound') {
-      throw "Selector [$($script:Selector)] 不在当前 Clash 配置里（404）：用 watchdog.json 的 selector 或 -Selector 指定实际代理组名"
+      $availTxt = '（读不到）'
+      try {
+        $avail = @(Get-SelectorGroupNames -ProxyMap (Get-ProxyMap))
+        if (@($avail).Count -gt 0) { $availTxt = (@($avail) -join ' / ') }
+      } catch { }
+      throw "Selector [$($script:Selector)] 不在当前 Clash 配置里（404）：候选 [$($script:SelectorCandidates -join ' / ')] 均未命中；当前可用的 Selector 组：$availTxt"
     }
     throw
   }
@@ -2413,6 +2509,25 @@ try {
     }
   }
   $regionCfg = '关闭'
+  # selector 候选解析：取第一个在当前配置里存在的 Selector 组（本地节点池 ↔ 渔云组名不同）。
+  # 必须在横幅之前，横幅要如实打印最终选中的组；解析失败不中止启动（Clash 可能还没起），
+  # 每轮的 404 分支会再挑一次。
+  try {
+    $picked = Resolve-SelectorCandidate -Candidates $script:SelectorCandidates
+    if ($picked) {
+      if ($picked -ne $script:Selector) {
+        Write-WdLog "selector 候选命中：$picked（[$($script:Selector)] 不在当前配置里）" 'INFO'
+      }
+      $script:Selector = $picked
+    } else {
+      $avail = @(Get-SelectorGroupNames -ProxyMap (Get-ProxyMap))
+      $availTxt = if (@($avail).Count -gt 0) { (@($avail) | Select-Object -First 10) -join ' / ' } else { '（读不到）' }
+      Write-WdLog "selector 候选都不在当前 Clash 配置里（候选：$($script:SelectorCandidates -join ' / ')）：每轮会报 404，直到切回含这些组的配置；当前可用的 Selector 组：$availTxt" 'ERROR'
+      $script:Selector = $script:SelectorCandidates[0]
+    }
+  } catch {
+    Write-WdLog "启动时解析 selector 失败（Clash 未启动？先用候选第一个 [$($script:Selector)]，每轮会重试）：$($_.Exception.Message)" 'WARN'
+  }
   # 与 Get-RankedCandidates 同口径：先过滤空白条目再计数，全空白列表视为关闭，
   # 日志与行为读同一份 $script: 源，避免一侧被重赋值后分叉。
   $regionKeysForLog = @($script:DeprioritizeContains | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })

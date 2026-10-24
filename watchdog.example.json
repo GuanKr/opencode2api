@@ -4,11 +4,13 @@
   // 字符串里的 https:// 不受影响）。
   // 优先级：显式命令行参数 > 本文件 > 脚本内置默认值。删除本文件 = 全部走内置默认值。
 
-  // 代理组名：看门狗只在这个组里逐个换节点，必须与当前激活配置的 proxy-groups 名称一致。
-  // 内置默认值就是它（本地 gen_clash_sub.py 生成的 opencode2api-节点.yaml 用这个组名）；
-  // 换回机场订阅时改成订阅里的组名（如 "渔云CloudFisher"）。
-  // 写错时的日志是「Selector [...] 不在当前 Clash 配置里（404）」，不会去动 Clash。
-  "selector": "🚀 节点选择",
+  // 代理组候选：看门狗只在这个组里逐个换节点。字符串或字符串数组都行；
+  // 数组 = 候选列表，启动时与每轮 404 时都按顺序取第一个在当前配置里存在的
+  // type=Selector 组。默认这两个正好覆盖「本地节点池」与「渔云订阅」两套配置，
+  // 来回切不用改文件；换回机场订阅时把它的组名加进列表即可（如 "渔云CloudFisher"）。
+  // 只认 type=Selector：url-test/fallback 组的 now 由测速决定，PUT 会拒绝。
+  // 写错时的日志是「Selector [...] 不在当前 Clash 配置里（404）」并列出当前可用组名。
+  "selector": ["🚀 节点选择", "渔云CloudFisher"],
 
   // profile uid：决定刷新哪份 profile、selected.now 写到哪个条目。
   // 留空 "" = 自动取 profiles.yaml 的 current:（当前激活的那份配置）。
