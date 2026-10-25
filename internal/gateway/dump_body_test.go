@@ -21,7 +21,7 @@ import (
 
 // dumpSink records what the stub upstream received. The handler writes it from
 // the server goroutine while the test reads it from its own, so the copy is
-// guarded the way poisonStub guards its own recordings.
+// guarded by a mutex.
 type dumpSink struct {
 	mu   sync.Mutex
 	body []byte

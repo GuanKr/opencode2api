@@ -322,63 +322,23 @@ function appendTokenCell(row, tokens) {
 }
 
 // Attempts: 0 means the request never left (no node, or rejected locally).
-// Pre-strip is flagged by suffix — s for selective, * for full — and unknown
-// prestrip_mode is treated as full.
 function attemptsCell(request) {
   const attempts = Number(request.attempts);
   if (!Number.isFinite(attempts) || attempts < 0) return { text: "—", tone: "", title: "" };
-  // Allowlist: only an explicit "selective" takes the selective branch; anything
-  // else with prestripped (missing or dirty field) counts as a full strip.
-  const mode =
-    request.prestrip_mode === "selective" ? "selective" : request.prestripped ? "full" : "";
-  // Dirty-data guard: positive integers only, capped far above the server-side
-  // blacklist limit of 1024 so an exponent-looking value stays hidden.
-  const rawBlacklist = Number(request.prestrip_ids);
-  const blacklist =
-    Number.isInteger(rawBlacklist) && rawBlacklist > 0 && rawBlacklist <= 100000 ? rawBlacklist : 0;
-  const suffix = blacklist > 0 ? `；黑名单 ${blacklist} 个推理 ID` : "";
   if (attempts === 0) {
     return { text: "0", tone: "", title: "未发出上游尝试：无可用节点，或请求在本地被拒" };
-  }
-  if (attempts > 1 && mode) {
-    return {
-      text: `${attempts}${mode === "selective" ? "s" : "*"}`,
-      tone: "warn",
-      title:
-        (mode === "selective"
-          ? "命中中毒历史快照：首跳为选择剥离（仅剥黑名单推理ID，s=选择剥离），之后又触发了重试/回退（含全量回退）"
-          : "命中中毒历史记忆（全量剥离）：首跳为剥离体，之后又触发了重试/回退") + suffix,
-    };
   }
   if (attempts > 1) {
     return {
       text: String(attempts),
       tone: "warn",
-      title:
-        "上游尝试次数（含匿名 lane 与 key 回退；>1 表示触发过重试/回退，含自愈）" + suffix,
-    };
-  }
-  if (mode === "selective") {
-    return {
-      text: `${attempts}s`,
-      tone: "prestrip-sel",
-      title:
-        "命中中毒历史快照：首跳仅剥离黑名单推理ID（标记前中毒段，s=选择剥离），保留其后健康推理；未消耗 400 往返" +
-        (suffix || "；黑名单无 ID（本轮仅剥离无 ID 推理块，命中死链一并剥离）"),
-    };
-  }
-  if (mode) {
-    return {
-      text: `${attempts}*`,
-      tone: "prestrip",
-      title:
-        "命中中毒历史记忆（全量剥离）：首跳直接发送剥离体（等价于自愈重试体），未消耗 400 往返；命中期间连续多轮均为 *",
+      title: "上游尝试次数（含匿名 lane 与 key 回退；>1 表示触发过重试/回退）",
     };
   }
   return {
     text: String(attempts),
     tone: "",
-    title: "上游尝试次数（含匿名 lane 与 key 回退；>1 表示触发过重试/回退，含自愈）",
+    title: "上游尝试次数（含匿名 lane 与 key 回退；>1 表示触发过重试/回退）",
   };
 }
 

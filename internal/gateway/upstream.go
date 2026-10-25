@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -60,494 +59,15 @@ func debugKeyOverrideFrom(ctx context.Context) (DebugKeyOverride, bool) {
 // captured before any shaping. It scopes anonymous cooldown: a retry of the same
 // turn is blocked, a different turn still gets one real attempt.
 func (g *Gateway) doUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, fingerprint string) (*http.Response, models.Route, error) {
-	// Diagnostic requests (Playground auto mode included) must neither see
-	// a pre-stripped shape nor leave traces in production memory: they
-	// exercise the real request shape and never write production pool
-	// state. Per-key probes additionally return before any memo access.
-	// Note: ordinary diagnostics still allow the in-turn stale-reasoning
-	// self-heal retry below (only memo reads/writes are skipped), so a
-	// poisoned Playground turn succeeds with the stripped shape instead of
-	// surfacing the raw 400; use a per-key probe only when the raw shape
-	// itself must be exercised.
-	diagnostic := isDiagnosticRequest(ctx)
-	// recordBlacklistSize publishes the stored blacklist size for the usage
-	// page. It re-reads the snapshot so the displayed count always equals
-	// what is actually stored (post dedup/cap). The count is best-effort
-	// display only: a concurrent clean/eviction slipping between the memo
-	// write and this re-read may leave a stale size (or zero) for one turn,
-	// which never affects memo correctness.
-	recordBlacklistSize := func() {
-		meta := telemetry.MetaFromContext(ctx)
-		if meta == nil {
-			return
-		}
-		if snapIDs, _, _, ok := g.staleMemo.snapshot(ids.Session); ok {
-			meta.PrestripIDs = len(snapIDs)
-		}
-	}
-	// Poisoned-history fast path: this conversation needed a strip-retry
-	// recently, so its stored history still carries dead reasoning
-	// references that would 400 again. Send the stripped shape on the first
-	// attempt instead of burning a 400 round-trip every turn. The memo
-	// expires (re-probing with the full shape), so server-side healing or a
-	// dsh history rewrite resumes normal replay on its own. Diagnostic
-	// requests bypass it so per-key probes always exercise the real shape.
-	//
-	// The fast path is selective: only the snapshotted blacklist is removed
-	// (every reasoning id the failed body carried at poison-discovery time,
-	// plus the dead chain link), while reasoning that arrived after the mark
-	// is kept — the failing body had never seen it, so it cannot be what the
-	// server rejected. A selective attempt that still 400s falls back to a
-	// full strip once within the same turn. Past the TTL the memo no longer
-	// remembers the session, so that turn re-probes full and re-learns from
-	// its failing body instead of reusing anything old.
-	prestripped := false
-	prestripMode := ""
-	if _, selected := debugKeyOverrideFrom(ctx); !selected && !diagnostic && g.staleMemo.shouldPrestrip(ids.Session) {
-		deny, deadPrev, full, ok := g.staleMemo.snapshot(ids.Session)
-		if ok && !full {
-			if stripped, changed := stripSelectiveReasoningInputs(route, bodies, deny, deadPrev); changed {
-				g.logger.Debug("poisoned history selectively pre-stripped on first attempt", "component", "upstream", "event", "stale_retry_pre_stripped", "request_id", ids.Request, "session_id", ids.Session, "model", route.ID, "tier", route.Tier, "prestrip_mode", "selective",
-					"replayed", summarizeReplayedReasoning(bodies[route.Tier]))
-				// Every tier body was encoded up front by prepareRouteBodies
-				// and stripSelectiveReasoningInputs rewrites all of them,
-				// so no lazily encoded fallback tier can resurrect the
-				// blacklisted references (and healthy ones are kept).
-				bodies = stripped
-				prestripped = true
-				prestripMode = "selective"
-				if meta := telemetry.MetaFromContext(ctx); meta != nil {
-					meta.Prestripped = true
-					meta.PrestripMode = "selective"
-					meta.PrestripIDs = len(deny)
-				}
-			}
-			// No blacklisted id present: the stored history looks clean
-			// already (e.g. the client rewrote it), so re-probe with the
-			// full shape below. A clean 2xx then clears the memo.
-			// Note: !ok (entry concurrently cleaned/evicted between the
-			// shouldPrestrip and snapshot calls) intentionally falls through
-			// with no pre-strip: treat it as unremembered and probe full.
-		} else if ok && full {
-			if stripped, changed := stripStaleReasoningInputs(route, bodies); changed {
-				g.logger.Debug("poisoned history pre-stripped on first attempt", "component", "upstream", "event", "stale_retry_pre_stripped", "request_id", ids.Request, "session_id", ids.Session, "model", route.ID, "tier", route.Tier, "prestrip_mode", "full")
-				bodies = stripped
-				prestripped = true
-				prestripMode = "full"
-				if meta := telemetry.MetaFromContext(ctx); meta != nil {
-					meta.Prestripped = true
-					meta.PrestripMode = "full"
-				}
-			}
-		}
-	}
-	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0, fingerprint)
-	if attempts == 0 && prestripped {
-		// Nothing was actually transmitted (no healthy anonymous node or
-		// key tier accepted the request before any attempt): the prestrip
-		// flags describe a shape never sent, so drop them rather than
-		// persisting a claim about unsent bytes. Any real attempt leaves
-		// attempts > 0 and keeps the flags.
-		prestripped = false
-		prestripMode = ""
-		if meta := telemetry.MetaFromContext(ctx); meta != nil {
-			meta.Prestripped = false
-			meta.PrestripMode = ""
-			meta.PrestripIDs = 0
-		}
-	}
-	if _, selected := debugKeyOverrideFrom(ctx); selected {
-		return resp, effectiveRoute, err
-	}
-	if err != nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
-		if err == nil && resp != nil && resp.StatusCode/100 == 2 && !prestripped && !diagnostic {
-			// A clean first attempt proves the stored history replays fine.
-			g.staleMemo.noteClean(ids.Session)
-		}
-		return resp, effectiveRoute, err
-	}
-	origBody := resp.Body
-	errBody, readErr := io.ReadAll(io.LimitReader(origBody, 1<<20))
-	// The original network body is always closed here: the retry path below
-	// reuses the connection, otherwise downstream receives a fresh in-memory
-	// reader over the cached bytes.
-	httpx.DrainAndClose(origBody)
-	if readErr != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(errBody))
-		return resp, effectiveRoute, nil
-	}
-	// Restore the body so downstream error handling still sees the original
-	// payload when no retry happens below.
-	resp.Body = io.NopCloser(bytes.NewReader(errBody))
-	// Log a capped snippet of the upstream error body so the 400 class is
-	// visible without dumping full payloads. Bodies stay out of attempt
-	// records; the hub redactor scrubs configured secrets from log output.
-	if len(errBody) > 0 {
-		redactor := config.SecretRedactor()
-		redactor.Replace(g.cfg)
-		snippet := redactor.String(string(errBody))
-		if len(snippet) > 240 {
-			snippet = snippet[:240]
-		}
-		g.logger.Info("upstream error returned or retried", "component", "upstream", "event", "upstream_error_body", "request_id", ids.Request, "model", route.ID, "status", resp.StatusCode, "snippet", snippet)
-	}
-	if !isStaleReasoningReference(errBody) {
-		return resp, effectiveRoute, nil
-	}
-	g.logger.Debug("stale reasoning reference matched; retrying without them", "component", "upstream", "event", "stale_reasoning_matched", "request_id", ids.Request, "session_id", ids.Session, "model", route.ID, "tier", effectiveRoute.Tier, "prestrip_mode", prestripMode,
-		"replayed", summarizeReplayedReasoning(bodies[effectiveRoute.Tier]))
-	// A selective pre-strip that still 400s keeps newer reasoning the full
-	// strip would drop, so fall back to the full strip once within the same
-	// turn (opencode verification shows post-mark reasoning is healthy, so
-	// the fallback is a safety net, not the steady state).
-	if prestripMode == "selective" {
-		stripped, changed := stripStaleReasoningInputs(effectiveRoute, bodies)
-		if !changed {
-			return resp, effectiveRoute, nil
-		}
-		g.logger.Info("selective prestrip still rejected; falling back to full strip", "component", "upstream", "event", "reasoning_reference_fallback", "request_id", ids.Request, "session_id", ids.Session, "model", route.ID, "tier", effectiveRoute.Tier, "attempt_offset", attempts)
-		// The stale-reasoning self-heal replays the SAME client turn with reasoning
-		// references stripped, so it keeps the original fingerprint on purpose: a
-		// same-turn retry must stay inside the cooldown scope that blocked it.
-		retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, ids, attempts, fingerprint)
-		if retryErr != nil || retryResp == nil || retryResp.StatusCode/100 != 2 {
-			retryStatus := 0
-			if retryResp != nil {
-				retryStatus = retryResp.StatusCode
-				httpx.DrainAndClose(retryResp.Body)
-			}
-			g.logger.Warn("reasoning reference retry failed; returning original error", "component", "upstream", "event", "reasoning_reference_retry_failed", "request_id", ids.Request, "session_id", ids.Session, "model", route.ID, "tier", effectiveRoute.Tier, "error", retryErr, "retry_status", retryStatus)
-			fallback := *resp
-			fallback.Body = io.NopCloser(bytes.NewReader(errBody))
-			return &fallback, effectiveRoute, nil
-		}
-		// The blacklist was proven incomplete: the upstream rejected a body
-		// that no longer carried the blacklisted ids, and only removing the
-		// rest of them made the replay succeed. Merge those into the
-		// blacklist so the next turn strips them on its first attempt
-		// instead of paying this same 400 + fallback every turn.
-		if !diagnostic {
-			g.rememberStaleHistory(ids.Session, bodies[effectiveRoute.Tier], prestripMode)
-			recordBlacklistSize()
-		}
-		return retryResp, retryRoute, nil
-	}
-	stripped, changed := stripStaleReasoningInputs(effectiveRoute, bodies)
-	if !changed {
-		return resp, effectiveRoute, nil
-	}
-	// The referenced reasoning items belong to an upstream chain this session
-	// can no longer address (e.g. an interrupted stream). Replay once without
-	// them instead of failing the client request outright. Attempt numbering
-	// continues from the first round so monitoring never shows duplicate attempt
-	// numbers for one request.
-	//
-	// The client's session is deliberately preserved: it carries key/proxy
-	// affinity and upstream session correlation. Minting a fresh session made
-	// the replay land on a different node with a cold prompt cache and detached
-	// the reply from the chain the client still holds; the stale references are
-	// already removed from the payload itself.
-	g.logger.Info("retrying upstream without stale reasoning references", "component", "upstream", "event", "reasoning_reference_retry", "request_id", ids.Request, "model", route.ID, "tier", effectiveRoute.Tier, "attempt_offset", attempts)
-	// The stale-reasoning self-heal replays the SAME client turn with reasoning
-	// references stripped, so it keeps the original fingerprint on purpose: a
-	// same-turn retry must stay inside the cooldown scope that blocked it.
-	retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, ids, attempts, fingerprint)
-	if retryErr != nil || retryResp == nil || retryResp.StatusCode/100 != 2 {
-		retryStatus := 0
-		if retryResp != nil {
-			retryStatus = retryResp.StatusCode
-			httpx.DrainAndClose(retryResp.Body)
-		}
-		g.logger.Warn("reasoning reference retry failed; returning original error", "component", "upstream", "event", "reasoning_reference_retry_failed", "request_id", ids.Request, "model", route.ID, "tier", effectiveRoute.Tier, "error", retryErr, "retry_status", retryStatus)
-		fallback := *resp
-		fallback.Body = io.NopCloser(bytes.NewReader(errBody))
-		return &fallback, effectiveRoute, nil
-	}
-	// The history needed surgery this turn; remember it so the next turns
-	// pre-strip on the first attempt instead of burning a 400 each time.
-	// prestripMode tells rememberStaleHistory whether this turn's failure is
-	// fresh evidence (selective pre-strip still rejected) or just the same old
-	// poison (no pre-strip / full pre-strip). Diagnostic requests never write
-	// production memory.
-	if !diagnostic {
-		g.rememberStaleHistory(ids.Session, bodies[effectiveRoute.Tier], prestripMode)
-		recordBlacklistSize()
-	}
-	return retryResp, retryRoute, nil
+	resp, effectiveRoute, _, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0, fingerprint)
+	return resp, effectiveRoute, err
 }
-
-// rememberStaleHistory is the memo write path for a turn that needed
-// reasoning surgery and then succeeded. It is a method (rather than inline
-// code in doUpstream) so the branch can be exercised without a failing
-// upstream: a real 400 would spawn the background proxy verification, which
-// dials the public internet.
-//
-// prestripMode is what this turn's FIRST attempt was already stripped with
-// ("" when nothing was pre-stripped), because it decides whether the failing
-// body carries fresh evidence:
-//
-//   - "selective": the blacklist was proven INCOMPLETE. The rejected body no
-//     longer carried the blacklisted ids, yet the upstream still refused it
-//     and only the full strip (dropping everything it did carry — the
-//     remaining reasoning ids AND the chain link) was accepted — so those
-//     references are dead as well and get learned. Without this, a session
-//     whose upstream moved on to other references pays one more 400 +
-//     fallback every single turn for the whole window, because the entry it
-//     holds can never grow. Note the chain link is not stripped by the
-//     selective pass unless it equals the remembered dead one, so a
-//     fresh-but-dead link reaches this point and must be learned here too.
-//   - anything else ("" / "full"): the failure carries no new evidence, so an
-//     already-remembered session only has its window moved. Ids appended
-//     during the window are healthy — nothing rejected them — and must never
-//     be blacklisted.
-//
-// Only the first-ever poison snapshots the current failing body (which is
-// exactly the stripped id set). Past the TTL the memo no longer remembers the
-// session, so the turn re-learns from its failing body instead.
-func (g *Gateway) rememberStaleHistory(session string, failingBody []byte, prestripMode string) {
-	if prestripMode == "selective" {
-		failingIDs, failingPrev := collectStaleReasoningIDs(failingBody)
-		g.staleMemo.mergeRejected(session, failingIDs, failingPrev)
-		return
-	}
-	if _, _, _, hadOld := g.staleMemo.snapshot(session); hadOld {
-		g.staleMemo.refresh(session)
-		return
-	}
-	failingIDs, failingPrev := collectStaleReasoningIDs(failingBody)
-	g.staleMemo.noteStripped(session, failingIDs, failingPrev)
-}
-
-// isStaleReasoningReference reports whether an upstream 400 body describes a
-// reasoning item/reference the server no longer recognizes, such as
-// "Referenced reasoning item 'rs_...' was not found or has expired".
-// Generic validation errors that merely mention reasoning (e.g. "unknown
-// reasoning field") must NOT match, so both the target phrase and the
-// gone/expired marker are required.
-func isStaleReasoningReference(body []byte) bool {
-	text := strings.ToLower(string(body))
-	if !strings.Contains(text, "reasoning item") && !strings.Contains(text, "reasoning reference") {
-		return false
-	}
-	for _, marker := range []string{"not found", "expir", "does not exist", "no longer"} {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// stripStaleReasoningInputs removes server-issued reasoning references from
-// Responses-protocol upstream payloads: replayed "reasoning" input items and
-// any previous_response_id chain link. Other tiers/protocols are passed
-// through untouched. It reports whether any payload actually changed.
-func stripStaleReasoningInputs(route models.Route, bodies map[config.Tier][]byte) (map[config.Tier][]byte, bool) {
-	changed := false
-	out := make(map[config.Tier][]byte, len(bodies))
-	for tier, body := range bodies {
-		if len(body) == 0 || route.ProtocolFor(tier) != wire.Responses {
-			out[tier] = body
-			continue
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			out[tier] = body
-			continue
-		}
-		tierChanged := false
-		if _, ok := payload["previous_response_id"]; ok {
-			delete(payload, "previous_response_id")
-			tierChanged = true
-		}
-		if raw, ok := payload["input"].([]any); ok {
-			kept := make([]any, 0, len(raw))
-			for _, item := range raw {
-				if m, ok := item.(map[string]any); ok && jsonutil.StringAt(m, "type") == "reasoning" {
-					tierChanged = true
-					continue
-				}
-				kept = append(kept, item)
-			}
-			if tierChanged {
-				payload["input"] = kept
-			}
-		}
-		if !tierChanged {
-			out[tier] = body
-			continue
-		}
-		encoded, err := jsonutil.Marshal(payload)
-		if err != nil {
-			out[tier] = body
-			continue
-		}
-		out[tier] = encoded
-		changed = true
-	}
-	return out, changed
-}
-
-// collectStaleReasoningIDs extracts the snapshot blacklist from a failed
-// Responses-protocol upstream payload: EVERY reasoning item id present in
-// that body, plus the chain link seen then.
-//
-// The gateway cannot narrow this down to the one id the 400 names: the
-// upstream error text is free-form prose, parsing it reliably would be a
-// second, weaker copy of the same classification, and a wrong guess would
-// leave a dead reference in the body (a wasted 400 every turn). So the
-// blacklist is the whole reasoning set as of poison-discovery time, which
-// means the entire pre-mark reasoning prefix is re-stripped on every turn
-// of the window, not just the single id the server complained about. What
-// selective stripping actually buys is that reasoning delivered AFTER the
-// mark — the part the failing body had never seen — survives. Empty ids
-// are skipped: id-less reasoning items can never replay validly, so
-// selective stripping always drops them without needing to record them.
-func collectStaleReasoningIDs(body []byte) (ids []string, prev string) {
-	var payload map[string]any
-	if json.Unmarshal(body, &payload) != nil {
-		return nil, ""
-	}
-	prev = jsonutil.StringAt(payload, "previous_response_id")
-	seen := make(map[string]struct{})
-	for _, raw := range jsonutil.SliceAt(payload, "input") {
-		m, _ := raw.(map[string]any)
-		if m == nil || jsonutil.StringAt(m, "type") != "reasoning" {
-			continue
-		}
-		id := jsonutil.StringAt(m, "id")
-		if id == "" {
-			continue
-		}
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
-	}
-	return ids, prev
-}
-
-// stripSelectiveReasoningInputs removes only the snapshotted blacklist from
-// Responses-protocol upstream payloads: blacklisted reasoning items, any
-// id-less reasoning items (never replayable), and the chain link only when
-// it still equals the dead link seen at snapshot time (a fresh link issued
-// after the mark is preserved, keeping newer healthy reasoning addressable).
-// Because the blacklist is every reasoning id the failing body carried, the
-// whole pre-mark reasoning prefix goes; what is kept is reasoning that
-// arrived after the mark (see collectStaleReasoningIDs).
-// Other tiers/protocols pass through untouched. It reports whether any
-// payload actually changed.
-func stripSelectiveReasoningInputs(route models.Route, bodies map[config.Tier][]byte, deny map[string]struct{}, deadPrev string) (map[config.Tier][]byte, bool) {
-	changed := false
-	out := make(map[config.Tier][]byte, len(bodies))
-	for tier, body := range bodies {
-		if len(body) == 0 || route.ProtocolFor(tier) != wire.Responses {
-			out[tier] = body
-			continue
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			out[tier] = body
-			continue
-		}
-		tierChanged := false
-		if current, ok := payload["previous_response_id"]; ok {
-			if deadPrev != "" {
-				// A non-string link can never be a freshly issued chain id,
-				// so treat it as dead rather than burning a fallback
-				// round-trip to learn the same thing.
-				if prev, isStr := current.(string); !isStr || prev == deadPrev {
-					delete(payload, "previous_response_id")
-					tierChanged = true
-				}
-			}
-		}
-		if raw, ok := payload["input"].([]any); ok {
-			kept := make([]any, 0, len(raw))
-			removed := false
-			for _, item := range raw {
-				m, ok := item.(map[string]any)
-				if !ok || jsonutil.StringAt(m, "type") != "reasoning" {
-					kept = append(kept, item)
-					continue
-				}
-				id := jsonutil.StringAt(m, "id")
-				if id == "" {
-					removed = true
-					continue
-				}
-				if _, blacklisted := deny[id]; blacklisted {
-					removed = true
-					continue
-				}
-				kept = append(kept, item)
-			}
-			if removed {
-				payload["input"] = kept
-				tierChanged = true
-			}
-		}
-		if !tierChanged {
-			out[tier] = body
-			continue
-		}
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			out[tier] = body
-			continue
-		}
-		out[tier] = encoded
-		changed = true
-	}
-	return out, changed
-}
-
-// summarizeReplayedReasoning describes the Responses reasoning input items
-// the client asked to replay in a request body (debug diagnostics only):
-// how many, how many carry encrypted_content, a hash of the ordered id
-// list, plus head/tail ids and any previous_response_id chain link.
-// Comparing two turns decides whether dsh replays the same dead references
-// every turn or rotates in freshly delivered ones. Note it describes
-// whatever body it is handed at the call site, and the two call sites sit on
-// opposite sides of the pre-strip: the "selectively pre-stripped" line
-// evaluates it before bodies is replaced, so it reports the client's own
-// replayed ids, while "stale reasoning reference matched" runs on the
-// already-stripped bodies and therefore reports n=0 for a full-mode
-// pre-strip (n=0 there is expected, not a bug).
-func summarizeReplayedReasoning(body []byte) string {
-	var payload map[string]any
-	if json.Unmarshal(body, &payload) != nil {
-		return "unparseable"
-	}
-	var ids []string
-	encrypted := 0
-	for _, raw := range jsonutil.SliceAt(payload, "input") {
-		m, _ := raw.(map[string]any)
-		if m == nil || jsonutil.StringAt(m, "type") != "reasoning" {
-			continue
-		}
-		ids = append(ids, jsonutil.StringAt(m, "id"))
-		if jsonutil.StringAt(m, "encrypted_content") != "" {
-			encrypted++
-		}
-	}
-	sum := sha256.Sum256([]byte(strings.Join(ids, ",")))
-	head, tail := "", ""
-	if len(ids) > 0 {
-		head = strings.Join(ids[:min(3, len(ids))], ",")
-		tail = strings.Join(ids[max(0, len(ids)-3):], ",")
-	}
-	return fmt.Sprintf("n=%d encrypted=%d hash=%s head=[%s] tail=[%s] prev=%s",
-		len(ids), encrypted, hex.EncodeToString(sum[:4]), head, tail,
-		jsonutil.StringAt(payload, "previous_response_id"))
-}
-
 func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int, fingerprint string) (*http.Response, models.Route, int, error) {
 	var lastResponse *http.Response
 	var lastErr error
 	effectiveRoute := route
 	attempts := attemptOffset
-	g.dumpClientBodies(route, bodies, ids, attemptOffset)
+	g.dumpClientBodies(route, bodies, ids)
 	if override, selected := debugKeyOverrideFrom(ctx); selected {
 		resp, err, used := g.doSelectedKeyUpstream(ctx, route, bodies, ids, override, attemptOffset)
 		return resp, route, used, err
@@ -745,7 +265,6 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	}
 	preparedBodies := make([][]byte, len(upstreams))
 	toolRenames := make([]*wire.ToolRenames, len(upstreams))
-	shapedPhase := shapedDumpPhase(attemptOffset)
 	for i, baseURL := range upstreams {
 		preparedBodies[i], toolRenames[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL))
 		// The shaped dump for this candidate is emitted inside the attempt loop,
@@ -810,7 +329,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			// bytes for a candidate that lost the race and "shaped" would stop meaning
 			// "what actually went out"; logged per attempt, the base it targets is
 			// unambiguous.
-			g.dumpOutboundBodyForUpstream(route, config.TierZen, preparedBodies[index], ids, shapedPhase, baseURL)
+			g.dumpOutboundBodyForUpstream(route, config.TierZen, preparedBodies[index], ids, "shaped", baseURL)
 			if node.proxy.pool {
 				req.Close = true
 			}
@@ -1219,10 +738,10 @@ func ensureAnonymousChatUsage(payload map[string]any, protocol wire.Protocol) bo
 const requestBodyDumpLimit = 64 << 10
 
 // dumpOutboundBody records one request body when logging.dump_request_bodies is
-// enabled. It exists so retry, translation and tool-shaping problems (stale
-// rs_* references, re-encoded history, tier re-encoding, the renamed client
-// tools, the appended official definitions, the gateway tool note) can be
-// diagnosed without patching the binary. Credentials travel in headers and
+// enabled. It exists so retry, translation and tool-shaping problems (re-encoded
+// history, tier re-encoding, the renamed client tools, the appended official
+// definitions, the gateway tool note), and upstream 400s that reject a replayed
+// rs_* reference as expired, can be diagnosed without patching the binary. Credentials travel in headers and
 // never in the body. The logger redacts configured secrets, but conversation
 // content can still be sensitive. Reference IDs are retained for replay
 // diagnostics.
@@ -1266,13 +785,9 @@ func (g *Gateway) dumpOutboundBodyForUpstream(route models.Route, tier config.Ti
 
 // dumpClientBodies logs the per-tier bodies a request arrived with, before any
 // lane shaping. See dumpOutboundBody for the phase vocabulary.
-func (g *Gateway) dumpClientBodies(route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) {
+func (g *Gateway) dumpClientBodies(route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs) {
 	if !g.cfg.Logging.DumpRequestBodies || len(bodies) == 0 {
 		return
-	}
-	phase := "client"
-	if attemptOffset > 0 {
-		phase = "client-retry"
 	}
 	tiers := make([]string, 0, len(bodies))
 	for tier := range bodies {
@@ -1280,17 +795,8 @@ func (g *Gateway) dumpClientBodies(route models.Route, bodies map[config.Tier][]
 	}
 	sort.Strings(tiers)
 	for _, name := range tiers {
-		g.dumpOutboundBody(route, config.Tier(name), bodies[config.Tier(name)], ids, phase)
+		g.dumpOutboundBody(route, config.Tier(name), bodies[config.Tier(name)], ids, "client")
 	}
-}
-
-// shapedDumpPhase names the shaped-phase line so a retry stays distinguishable
-// from the first attempt, the way the client-side phase does.
-func shapedDumpPhase(attemptOffset int) string {
-	if attemptOffset > 0 {
-		return "shaped-retry"
-	}
-	return "shaped"
 }
 
 // shapeKeyBody normalizes key-tier free-model wire bodies to agent shape
@@ -1339,7 +845,7 @@ func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route,
 	}
 	setRequestShape(ctx, changed, toolRenames)
 	useWARP := g.usesWARP(route.ID, override.Tier, false)
-	g.dumpOutboundBody(route, override.Tier, body, ids, shapedDumpPhase(attemptOffset))
+	g.dumpOutboundBody(route, override.Tier, body, ids, "shaped")
 	proxy := nodes.Proxy(node)
 	if !useWARP {
 		if proxy == nil {
@@ -1411,7 +917,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 	}
 	setRequestShape(ctx, changed, toolRenames)
 	useWARP := g.usesWARP(route.ID, route.Tier, false)
-	g.dumpOutboundBody(route, route.Tier, body, ids, shapedDumpPhase(attemptOffset))
+	g.dumpOutboundBody(route, route.Tier, body, ids, "shaped")
 	for attempts < g.cfg.Retry.MaxAttempts {
 		if ctx.Err() != nil {
 			// Same guard as the anonymous loop: an exhausted request budget

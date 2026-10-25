@@ -524,19 +524,6 @@
   text-decoration: underline;
 }
 
-/* Pre-strip attempt marks: bold, not clickable, no underline on hover. */
-.usage-table td.prestrip {
-  font-weight: 700;
-  white-space: nowrap;
-  color: var(--text-1);
-}
-
-.usage-table td.prestrip-sel {
-  font-weight: 700;
-  white-space: nowrap;
-  color: var(--ok);
-}
-
 /* Token cell: fresh input ↓ / output ↑, cache read + hit rate, exact breakdown
    on hover. */
 .tok {

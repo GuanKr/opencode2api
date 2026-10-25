@@ -132,27 +132,10 @@ type UpstreamRequest struct {
 	Anonymous   bool      `json:"anonymous"`
 	Proxy       string    `json:"proxy_node,omitempty"`
 	Attempts    int       `json:"attempts"`
-	// Prestripped marks a request whose first upstream attempt already went
-	// out pre-stripped because the session's stored history was remembered
-	// as poisoned (see gateway staleMemo). Such requests show attempts=1
-	// like a clean request, but the shape equals a self-heal retry body
-	// rather than the full client history.
-	Prestripped bool `json:"prestripped,omitempty"`
-	// PrestripMode is "selective" when only the snapshotted blacklist was
-	// removed and newer reasoning was kept, "full" when every reasoning
-	// reference was removed. Empty for non-pre-stripped requests; old
-	// pre-stripped records without a mode are full strips.
-	// It always describes the first-attempt shape, not the final successful
-	// body: a selective first attempt that needed an in-turn full fallback
-	// still records "selective" (see the attempts column title).
-	PrestripMode string `json:"prestrip_mode,omitempty"`
-	// PrestripIDs mirrors RequestMeta: stored blacklist size for the usage
-	// page (selective pre-strip or self-heal retry); omitted when zero.
-	PrestripIDs int    `json:"prestrip_ids,omitempty"`
-	Status      int    `json:"status"`
-	DurationMS  int64  `json:"duration_ms"`
-	Success     bool   `json:"success"`
-	Outcome     string `json:"outcome"`
+	Status      int       `json:"status"`
+	DurationMS  int64     `json:"duration_ms"`
+	Success     bool      `json:"success"`
+	Outcome     string    `json:"outcome"`
 	// Endpoint is the inbound path the client called (/v1/messages, ...).
 	Endpoint string `json:"endpoint,omitempty"`
 	// Stream records the client-requested response shape as stated on the
@@ -488,11 +471,6 @@ func (m *Metrics) Record(endpoint string, status int, duration time.Duration, me
 				Success:         success,
 				Endpoint:        endpoint,
 				ReasoningEffort: meta.ReasoningEffort, FirstByteMS: meta.FirstByteMS,
-				// Poisoned-history fast path: persisted so the usage page can
-				// mark a pre-stripped first attempt across restarts (see
-				// gateway staleMemo and UpstreamRequest).
-				Prestripped: meta.Prestripped, PrestripMode: meta.PrestripMode,
-				PrestripIDs: meta.PrestripIDs,
 			}
 			// Always a real pointer, sync included: nil would read back as
 			// "never recorded" in the usage page's 流式 column.

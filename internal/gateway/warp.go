@@ -281,7 +281,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 			// D5: dump the bytes that actually go on the wire, naming the base
 			// they target. Emitted here, not in the preparation loop above, so
 			// a candidate that is never attempted leaves no "shaped" record.
-			g.dumpOutboundBodyForUpstream(route, config.TierZen, prepared[index], ids, shapedDumpPhase(attemptOffset), baseURL)
+			g.dumpOutboundBodyForUpstream(route, config.TierZen, prepared[index], ids, "shaped", baseURL)
 			setRequestCredential(ctx, config.TierZen, "anonymous", "anonymous", true, nil)
 			started := time.Now()
 			resp, egress, err := g.doWARPAttempt(ctx, req, baseURL, route.ID, firstEventTimeout)

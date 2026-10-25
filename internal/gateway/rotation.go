@@ -226,7 +226,7 @@ func (g *Gateway) rotationAttempt(parent context.Context, w http.ResponseWriter,
 	cursor := g.goNodes.CursorFor(ids.Session)
 	var node *upstreamNode
 	// Each group attempt is exactly one HTTP call. Key selection may change,
-	// but there is no nested retry, stale-reasoning replay, or model-wide key ban.
+	// but there is no nested retry or model-wide key ban.
 	for n := 0; n < attempt; n++ {
 		node = cursor.Next()
 	}

@@ -56,26 +56,7 @@ type RequestMeta struct {
 	// ToolRenames counts the client tools the free-tier shaper renamed with
 	// the clint_ prefix. The upstream response is rewritten back to the
 	// client's names before it is returned.
-	ToolRenames int
-	// Prestripped is set by the gateway when the first upstream attempt
-	// goes out pre-stripped (poisoned-history fast path). It lets the
-	// usage page tell a pre-stripped att=1 apart from a clean att=1.
-	Prestripped bool
-	// PrestripMode distinguishes the first-attempt shape: "selective"
-	// strips only the snapshotted blacklist (pre-mark poisoned reasoning
-	// ids) while keeping newer healthy reasoning, "full" removes every
-	// reasoning reference. Empty when the request was not pre-stripped.
-	// Old records without a mode are full strips.
-	PrestripMode string
-	// PrestripIDs is the number of blacklisted reasoning ids stored for
-	// this session: the selective first-attempt blacklist size, or the
-	// size recorded by an in-turn self-heal retry. Note the two differ
-	// when a selective pre-strip was rejected and its full-strip fallback
-	// then succeeded: that write learns the ids the refused body carried
-	// before re-publishing the size, so the reported number is the
-	// post-merge one, not the one the first attempt was stripped with.
-	// Zero for full strips and for requests without reasoning surgery.
-	PrestripIDs    int
+	ToolRenames    int
 	Usage          protocol.Usage
 	UsageReported  bool
 	AttemptOutcome string

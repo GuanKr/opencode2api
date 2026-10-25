@@ -268,8 +268,7 @@ func (g *Gateway) handleWatchdogProbe(w http.ResponseWriter, r *http.Request) {
 // never drift apart.
 //
 // It writes almost no pool state: no cooldown, no health verdict, no
-// lastSuccess/lastFailure, no stale-reasoning memo, and it never triggers a
-// background proxy check. The one exception is an IP abuse block, which a 2xx
+// lastSuccess/lastFailure, and it never triggers a background proxy check. The one exception is an IP abuse block, which a 2xx
 // clears — that block is a property of the egress IP, the probe just proved the
 // IP works, and nothing else in the process would ever clear it before
 // performance.free_tier_block_seconds expired. The feed's "user traffic only"
