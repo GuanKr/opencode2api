@@ -250,8 +250,11 @@ func TestFreeTierShapingFoldsChatSystemMessagesIntoOne(t *testing.T) {
 	if !strings.Contains(content, opencodePromptMarker) {
 		t.Fatalf("the official prompt is missing from the folded message")
 	}
-	if !strings.HasSuffix(content, "\n\ndev rules\nsys rules") {
+	if !strings.Contains(content, "\n\ndev rules\nsys rules\n\n") {
 		t.Fatalf("client instructions must follow the official prompt in order, got %q", content)
+	}
+	if !strings.HasSuffix(content, "\n\n"+gatewayToolNote) {
+		t.Fatalf("the gateway tool note must come last, got %q", content)
 	}
 	for index, raw := range messages {
 		message, _ := raw.(map[string]any)
@@ -271,14 +274,14 @@ func TestFreeTierShapingInjectsAnthropicSystemInPlace(t *testing.T) {
 
 	asString := decodeShaped(t, mustShape(t, []byte(`{"model":"m","system":"be terse","messages":[]}`), wire.Anthropic, false))
 	system, _ := asString["system"].(string)
-	if !strings.HasPrefix(system, opencodeSystemPrompt("m", false)) || !strings.HasSuffix(system, "\n\nbe terse") {
-		t.Fatalf("a string system value must keep its text after the prompt, got %q", system)
+	if !strings.HasPrefix(system, opencodeSystemPrompt("m", false)) || !strings.Contains(system, "\n\nbe terse\n\n"+gatewayToolNote) {
+		t.Fatalf("a string system value must keep its text after the prompt and before the note, got %q", system)
 	}
 
 	asBlocks := decodeShaped(t, mustShape(t, []byte(`{"model":"m","system":[{"type":"text","text":"be terse"}],"messages":[]}`), wire.Anthropic, false))
 	blocks, ok := asBlocks["system"].([]any)
-	if !ok || len(blocks) != 2 {
-		t.Fatalf("a block system value must gain exactly one leading block, got %v", asBlocks["system"])
+	if !ok || len(blocks) != 3 {
+		t.Fatalf("a block system value must gain the prompt and the note, got %v", asBlocks["system"])
 	}
 	first, _ := blocks[0].(map[string]any)
 	if first["type"] != "text" || !strings.Contains(first["text"].(string), opencodePromptMarker) {
@@ -287,6 +290,10 @@ func TestFreeTierShapingInjectsAnthropicSystemInPlace(t *testing.T) {
 	second, _ := blocks[1].(map[string]any)
 	if second["text"] != "be terse" {
 		t.Fatalf("the client block must be preserved verbatim, got %v", second)
+	}
+	third, _ := blocks[2].(map[string]any)
+	if third["text"] != gatewayToolNote {
+		t.Fatalf("the trailing block must be the gateway note, got %v", third)
 	}
 }
 
@@ -301,8 +308,8 @@ func TestFreeTierShapingInjectsResponsesInstructions(t *testing.T) {
 
 	present := decodeShaped(t, mustShape(t, []byte(`{"model":"m","instructions":"be terse","input":[]}`), wire.Responses, false))
 	instructions, _ = present["instructions"].(string)
-	if !strings.HasSuffix(instructions, "\n\nbe terse") {
-		t.Fatalf("the client instructions must follow the prompt, got %q", instructions)
+	if !strings.Contains(instructions, "\n\nbe terse\n\n"+gatewayToolNote) {
+		t.Fatalf("the client instructions must follow the prompt and precede the note, got %q", instructions)
 	}
 }
 
@@ -333,6 +340,94 @@ func TestFreeTierShapingNeverDuplicatesTheOfficialPrompt(t *testing.T) {
 		if count := strings.Count(string(shaped), opencodePromptMarker); count != 1 {
 			t.Fatalf("%s: the prompt appears %d times, want exactly the client's one:\n%s", name, count, shaped)
 		}
+	}
+}
+
+// TestFreeTierShapingAppendsTheGatewayToolNote pins the suppression note: after
+// the official prompt and after the client's own instructions, every shaped body
+// ends with the note that tells the model only the clint_ tools exist in the
+// caller's executor. Without it the appended official set invites calls the
+// client never declared and cannot run.
+func TestFreeTierShapingAppendsTheGatewayToolNote(t *testing.T) {
+	chat := decodeShaped(t, mustShape(t, []byte(`{"model":"m","messages":[{"role":"system","content":"be terse"},`+
+		`{"role":"user","content":"hi"}]}`), wire.Chat, false))
+	messages, _ := chat["messages"].([]any)
+	if len(messages) == 0 {
+		t.Fatal("the shaped chat body lost its messages")
+	}
+	system, _ := messages[0].(map[string]any)
+	content, _ := system["content"].(string)
+	if strings.Count(content, gatewayToolNote) != 1 || !strings.HasSuffix(content, "\n\n"+gatewayToolNote) {
+		t.Fatalf("the chat note must be the last system instruction exactly once, got %q", content)
+	}
+	if !strings.Contains(content, "be terse") {
+		t.Fatalf("the client's instruction must survive ahead of the note, got %q", content)
+	}
+
+	anthropicString := decodeShaped(t, mustShape(t, []byte(`{"model":"m","system":"be terse","messages":[]}`), wire.Anthropic, false))
+	if system, _ := anthropicString["system"].(string); !strings.HasSuffix(system, "\n\n"+gatewayToolNote) {
+		t.Fatalf("a string system value must gain the note at the end, got %v", anthropicString["system"])
+	}
+	anthropicBlocks := decodeShaped(t, mustShape(t, []byte(`{"model":"m","system":[{"type":"text","text":"be terse"}],"messages":[]}`), wire.Anthropic, false))
+	blocks, _ := anthropicBlocks["system"].([]any)
+	if len(blocks) != 3 {
+		t.Fatalf("a block system value must gain the prompt and the note, got %v", anthropicBlocks["system"])
+	}
+	if last, _ := blocks[len(blocks)-1].(map[string]any); last["text"] != gatewayToolNote {
+		t.Fatalf("the last block must be the note, got %v", last)
+	}
+
+	responses := decodeShaped(t, mustShape(t, []byte(`{"model":"m","instructions":"be terse","input":[]}`), wire.Responses, false))
+	if instructions, _ := responses["instructions"].(string); !strings.HasSuffix(instructions, "\n\n"+gatewayToolNote) {
+		t.Fatalf("responses instructions must gain the note at the end, got %v", responses["instructions"])
+	}
+}
+
+// TestFreeTierShapingNotesABodyWithNoSystemSlot: a client that sends no system
+// message still needs to know which tools it can run. Prompt injection creates
+// the leading slot, and the note must land in it rather than being dropped.
+func TestFreeTierShapingNotesABodyWithNoSystemSlot(t *testing.T) {
+	payload := decodeShaped(t, mustShape(t, []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`), wire.Chat, false))
+	messages, _ := payload["messages"].([]any)
+	first, _ := messages[0].(map[string]any)
+	content, _ := first["content"].(string)
+	if first["role"] != "system" || !strings.HasPrefix(content, opencodePromptMarker) || !strings.HasSuffix(content, gatewayToolNote) {
+		t.Fatalf("want one leading system message carrying the prompt and the note, got %v", messages)
+	}
+}
+
+// TestFreeTierShapingNotesABodyThatAlreadyCarriesThePrompt: the marker suppresses
+// the prompt injection, not the tool shaping. A client that sends the official
+// prompt itself still has its tools renamed, so it still needs the note.
+func TestFreeTierShapingNotesABodyThatAlreadyCarriesThePrompt(t *testing.T) {
+	shaped := mustShape(t, []byte(`{"model":"m","messages":[{"role":"system","content":"`+opencodePromptMarker+
+		` and the rest"},{"role":"user","content":"hi"}]}`), wire.Chat, false)
+	messages, _ := decodeShaped(t, shaped)["messages"].([]any)
+	system, _ := messages[0].(map[string]any)
+	content, _ := system["content"].(string)
+	if strings.Count(content, opencodePromptMarker) != 1 {
+		t.Fatalf("the client's prompt must not be duplicated, got %q", content)
+	}
+	if !strings.HasSuffix(content, "\n\n"+gatewayToolNote) {
+		t.Fatalf("the note must still be appended, got %q", content)
+	}
+}
+
+// TestGatewayToolNoteStaysScopedToTheOfficialSet pins the wording decision: the
+// shaper passes client-declared server tools (Responses web_search, Anthropic
+// server tools) through unrenamed because they have no client name to rewrite,
+// and the upstream runs them. A blanket "every other tool is a placeholder"
+// would tell the model not to use a capability that still works, so the
+// prohibition must stay scoped to the official OpenCode set.
+func TestGatewayToolNoteStaysScopedToTheOfficialSet(t *testing.T) {
+	lower := strings.ToLower(gatewayToolNote)
+	for _, blanket := range []string{"every other tool", "any other tool", "all other tools", "every tool"} {
+		if strings.Contains(lower, blanket) {
+			t.Fatalf("the note claims %q is a placeholder; client-declared server tools such as web_search stay callable:\n%s", blanket, gatewayToolNote)
+		}
+	}
+	if !strings.Contains(gatewayToolNote, "official OpenCode") {
+		t.Fatalf("the prohibition must name the official set it applies to, got %q", gatewayToolNote)
 	}
 }
 

@@ -1020,9 +1020,12 @@ func (g *Gateway) inferenceClient(proxy *proxyTransport, baseURL, model string) 
 //
 // Every named client tool becomes clint_<name> (sanitized and collision-safe)
 // and the full official set for the lane is appended, so the request looks like
-// an official CLI session on both the v1 (/zen) and v2 lanes. System One
-// payloads are decision requests, not agent traffic, so they are forwarded
-// verbatim, as is a body that is not a JSON object.
+// an official CLI session on both the v1 (/zen) and v2 lanes. Because the model
+// then sees both generations, a gateway note is appended after every other
+// system instruction telling it to call only the clint_ tools (see
+// gatewayToolNote). System One payloads are decision requests, not agent
+// traffic, so they are forwarded verbatim, as is a body that is not a JSON
+// object.
 func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool) ([]byte, *wire.ToolRenames) {
 	if protocol == wire.SystemOne {
 		return body, nil
@@ -1044,6 +1047,9 @@ func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool) ([]byte,
 	}
 	renames, toolsChanged := renameAndCompleteTools(payload, protocol, v1)
 	if toolsChanged {
+		changed = true
+	}
+	if appendGatewayToolNote(payload, protocol) {
 		changed = true
 	}
 	if !v1 && protocol == wire.Chat && ensureV2CompletionLimit(payload) {
@@ -1176,18 +1182,19 @@ const requestBodyDumpLimit = 64 << 10
 
 // dumpOutboundBody records one request body when logging.dump_request_bodies is
 // enabled. It exists so retry, translation and tool-shaping problems (stale
-// rs_* references, re-encoded history, tier re-encoding, appended core tool
-// definitions, the injected placeholder note) can be diagnosed without patching
-// the binary. Credentials travel in headers and never in the body. The logger
-// redacts configured secrets, but conversation content can still be sensitive.
-// Reference IDs are retained for replay diagnostics.
+// rs_* references, re-encoded history, tier re-encoding, the renamed client
+// tools, the appended official definitions, the gateway tool note) can be
+// diagnosed without patching the binary. Credentials travel in headers and
+// never in the body. The logger redacts configured secrets, but conversation
+// content can still be sensitive. Reference IDs are retained for replay
+// diagnostics.
 //
 // phase says which bytes these are. "client" is what the client sent, before the
 // lane shapes the body; "shaped" is what goes on the wire. Both are logged so the
 // pair can be compared: an equal sha256 proves the lane changed nothing, and a
 // differing one localises the change to one transformation. Logging only the
 // client-side body hides every shaping step, and that is exactly where the tool
-// definitions and the placeholder note live.
+// definitions and the gateway tool note live.
 func (g *Gateway) dumpOutboundBody(route models.Route, tier config.Tier, body []byte, ids identity.RequestIDs, phase string) {
 	g.dumpOutboundBodyForUpstream(route, tier, body, ids, phase, "")
 }

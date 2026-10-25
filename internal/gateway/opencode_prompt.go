@@ -196,6 +196,141 @@ func injectResponsesPrompt(payload map[string]any, prompt string) bool {
 	return true
 }
 
+// gatewayToolNote goes into the system slot of a shaped free-tier body, after
+// the official prompt and after the client's own instructions. The shaper
+// renames the client's own tools to clint_<name> and then appends the lane's
+// full official OpenCode set, so the model sees both generations at once while
+// only the clint_ tools exist in the caller's executor. A call to an appended
+// official name is passed through unmapped (see protocol.renameToolInMap), so
+// the client receives a tool call it never declared and cannot run.
+//
+// Measured 2026-10-15 against /inference: a system-slot note turned ghost
+// tool_calls on a neutral prompt from 1/1 requests into 0/1, while changing the
+// system slot cost no 403 because the gate compares tool definitions, not
+// system text. A prompt that explicitly asks for a tool still gets one — that is
+// the user asking, not a ghost call.
+//
+// Cost, stated plainly: upstream injected the official prompt because the gate
+// is said to check the request against it (see 97cdb29), and this note is text
+// no real CLI sends. It sits after the official prompt, the same shape upstream
+// already produces when it appends the client's own instructions, and the
+// 2026-10-15 measurement showed system-slot text alone did not cost a 403. That
+// measurement predates the official prompt, so the gate's reaction to this body
+// stays unverified — the same caveat AGENTS.md carries for the whole shaper.
+//
+// The wording names no tool and, deliberately, does not claim that every
+// non-clint_ entry is a gateway placeholder. Responses and Anthropic clients can
+// declare server-side tools (web_search and friends); those carry no client name
+// to rewrite, so the shaper passes them through untouched and the upstream runs
+// them. Condemning "everything else" would switch a working capability off, so
+// the prohibition is scoped to the official OpenCode set the gateway itself
+// appended. It still names none of those tools: the set differs by lane (11
+// names on v1, 13 on v2), and enumerating either would make the note change
+// whenever the lane or the captured set does.
+const gatewayToolNote = "[gateway] The tools whose names begin with `clint_` are the client's own tools: " +
+	"call them with exactly the parameters they declare. The gateway also appends the official OpenCode " +
+	"tool set so this request looks like a CLI session, and this client cannot execute those tools: do not " +
+	"call an official OpenCode tool here. If none of the `clint_` tools fits, answer directly instead."
+
+// appendGatewayToolNote appends gatewayToolNote to the payload's system slot,
+// after the official prompt and after the client's own instructions, so the
+// suppression is the last instruction the model reads. It reports whether the
+// payload changed; System One payloads are decision requests and are never
+// touched.
+func appendGatewayToolNote(payload map[string]any, protocol wire.Protocol) bool {
+	if payload == nil || protocol == wire.SystemOne {
+		return false
+	}
+	switch protocol {
+	case wire.Chat:
+		return appendChatToolNote(payload)
+	case wire.Anthropic:
+		return appendAnthropicToolNote(payload)
+	case wire.Responses:
+		return appendResponsesToolNote(payload)
+	default:
+		return false
+	}
+}
+
+// appendChatToolNote writes the note into the first system/developer message it
+// can extend, creating a leading system message when the body carries none. An
+// exotic content shape is skipped rather than overwritten: the note is advisory
+// and must never cost client data.
+//
+// In the current call order injectOfficialPrompt has already folded every
+// system/developer message into a leading one, so the "none" branch is
+// defensive only — it keeps the note from disappearing if the two steps are ever
+// reordered. The end-to-end test for a body without a system slot therefore
+// exercises that fold, not this branch.
+func appendChatToolNote(payload map[string]any) bool {
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if role != "system" && role != "developer" {
+			continue
+		}
+		switch content := message["content"].(type) {
+		case string:
+			if strings.TrimSpace(content) == "" {
+				message["content"] = gatewayToolNote
+			} else {
+				message["content"] = content + "\n\n" + gatewayToolNote
+			}
+			return true
+		case []any:
+			message["content"] = append(content, map[string]any{"type": "text", "text": gatewayToolNote})
+			return true
+		}
+	}
+	payload["messages"] = append([]any{map[string]any{"role": "system", "content": gatewayToolNote}}, messages...)
+	return true
+}
+
+// appendAnthropicToolNote appends the note after the top-level system value,
+// keeping a caller's string or block list intact ahead of it.
+func appendAnthropicToolNote(payload map[string]any) bool {
+	switch system := payload["system"].(type) {
+	case nil:
+		payload["system"] = gatewayToolNote
+	case string:
+		if strings.TrimSpace(system) == "" {
+			payload["system"] = gatewayToolNote
+		} else {
+			payload["system"] = system + "\n\n" + gatewayToolNote
+		}
+	case []any:
+		payload["system"] = append(system, map[string]any{"type": "text", "text": gatewayToolNote})
+	default:
+		return false
+	}
+	return true
+}
+
+// appendResponsesToolNote appends the note after the Responses instructions.
+func appendResponsesToolNote(payload map[string]any) bool {
+	switch instructions := payload["instructions"].(type) {
+	case nil:
+		payload["instructions"] = gatewayToolNote
+	case string:
+		if strings.TrimSpace(instructions) == "" {
+			payload["instructions"] = gatewayToolNote
+		} else {
+			payload["instructions"] = instructions + "\n\n" + gatewayToolNote
+		}
+	default:
+		return false
+	}
+	return true
+}
+
 // textFragments flattens a system or instruction value into its text: a plain
 // string, a list of content blocks, or a block object carrying text or content.
 func textFragments(value any) []string {
