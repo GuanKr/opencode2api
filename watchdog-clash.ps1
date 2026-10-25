@@ -1168,6 +1168,12 @@ function Test-GatewayNodeLegacy {
     #   - lane_paused：窗口内换任何节点都无效，按 cooling 只等，不刷新不切换。
     elseif ($info.Status -eq 503 -and $body.Contains('free_tier_lane_paused')) { $class = 'cooling' }
     elseif ($info.Status -eq 503 -and $body.Contains('free_tier_ip_blocked')) { $class = 'quota' }
+    # 2026-10-25：第 4 条自撰 503 —— warp_unavailable（WARP 开着但一个出口都拿不到，
+    # 请求根本没到上游）。WARP 流量不经过 Clash，换候选节点对它无解；而且这是网关侧/
+    # 主机侧状态（出口池起不来、UDP 到不了 Cloudflare 端点），一轮之内不会自愈，按
+    # config 停轮。主探针端点在 WARP 开启时网关直接答 config（不真发），此分支只保护
+    # legacy 探针（-ProbeEndpoint legacy / 端点 404 回落）那条真发请求的路径。
+    elseif ($info.Status -eq 503 -and $body.Contains('warp_unavailable')) { $class = 'config' }
     elseif ($body.Contains('FreeUsageLimit') -or $body.Contains('BlackUsageLimit')) { $class = 'quota' }
     elseif ($info.Status -eq 502 -or $info.Status -eq 503 -or $info.Status -eq 504 -or $body.Contains('gateway_transport')) {
       $class = 'transport'

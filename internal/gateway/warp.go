@@ -28,8 +28,11 @@ var errWARPUnavailable = errors.New("WARP egress is unavailable")
 
 // warpUnavailableMessage is what a client receives when the free lane is
 // configured to leave through WARP but no exit could be acquired. It is a 503
-// because the request never reached the upstream.
-const warpUnavailableMessage = "no WARP exit could carry this free-model request; the upstream was not contacted. Check the WARP switch and this host's UDP access to the Cloudflare endpoint."
+// because the request never reached the upstream. The opencode2api: prefix is
+// the same self-authored marker every other gateway-synthesised error carries:
+// watchdog-clash.ps1 distinguishes these bodies from upstream pass-throughs by
+// it, and an upstream echo of user input can otherwise impersonate the gateway.
+const warpUnavailableMessage = "opencode2api: no WARP exit could carry this free-model request; the upstream was not contacted. Check the WARP switch and this host's UDP access to the Cloudflare endpoint."
 
 // usesWARP reports whether this request's egress must bypass proxies. Only
 // free models on the anonymous lane and the Zen key tier qualify; the Go plan

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -315,6 +316,18 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 		return nil
 	}
 	defer g.anonymous.ReleaseProbe()
+	// An empty lane list is D1's "must report unavailable" configuration
+	// (upstream.anonymous on the v1 origin with the default ["inference"]
+	// order). The request path answers 503 proxy_error and the watchdog
+	// answers config; walking on here would run zero FetchModels attempts
+	// while err stays nil, and the success branch below would heal cooldowns
+	// and close the lane breaker on evidence no attempt ever produced. The
+	// gate covers both the proxy walk and refreshAnonymousWARP, so neither
+	// path reports a route it never dialled.
+	if len(g.anonymousUpstreams()) == 0 {
+		g.logger.Warn("anonymous model catalog refresh has no usable lane", "component", "models", "event", "anonymous_route_missing", "upstream", config.RedactURL(base), "lane_order", strings.Join(g.cfg.Upstream.AnonymousLaneOrder, ","))
+		return nil
+	}
 	if g.warp != nil {
 		return g.refreshAnonymousWARP(ctx, base)
 	}

@@ -30,10 +30,11 @@ type sessionGenerations struct {
 	mu  sync.Mutex
 	now func() time.Time
 	ttl time.Duration
-	// sweepInterval throttles the TTL sweep: Generation runs at least twice per
-	// request, and a full-map walk under the store's single mutex on every call
-	// would serialise every request behind the same lock once a gateway holds
-	// many conversations.
+	// sweepInterval throttles the TTL sweep: Generation runs on the hot path
+	// of every free-model request (once per lane the conversation touches),
+	// and a full-map walk under the store's single mutex on every call would
+	// serialise every request behind the same lock once a gateway holds many
+	// conversations.
 	sweepInterval time.Duration
 	lastSweep     time.Time
 	gen           map[string]sessionGenerationEntry
