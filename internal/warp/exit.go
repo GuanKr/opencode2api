@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
@@ -74,14 +75,18 @@ type exit struct {
 }
 
 func newExit(ctx context.Context, reg registration) (*exit, error) {
-	return newExitWithStack(ctx, reg, DefaultStack, netip.Addr{})
+	return newExitWithStack(ctx, reg, DefaultStack, netip.Addr{}, "")
 }
 
 // newExitWithStack builds one userspace tunnel for reg. A valid source pins
 // the outer WireGuard socket to that address and restricts the peer endpoints
 // to IPv6, so the public egress is derived from the rotating source rather than
-// from whatever address the host happens to share.
-func newExitWithStack(ctx context.Context, reg registration, stack Stack, source netip.Addr) (*exit, error) {
+// from whatever address the host happens to share. A non-empty proxy instead
+// relays the outer packets through a SOCKS5 UDP relay: the host's own routes
+// then say nothing about what is reachable, so both endpoint families are kept
+// with IPv4 leading, and a source prefix cannot be bound behind someone else's
+// NAT (the configuration rejects the combination).
+func newExitWithStack(ctx context.Context, reg registration, stack Stack, source netip.Addr, proxy string) (*exit, error) {
 	normalized, err := ParseStack(string(stack))
 	if err != nil {
 		return nil, err
@@ -144,14 +149,26 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 	// "unreachable network" after a full handshake timeout, and the startup
 	// budget expires before the IPv4 fallbacks are reached (measured
 	// 2026-10-25: 15s per candidate, three IPv6 candidates, 2-minute deadline).
-	endpoints = orderEndpointsByReachability(endpoints, source.IsValid(),
-		familyReachable("udp4", "1.1.1.1:53"),
-		familyReachable("udp6", "[2606:4700:4700::1111]:53"))
+	var bind conn.Bind
+	var reachV4, reachV6 bool
+	if proxy != "" {
+		// Behind the relay the host's routes are not the routes that matter;
+		// skip the local probes entirely, keep both families and lead with
+		// IPv4. familyReachable's local UDP lookup would order by the wrong
+		// network's capability.
+		bind = &socks5Bind{proxy: proxy}
+		reachV4 = true
+	} else {
+		bind = &simpleBind{source: source}
+		reachV4 = familyReachable("udp4", "1.1.1.1:53")
+		reachV6 = familyReachable("udp6", "[2606:4700:4700::1111]:53")
+	}
+	endpoints = orderEndpointsByReachability(endpoints, source.IsValid(), reachV4, reachV6)
 	if len(endpoints) == 0 {
 		tunDevice.Close()
 		return nil, fmt.Errorf("no WARP endpoint is reachable over the %s stack", stack)
 	}
-	wg := device.NewDevice(tunDevice, &simpleBind{source: source}, device.NewLogger(device.LogLevelError, "warp: "))
+	wg := device.NewDevice(tunDevice, bind, device.NewLogger(device.LogLevelError, "warp: "))
 	uapi := fmt.Sprintf(
 		"private_key=%s\npublic_key=%s\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\nendpoint=%s\npersistent_keepalive_interval=25\n",
 		privateKey, peerKey, endpoints[0],

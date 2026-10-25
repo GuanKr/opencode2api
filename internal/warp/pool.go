@@ -122,12 +122,24 @@ type Options struct {
 	// SourceIPv6, when valid, is the outer IPv6 prefix each exit binds its
 	// WireGuard socket to. Every exit draws its own address from it, so a
 	// replacement reaches Cloudflare from a new source and receives a new
-	// public egress — the only way past an egress-scoped free usage limit.
+	// public egress. One way past an egress-scoped free usage limit — but not
+	// the only one: measured 2026-10-25, a replacement registration already
+	// receives a fresh public egress from a single fixed outer source, so this
+	// prefix is optional, not required, for egress rotation.
 	SourceIPv6 netip.Prefix
+	// Proxy, when set, is a socks5:// or socks5h:// URL (a bare host:port is
+	// tolerated for direct callers) whose relay carries both the registration
+	// API calls and every outer WireGuard packet (UDP ASSOCIATE). The
+	// deployment this exists for is a host whose direct UDP to the WARP
+	// endpoints is unreliable (measured 2026-10-25: 1/3 direct handshakes vs
+	// 3/3 over a local mixed port) — the relay fixes the handshake path while
+	// each registration still gets its own egress.
+	Proxy string
 }
 
 // NewWithOptions creates a WARP pool whose exits use the selected IP stack and,
-// optionally, rotate their outer IPv6 source within a prefix.
+// optionally, rotate their outer IPv6 source within a prefix or relay their
+// outer packets through a SOCKS5 server.
 func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool, error) {
 	normalized, err := ParseStack(string(opts.Stack))
 	if err != nil {
@@ -136,11 +148,21 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 	if opts.SourceIPv6.IsValid() && (!opts.SourceIPv6.Addr().Is6() || opts.SourceIPv6.Bits() > 64) {
 		return nil, fmt.Errorf("WARP outer source must be an IPv6 prefix of /64 or shorter, got %s", opts.SourceIPv6)
 	}
+	proxyDial := ""
+	if opts.Proxy != "" {
+		proxyDial, err = proxyDialAddress(opts.Proxy)
+		if err != nil {
+			return nil, err
+		}
+		if opts.SourceIPv6.IsValid() {
+			return nil, errors.New("WARP outer source cannot be bound behind a SOCKS5 relay; set either warp.proxy or warp.source_ipv6")
+		}
+	}
 	size := opts.Size
 	if size <= 0 {
 		size = DefaultPoolSize
 	}
-	r := newRegistrar()
+	r := newRegistrar(proxyDial)
 	pool, err := newPool(ctx, slogLogger{log: log}, size, func(ctx context.Context) (*exit, error) {
 		reg, err := r.register(ctx)
 		if err != nil {
@@ -153,7 +175,7 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 				return nil, err
 			}
 		}
-		return newExitWithStack(ctx, reg, normalized, source)
+		return newExitWithStack(ctx, reg, normalized, source, proxyDial)
 	})
 	if err != nil {
 		return nil, err

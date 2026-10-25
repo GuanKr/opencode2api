@@ -262,15 +262,15 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 }
 
 // selectWARP returns the WARP pool a runtime built for cfg must use. A pool
-// with the same size, stack and outer source prefix is shared across runtimes;
-// creating a new one registers its first exit synchronously, so enabling WARP
-// fails closed when Cloudflare cannot be reached. A disabled configuration
-// returns no pool.
+// with the same size, stack, outer source prefix and SOCKS relay is shared
+// across runtimes; creating a new one registers its first exit synchronously,
+// so enabling WARP fails closed when Cloudflare cannot be reached. A disabled
+// configuration returns no pool.
 func (m *RuntimeController) selectWARP(cfg config.Config) (*warp.Pool, string, bool, error) {
 	if !cfg.Warp.Enabled {
 		return nil, "", false, nil
 	}
-	key := fmt.Sprintf("%d|%s|%s", cfg.Warp.PoolSize, cfg.Warp.Stack, cfg.Warp.SourceIPv6)
+	key := fmt.Sprintf("%d|%s|%s|%s", cfg.Warp.PoolSize, cfg.Warp.Stack, cfg.Warp.SourceIPv6, cfg.Warp.Proxy)
 	if m.warpPool != nil && m.warpKey == key {
 		return m.warpPool, key, false, nil
 	}
@@ -288,7 +288,7 @@ func (m *RuntimeController) selectWARP(cfg config.Config) (*warp.Pool, string, b
 	}
 	ctx, cancel := context.WithTimeout(m.root, timeout)
 	defer cancel()
-	pool, err := warp.NewWithOptions(ctx, m.logger, warp.Options{Size: cfg.Warp.PoolSize, Stack: warp.Stack(cfg.Warp.Stack), SourceIPv6: source})
+	pool, err := warp.NewWithOptions(ctx, m.logger, warp.Options{Size: cfg.Warp.PoolSize, Stack: warp.Stack(cfg.Warp.Stack), SourceIPv6: source, Proxy: cfg.Warp.Proxy})
 	if err != nil {
 		return nil, "", false, fmt.Errorf("initialize WARP egress: %w", err)
 	}

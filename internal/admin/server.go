@@ -328,6 +328,14 @@ func preserveUnrenderedSettings(current config.Config, update ConfigUpdate) Conf
 		backoff := *current.Models.AnonymousBackoff
 		update.Models.AnonymousBackoff = &backoff
 	}
+	// The WARP block is a pointer so an omitted field keeps the switch, but the
+	// form only renders enabled/pool_size/stack: a submitted block would clear
+	// warp.proxy by omission and silently push the outer path back to flaky
+	// direct UDP. An operator who wants it gone edits config.json, exactly like
+	// the lane order.
+	if update.Warp != nil && strings.TrimSpace(update.Warp.Proxy) == "" {
+		update.Warp.Proxy = current.Warp.Proxy
+	}
 	return update
 }
 

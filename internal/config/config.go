@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,10 +78,19 @@ type WarpConfig struct {
 	PoolSize int    `json:"pool_size,omitempty"`
 	Stack    string `json:"stack,omitempty"`
 	// SourceIPv6 is an outer IPv6 prefix (usually a routed /64) each WARP exit
-	// binds its WireGuard socket to. Rotating the source is what gives a
-	// replacement exit a new public egress; without it, exits share one
-	// address and an egress-scoped free quota stays exhausted.
+	// binds its WireGuard socket to. Rotating the source is one way to give a
+	// replacement exit a new public egress; measured 2026-10-25 it is optional
+	// — a replacement registration from a single fixed outer source already
+	// receives a fresh egress — so this prefix only matters for hosts that
+	// want egress variety beyond what per-registration rotation provides.
 	SourceIPv6 string `json:"source_ipv6,omitempty"`
+	// Proxy is a socks5://host:port URL whose relay carries the WARP
+	// registration API calls and every outer WireGuard UDP packet. Use it when
+	// the host's direct UDP to the WARP endpoints is unreliable (measured
+	// 2026-10-25 on an IPv4-only host behind the GFW: 1/3 direct handshakes
+	// vs 3/3 through a local mixed port). Only socks5/socks5h carry UDP;
+	// http(s) proxies are rejected. Mutually exclusive with source_ipv6.
+	Proxy string `json:"proxy,omitempty"`
 }
 
 // Normalize fills the defaults and canonicalizes the stack name.
@@ -112,6 +122,37 @@ func (w *WarpConfig) Normalize() error {
 			return errors.New("warp.source_ipv6 requires warp.stack to be \"ipv6\"; an IPv4 stack cannot present an IPv6 egress")
 		}
 		w.SourceIPv6 = prefix.Masked().String()
+		if w.Proxy != "" {
+			return errors.New("warp.proxy and warp.source_ipv6 are mutually exclusive: an outer source cannot be bound behind a SOCKS5 relay")
+		}
+	}
+	w.Proxy = strings.TrimSpace(w.Proxy)
+	if w.Proxy != "" {
+		u, err := url.Parse(w.Proxy)
+		if err != nil || u.Host == "" {
+			return fmt.Errorf("warp.proxy: %q is not a proxy URL", w.Proxy)
+		}
+		switch strings.ToLower(u.Scheme) {
+		case "socks5", "socks5h":
+		default:
+			return fmt.Errorf("warp.proxy must be socks5:// or socks5h:// (http(s) proxies cannot carry the outer UDP), got %q", w.Proxy)
+		}
+		if u.User != nil {
+			// The registration client and the bind must agree on the relay:
+			// the SOCKS5 handshake here is no-auth only, so credentials would
+			// split the two paths into "authenticated API, dead tunnel".
+			return fmt.Errorf("warp.proxy %s must not carry credentials: the relay is no-auth only", RedactURL(w.Proxy))
+		}
+		if u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Hostname() == "" {
+			return fmt.Errorf("warp.proxy must be a bare socks5://host:port URL, got %q", w.Proxy)
+		}
+		port, portErr := strconv.Atoi(u.Port())
+		if portErr != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("warp.proxy: %q has no valid port", w.Proxy)
+		}
+		// Canonicalize so the runtime layer never re-parses a mixed-case
+		// scheme that url.Parse has already lowercased.
+		w.Proxy = strings.ToLower(u.Scheme) + "://" + u.Host
 	}
 	return nil
 }

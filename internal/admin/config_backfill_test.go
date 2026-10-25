@@ -171,3 +171,30 @@ func TestBuildConfigCandidateKeepsWarpWhenTheFormOmitsIt(t *testing.T) {
 		t.Fatalf("an explicit warp block must win: %+v", candidate.Warp)
 	}
 }
+
+// The console form renders enabled/pool_size/stack but not warp.proxy, so a
+// save from it would push the WARP outer path back to flaky direct UDP with
+// applied:true and no log line — the same silent-loss shape as the lane order.
+func TestBuildConfigCandidateKeepsWarpProxyWhenTheFormOmitsIt(t *testing.T) {
+	current := config.Config{
+		ServerKeys: []string{"local-key"},
+		Warp:       config.WarpConfig{Enabled: true, PoolSize: 2, Stack: "ipv6", Proxy: "socks5://127.0.0.1:7890"},
+	}
+	// What the form submits: the warp block without the proxy field.
+	submitted := config.WarpConfig{Enabled: true, PoolSize: 2, Stack: "ipv6"}
+	candidate, code, err := buildConfigCandidate(current, ConfigUpdate{Warp: &submitted})
+	if err != nil {
+		t.Fatalf("unexpected rejection (%s): %v", code, err)
+	}
+	if candidate.Warp.Proxy != "socks5://127.0.0.1:7890" {
+		t.Fatalf("warp.proxy was dropped by the console form: %+v", candidate.Warp)
+	}
+	// An omitted warp block keeps the whole current block, proxy included.
+	candidate, code, err = buildConfigCandidate(current, ConfigUpdate{})
+	if err != nil {
+		t.Fatalf("unexpected rejection (%s): %v", code, err)
+	}
+	if candidate.Warp.Proxy != "socks5://127.0.0.1:7890" {
+		t.Fatalf("warp.proxy was dropped with the omitted block: %+v", candidate.Warp)
+	}
+}

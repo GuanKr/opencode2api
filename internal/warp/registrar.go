@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,19 +53,26 @@ type registrar struct {
 	lastReg time.Time
 }
 
-func newRegistrar() *registrar {
+// newRegistrar builds the registration client. A non-empty proxy (host:port
+// of a SOCKS5 server) routes the API calls through it, so the address
+// Cloudflare sees registering the device is the same address that then
+// carries the outer WireGuard handshake; a mismatch between the two is at
+// best an extra handshake retry and at worst a rejected registration.
+func newRegistrar(proxy string) *registrar {
+	transport := &http.Transport{
+		Proxy:               nil,
+		ForceAttemptHTTP2:   false,
+		MaxIdleConns:        4,
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	if proxy != "" {
+		relay := &url.URL{Scheme: "socks5", Host: proxy}
+		transport.Proxy = http.ProxyURL(relay)
+	}
 	return &registrar{
-		base: defaultAPIBase,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				Proxy:               nil,
-				ForceAttemptHTTP2:   false,
-				MaxIdleConns:        4,
-				IdleConnTimeout:     30 * time.Second,
-				TLSHandshakeTimeout: 10 * time.Second,
-			},
-		},
+		base:   defaultAPIBase,
+		client: &http.Client{Timeout: 30 * time.Second, Transport: transport},
 		minGap: registerGap,
 	}
 }

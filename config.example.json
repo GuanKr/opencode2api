@@ -8,7 +8,12 @@
     "enabled": false,
     "pool_size": 2,
     "stack": "ipv6",
-    "source_ipv6": ""
+    "source_ipv6": "",
+    // SOCKS5 relay for the WARP registration API and the outer WireGuard UDP,
+    // e.g. "socks5://127.0.0.1:7890" ("socks5h" also accepted) for a local
+    // Clash mixed port with UDP. No credentials: the relay must be no-auth.
+    // Empty means direct handshakes. Mutually exclusive with source_ipv6.
+    "proxy": ""
   },
   "proxies": ["direct"],
   "proxyfile": "",
