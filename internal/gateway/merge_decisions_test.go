@@ -259,7 +259,11 @@ func mergeDecisionStub(t *testing.T) *Gateway {
 }
 
 // ---------------------------------------------------------------------------
-// D1 + D4 + D5 together — the two-lane dispatch, end to end
+// D1 + D5 together — the two-lane dispatch, end to end
+//
+// D4 (append-only tool shaping) was overturned on 2026-10-25: upstream's
+// clint_ renaming now applies on both lanes, so the lane difference these tests
+// check is the official tool generation, not whether client tools are rewritten.
 // ---------------------------------------------------------------------------
 
 // twoLaneGateway builds a gateway whose anonymous lane has BOTH candidates
@@ -360,40 +364,53 @@ func TestTwoLaneRequestTriesBothAndSucceedsOnInference(t *testing.T) {
 		t.Fatalf("shaped dumps must follow the lane order and name their base, got %v", bases)
 	}
 
-	// D4: each lane got the shaper its own gate needs. The legacy lane wants a
-	// single tool named "read" and ignores schemas, so the client's read_file
-	// is renamed in place and nothing else is appended.
+	// D4 was overturned on 2026-10-25: both lanes now use upstream's shaper, so
+	// each one renames the client tool with the clint_ prefix and appends the
+	// official set of its own generation. What still differs is the generation:
+	// the legacy lane carries the 1.x names (bash, task, todowrite) and the
+	// inference lane the 2.x ones (shell, subagent, patch).
 	legacyBody := shaped[0]
-	if !strings.Contains(legacyBody, `"name":"read"`) || strings.Contains(legacyBody, `"shell"`) {
-		t.Fatalf("the legacy lane must be shaped for the single-read gate, got %s", legacyBody)
+	if !strings.Contains(legacyBody, `"clint_read_file"`) {
+		t.Fatalf("the legacy lane must rename the client tool, got %s", legacyBody)
+	}
+	if !strings.Contains(legacyBody, `"bash"`) || strings.Contains(legacyBody, `"shell"`) {
+		t.Fatalf("the legacy lane must append the captured 1.x set, got %s", legacyBody)
 	}
 	if !strings.Contains(legacyBody, "file_path") {
-		t.Fatalf("the legacy rename must keep the client's own parameters, got %s", legacyBody)
+		t.Fatalf("the rename must keep the client's own parameters, got %s", legacyBody)
 	}
-	// The inference lane needs genuine core definitions, appended — never
-	// substituted over what the client declared.
 	inferenceBody := shaped[1]
-	if !strings.Contains(inferenceBody, `"shell"`) || !strings.Contains(inferenceBody, "[gateway]") {
-		t.Fatalf("the inference lane must append the core toolset and the placeholder note, got %s", inferenceBody)
+	if !strings.Contains(inferenceBody, `"clint_read_file"`) {
+		t.Fatalf("the inference lane must rename the client tool, got %s", inferenceBody)
+	}
+	if !strings.Contains(inferenceBody, `"shell"`) || strings.Contains(inferenceBody, `"bash"`) {
+		t.Fatalf("the inference lane must append the captured 2.x set, got %s", inferenceBody)
 	}
 	if !strings.Contains(inferenceBody, "file_path") {
-		t.Fatalf("the client tool must survive inference shaping, got %s", inferenceBody)
+		t.Fatalf("the rename must keep the client's own parameters, got %s", inferenceBody)
+	}
+	if !strings.Contains(inferenceBody, opencodePromptMarker) {
+		t.Fatalf("the inference lane must carry the official system prompt, got %s", inferenceBody)
 	}
 }
 
-// TestTwoLaneToolAliasResetsWhenTheOtherLaneSucceeds pins that toolAlias is
-// recomputed per attempt. Computed once per request, a response arriving from
-// the other lane would still carry the first lane's alias and the gateway would
-// rewrite a tool call the client never made.
-func TestTwoLaneToolAliasResetsWhenTheOtherLaneSucceeds(t *testing.T) {
+// TestTwoLaneRenameCountReflectsTheWinningAttempt pins that the shape recorded
+// for the response is written per attempt, inside the anonymous loop, from the
+// renames that attempt actually used. The two lanes in this fixture rename the
+// same single client tool, so the count alone cannot tell them apart; what it
+// does prove is that the successful attempt wrote its own shape instead of
+// leaving the metric at zero.
+func TestTwoLaneRenameCountReflectsTheWinningAttempt(t *testing.T) {
 	g, _, legacyHits, inferenceHits := twoLaneGateway(t, []string{config.LaneLegacy, config.LaneInference})
 
-	client := []byte(`{"model":"probe-free","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+	client := []byte(`{"model":"probe-free","stream":false,"messages":[{"role":"user","content":"hi"}],` +
+		`"tools":[{"type":"function","function":{"name":"read_file","description":"client read",` +
+		`"parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]}`)
 	meta := &telemetry.RequestMeta{}
 	ctx := telemetry.WithRequestMeta(context.Background(), meta)
 
 	resp, _, _, err := g.doUpstreamTiers(ctx, chatDumpRoute(),
-		map[config.Tier][]byte{config.TierZen: client}, identity.RequestIDs{Request: "req-alias"}, 0, "")
+		map[config.Tier][]byte{config.TierZen: client}, identity.RequestIDs{Request: "req-rename"}, 0, "")
 	if err != nil {
 		t.Fatalf("the fallback lane should have carried the request: %v", err)
 	}
@@ -403,8 +420,11 @@ func TestTwoLaneToolAliasResetsWhenTheOtherLaneSucceeds(t *testing.T) {
 	if legacyHits.Load() != 1 || inferenceHits.Load() != 1 {
 		t.Fatalf("both lanes must be tried, got legacy=%d inference=%d", legacyHits.Load(), inferenceHits.Load())
 	}
-	if meta.ToolAlias != "" {
-		t.Fatalf("the successful /inference lane renames nothing, so ToolAlias must be empty, got %q", meta.ToolAlias)
+	if meta.ToolRenames != 1 {
+		t.Fatalf("the successful attempt renames one client tool, so ToolRenames must be 1, got %d", meta.ToolRenames)
+	}
+	if got := requestShapeFrom(ctx).renames.Restore("clint_read_file"); got != "read_file" {
+		t.Fatalf("the recorded shape must restore the client's name, got %q", got)
 	}
 }
 

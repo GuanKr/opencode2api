@@ -53,13 +53,10 @@ type RequestMeta struct {
 	// lane. Non-streaming responses for shaped requests arrive as SSE
 	// and must be collapsed like anonymous ones.
 	Shaped bool
-	// ToolAlias holds the client's original read-related tool name (e.g.
-	// "reAd" or "read_file") when the v1 lane's shaper renamed it to "read"
-	// on the outbound wire. When non-empty, "read" tool calls in the
-	// upstream response are rewritten back to ToolAlias before returning.
-	// Telemetry-only: it changes no routing and no wire body on the
-	// /inference lane, where the gate shaper never renames anything.
-	ToolAlias string
+	// ToolRenames counts the client tools the free-tier shaper renamed with
+	// the clint_ prefix. The upstream response is rewritten back to the
+	// client's names before it is returned.
+	ToolRenames int
 	// Prestripped is set by the gateway when the first upstream attempt
 	// goes out pre-stripped (poisoned-history fast path). It lets the
 	// usage page tell a pre-stripped att=1 apart from a clean att=1.

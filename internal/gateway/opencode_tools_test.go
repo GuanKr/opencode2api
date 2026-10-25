@@ -2,9 +2,13 @@ package gateway
 
 import (
 	"encoding/json"
+	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
+
+	wire "opencode2api/internal/protocol"
 )
 
 // internal/gateway/opencode_tools.json carries the one deliberate divergence
@@ -13,19 +17,19 @@ import (
 // Upstream re-synced that file from a Linux client on 2026-10-18 (b0a6584) and
 // merge f017ca2 reverted it. The revert left no diff trace — the merged file is
 // byte-identical to the merge base — so a future "take theirs on conflict" pass
-// would flip it silently, and no existing test would notice: the tool tests
-// compare output against knownOpencodeTool, i.e. against this same file. These
-// cases are the pin. They fail on the next silent flip, and their failure text
-// says why it matters.
+// would flip it silently. These cases are the pin; their failure text says why
+// it matters. (Since the 2026-10-25 merge the shaper appends the official
+// definitions itself instead of comparing them against a client's, but the
+// measured string is the same one the gate let through on 2026-10-15.)
 //
-// Read upstream.go's comment above //go:embed before changing anything here.
+// Read toolshape.go's comment above //go:embed before changing anything here.
 
 const pinnedShellDescriptionFragment = "Commands run on Windows using powershell."
 
 // TestShellDefinitionKeepsTheMeasuredWindowsWording pins the string that was
 // measured passing the free tier's gate on 2026-10-15.
 func TestShellDefinitionKeepsTheMeasuredWindowsWording(t *testing.T) {
-	shell, ok := knownOpencodeTool("shell")
+	shell, ok := officialToolDefinition("shell", false)
 	if !ok {
 		t.Fatal("the shell definition vanished from opencode_tools.json")
 	}
@@ -38,6 +42,21 @@ func TestShellDefinitionKeepsTheMeasuredWindowsWording(t *testing.T) {
 	}
 }
 
+// TestRenderedShellDescriptionCarriesTheWindowsWording: the file is not the last
+// word — v2ShellDescription rewrites the OS phrase at render time — so the pin
+// has to hold on the bytes that actually go out, too.
+func TestRenderedShellDescriptionCarriesTheWindowsWording(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the rewrite only applies on Windows")
+	}
+	entry := officialTool(wire.Chat, "shell", false)
+	function, _ := entry["function"].(map[string]any)
+	description, _ := function["description"].(string)
+	if !strings.Contains(description, pinnedShellDescriptionFragment) {
+		t.Fatalf("the rendered shell definition lost the measured Windows wording; got %q", description)
+	}
+}
+
 // TestOnlyShellCarriesOSSpecificText guards the other half of the decision:
 // the revert was scoped to one tool. If a later sync brings Linux wording in
 // elsewhere — an edit tool mentioning a POSIX path, say — this turns red too.
@@ -45,7 +64,7 @@ func TestOnlyShellCarriesOSSpecificText(t *testing.T) {
 	var definitions map[string]struct {
 		Description string `json:"description"`
 	}
-	if err := json.Unmarshal(opencodeToolsJSON, &definitions); err != nil {
+	if err := json.Unmarshal(opencodeToolsV2JSON, &definitions); err != nil {
 		t.Fatalf("opencode_tools.json is not a JSON object of tool definitions: %v", err)
 	}
 
@@ -72,20 +91,60 @@ func TestOnlyShellCarriesOSSpecificText(t *testing.T) {
 	}
 }
 
-// TestToolDefinitionsStillCoverTheCoreSet is a plain sanity check on the file the
-// shaping rules depend on: the core names must all be present, or ensureAnonymousTools
-// appends nothing and the gate has no genuine definition to judge.
-func TestToolDefinitionsStillCoverTheCoreSet(t *testing.T) {
-	for _, name := range anonymousCoreTools {
-		if _, ok := knownOpencodeTool(name); !ok {
-			t.Errorf("opencode_tools.json has no definition for core tool %q; "+
-				"the gate would receive a stub and reject the request", name)
+// TestOfficialToolOrderMatchesTheCapturedFiles keeps the explicit orders honest.
+// v2OfficialToolOrder exists only because Go maps do not preserve key order, so
+// a name added to the JSON but not to the slice (or vice versa) would silently
+// ship a truncated official set — exactly the failure the gate punishes.
+func TestOfficialToolOrderMatchesTheCapturedFiles(t *testing.T) {
+	loadOfficialTools()
+	for label, pair := range map[string]struct {
+		order []string
+		known map[string]opencodeToolDefinition
+	}{
+		"v2": {v2OfficialToolOrder, opencodeToolsV2},
+		"v1": {opencodeToolsV1Order, opencodeToolsV1},
+	} {
+		if len(pair.order) == 0 {
+			t.Fatalf("%s: no tool order was captured", label)
+		}
+		sortedOrder := append([]string(nil), pair.order...)
+		sort.Strings(sortedOrder)
+		keys := make([]string, 0, len(pair.known))
+		for name := range pair.known {
+			keys = append(keys, name)
+		}
+		sort.Strings(keys)
+		if !reflect.DeepEqual(sortedOrder, keys) {
+			t.Fatalf("%s: the explicit order and the captured definitions disagree:\norder=%v\ndefinitions=%v", label, sortedOrder, keys)
+		}
+		seen := map[string]bool{}
+		for _, name := range pair.order {
+			if seen[name] {
+				t.Fatalf("%s: %q appears twice in the order", label, name)
+			}
+			seen[name] = true
 		}
 	}
-	for _, name := range anonymousGateSaturators {
-		if _, ok := knownOpencodeTool(name); !ok {
-			t.Errorf("opencode_tools.json has no definition for saturator %q; the saturator "+
-				"branch would append an empty schema", name)
+}
+
+// TestBothOfficialSetsCoverTheirRequiredNames is a plain sanity check on the
+// files the shaping rules depend on: without a definition the shaper would
+// append a placeholder schema, and the gate reads schemas.
+func TestBothOfficialSetsCoverTheirRequiredNames(t *testing.T) {
+	for _, name := range []string{"shell", "read", "edit", "glob", "grep", "write"} {
+		if _, ok := officialToolDefinition(name, false); !ok {
+			t.Errorf("opencode_tools.json has no definition for 2.x tool %q", name)
 		}
+	}
+	for _, name := range []string{"bash", "read", "edit", "glob", "grep", "write"} {
+		if _, ok := officialToolDefinition(name, true); !ok {
+			t.Errorf("opencode_tools_v1.json has no definition for 1.x tool %q", name)
+		}
+	}
+	if len(officialToolNames(true)) != 11 {
+		t.Errorf("the captured 1.x set has %d tools, want 11", len(officialToolNames(true)))
+	}
+	if len(officialToolNames(false)) != 13 {
+		t.Errorf("the captured 2.x set has %d tools, want 13", len(officialToolNames(false)))
 	}
 }

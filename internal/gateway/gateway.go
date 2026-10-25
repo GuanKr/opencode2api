@@ -6,7 +6,7 @@
 // origin (models.V1Base, also the default upstream.zen), which
 // models.IsV1Upstream detects. It expects the OpenCode 1.x client shape: the
 // 1.x User-Agent, the x-opencode-request header, a git-commit-shaped project
-// and, on the free tier, the single "read" tool. The v2 lane is the /inference
+// and, on the free tier, the 1.x toolset. The v2 lane is the /inference
 // origin (upstream.anonymous) and the Go plan's /zen/go origin, which expect
 // the OpenCode 2.x CLI shape. The anonymous free tier follows
 // upstream.anonymous_lane_order, which defaults to the v2 /inference origin
@@ -36,6 +36,7 @@ import (
 	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/rotation"
 	"opencode2api/internal/telemetry"
+	"opencode2api/internal/warp"
 )
 
 const maxRequestBody = 32 << 20
@@ -80,13 +81,17 @@ const proxyUnavailableMessage = "opencode2api: **[gateway]** all proxies are una
 // config; applying a new config builds a new Gateway (see RuntimeController)
 // instead of mutating this one.
 type Gateway struct {
-	rotation     *rotation.Manager
-	cfg          config.Config
-	logger       *slog.Logger
-	transports   *proxyTransports
-	zenNodes     *upstreamNodes
-	goNodes      *upstreamNodes
-	anonymous    *anonymousNodes
+	rotation   *rotation.Manager
+	cfg        config.Config
+	logger     *slog.Logger
+	transports *proxyTransports
+	zenNodes   *upstreamNodes
+	goNodes    *upstreamNodes
+	anonymous  *anonymousNodes
+	// warp, when non-nil, is the shared userspace WARP pool. Free-model
+	// traffic on the anonymous lane and the Zen key tier leaves through it
+	// instead of the configured proxies and transports.
+	warp         *warp.Pool
 	catalog      *models.ModelCatalog
 	monitor      *telemetry.Metrics
 	availability *models.AvailabilityRegistry
@@ -115,7 +120,7 @@ type Gateway struct {
 // bound to those transports, the anonymous node pool and a model catalog. Its
 // rotation manager is not persisted; RuntimeController replaces it with the
 // shared one.
-func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics) (*Gateway, error) {
+func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, warpPool *warp.Pool) (*Gateway, error) {
 	cfg.Rotation.Defaults()
 	rotationManager, err := rotation.New("", cfg.Rotation)
 	if err != nil {
@@ -145,6 +150,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics) (*G
 		zenNodes:       zenNodes,
 		goNodes:        goNodes,
 		anonymous:      anonymousPool(cfg.Anonymous, transports, cooldown, anonymousBackoffFromConfig(cfg.Models.AnonymousBackoff)),
+		warp:           warpPool,
 		catalog:        catalog,
 		monitor:        monitor,
 		attemptTimeout: attemptDeadline(cfg),
@@ -242,16 +248,17 @@ func callerScope(ctx context.Context) string {
 type requestShapeContextKey struct{}
 
 type requestShape struct {
-	shaped    bool
-	toolAlias string
+	shaped  bool
+	renames *wire.ToolRenames
 }
 
-func setRequestShape(ctx context.Context, shaped bool, toolAlias string) {
+func setRequestShape(ctx context.Context, shaped bool, renames *wire.ToolRenames) {
 	if state, ok := ctx.Value(requestShapeContextKey{}).(*requestShape); ok {
-		state.shaped, state.toolAlias = shaped, toolAlias
+		state.shaped, state.renames = shaped, renames
 	}
 	if meta := telemetry.MetaFromContext(ctx); meta != nil {
-		meta.Shaped, meta.ToolAlias = shaped, toolAlias
+		meta.Shaped = shaped
+		meta.ToolRenames = renames.Count()
 	}
 }
 
@@ -411,6 +418,14 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				wire.WriteError(w, external, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
 				return
 			}
+			// WARP is enabled but no exit could carry the request, so it never
+			// reached the upstream either. Same reasoning as proxy_error: a 502
+			// would invite a retry into the same broken egress.
+			if errors.Is(err, errWARPUnavailable) {
+				g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+				wire.WriteError(w, external, http.StatusServiceUnavailable, warpUnavailableMessage, "warp_unavailable", ids.Request)
+				return
+			}
 			// Every exit this request could use is under the free tier's IP
 			// block. A 502 would read as a transient upstream fault and invite
 			// the client to retry into the same penalty, so answer with the
@@ -441,7 +456,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			return
 		}
 		shape := requestShapeFrom(r.Context())
-		toolAlias := shape.toolAlias
+		toolRenames := shape.renames
 		if stream {
 			if meta != nil {
 				meta.Stream = true
@@ -454,7 +469,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(resp.StatusCode)
-			streamBody := wire.RenameStreamReader(resp.Body, upstreamRoute.Protocol, v1ReadTool, toolAlias)
+			streamBody := wire.RenameStreamReader(resp.Body, upstreamRoute.Protocol, toolRenames)
 			var usage wire.Usage
 			var usageReported bool
 			if external == upstreamRoute.Protocol {
@@ -501,7 +516,7 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			}
 			responseBody = collapsed
 		}
-		responseBody = wire.RenameResponseTool(responseBody, upstreamRoute.Protocol, v1ReadTool, toolAlias)
+		responseBody = wire.RenameResponseTool(responseBody, upstreamRoute.Protocol, toolRenames)
 		if usage, reported := wire.ResponseUsage(upstreamRoute.Protocol, responseBody); meta != nil {
 			meta.Usage, meta.UsageReported = usage, reported
 		}
@@ -637,6 +652,11 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 		if errors.Is(err, errProxyUnavailable) {
 			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
 			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
+			return
+		}
+		if errors.Is(err, errWARPUnavailable) {
+			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, warpUnavailableMessage, "warp_unavailable", ids.Request)
 			return
 		}
 		// The two lane-level verdicts the inference path already reports. They

@@ -109,10 +109,11 @@ func chatDumpRoute() models.Route {
 }
 
 // The reason this dump exists is diagnosis, and the shaping steps live strictly
-// between the client's body and the wire: stream forcing, the appended core tool
-// definitions and the placeholder note. A log that only carries the client-side
-// body cannot show any of them, so the shaped bytes have to be logged too — and
-// they have to be the bytes that went out, not a reconstruction.
+// between the client's body and the wire: stream forcing, the official system
+// prompt, the clint_ renaming and the appended official tool set. A log that
+// only carries the client-side body cannot show any of them, so the shaped bytes
+// have to be logged too — and they have to be the bytes that went out, not a
+// reconstruction.
 func TestOutboundDumpRecordsTheShapedBytesSentUpstream(t *testing.T) {
 	g, buf, sink := dumpTestGateway(t)
 	client := []byte(`{"model":"probe-free","stream":false,"messages":[{"role":"user","content":"hi"}],` +
@@ -142,18 +143,20 @@ func TestOutboundDumpRecordsTheShapedBytesSentUpstream(t *testing.T) {
 	}
 	// Everything below only exists on the shaped side.
 	sent := shaped["body"].(string)
-	for _, want := range []string{`"stream":true`, "[gateway]", `"shell"`, `"include_usage":true`} {
+	for _, want := range []string{`"stream":true`, opencodePromptMarker, `"clint_read"`, `"shell"`, `"include_usage":true`} {
 		if !strings.Contains(sent, want) {
 			t.Fatalf("shaped dump is missing %s: %s", want, sent)
 		}
 	}
-	if strings.Contains(before["body"].(string), "[gateway]") {
-		t.Fatalf("the client dump already carries the note, so the phases are mislabelled: %s", before["body"])
+	for _, unwanted := range []string{opencodePromptMarker, `"clint_read"`, `"shell"`} {
+		if strings.Contains(before["body"].(string), unwanted) {
+			t.Fatalf("the client dump already carries %s, so the phases are mislabelled: %s", unwanted, before["body"])
+		}
 	}
-	// The client's own tool definition has to survive shaping; the gateway
-	// appends the missing core names instead of rewriting what the client sent.
+	// The client's tool definition keeps everything but its name: the description
+	// and, crucially, its own parameter names drive the client's executor.
 	if !strings.Contains(sent, "client read") || !strings.Contains(sent, "file_path") {
-		t.Fatalf("the client's tool definition was rewritten: %s", sent)
+		t.Fatalf("the client's tool schema was rewritten, not just renamed: %s", sent)
 	}
 }
 
@@ -161,29 +164,28 @@ func TestOutboundDumpRecordsTheShapedBytesSentUpstream(t *testing.T) {
 // nothing, so a shaped record identical to the client record is a real signal
 // and not a sign the dump is stale.
 //
-// The body has to be canonical for that to hold: since the 2.1 client
-// parity work, the v2 chat lane always re-encodes (model-first key order,
-// max_completion_tokens, no HTML escaping), so a payload encoded any other way
-// is reshaped by definition. Feeding it back through the same encoder is what
-// makes "nothing changed" the expected answer.
+// The free-tier lanes cannot demonstrate it any more: since 2026-10-25 the
+// shaper always injects the official prompt and appends the official tool set,
+// and it is not idempotent (a second pass renames the appended official tools
+// as client tools). The lane where "nothing changed" is still the truth is a
+// paid model on a key tier: shapeKeyBody leaves it verbatim, and the dump must
+// say so by logging the same digest twice.
 func TestOutboundDumpShapedMatchesClientWhenShapingIsANoOp(t *testing.T) {
 	g, buf, sink := dumpTestGateway(t)
-	alreadyShaped, err := marshalV2ChatBody(map[string]any{
-		"model":                 "probe-free",
-		"stream":                true,
-		"stream_options":        map[string]any{"include_usage": true},
-		"messages":              []any{map[string]any{"role": "user", "content": "hi"}},
-		"tools":                 v2Toolset(wire.Chat, nil),
-		"max_completion_tokens": v2CompletionLimit,
-	})
+	zen, err := nodePool([]string{"key-1"}, g.transports, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
+	g.zenNodes = zen
+	route := chatDumpRoute()
+	route.ID = "claude-sonnet-4" // not a free model: no shaping at all
+	route.Anonymous = false
+	alreadyShaped := []byte(`{"model":"claude-sonnet-4","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
 
-	resp, _, _, err := g.doUpstreamTiers(context.Background(), chatDumpRoute(),
+	resp, _, _, err := g.doUpstreamTiers(context.Background(), route,
 		map[config.Tier][]byte{config.TierZen: alreadyShaped}, identity.RequestIDs{Request: "req-dump"}, 0, "")
 	if err != nil {
-		t.Fatalf("anonymous attempt: %v", err)
+		t.Fatalf("key tier attempt: %v", err)
 	}
 	if resp != nil {
 		resp.Body.Close()
@@ -195,7 +197,7 @@ func TestOutboundDumpShapedMatchesClientWhenShapingIsANoOp(t *testing.T) {
 		t.Fatalf("want a client and a shaped dump, got %v", dumpPhases(records))
 	}
 	if before["sha256"] != shaped["sha256"] {
-		t.Fatalf("an already agent-shaped body must pass through untouched:\nclient: %s\nshaped: %s",
+		t.Fatalf("a paid key-tier body must pass through untouched:\nclient: %s\nshaped: %s",
 			before["body"], shaped["body"])
 	}
 	if shaped["body"] != string(sink.got()) {
@@ -252,7 +254,7 @@ func TestOutboundDumpRecordsShapedBytesOnTheKeyLane(t *testing.T) {
 	if shaped["body"] != string(sink.got()) {
 		t.Fatalf("shaped dump is not what was sent:\nlogged: %s\nsent:  %s", shaped["body"], string(sink.got()))
 	}
-	if !strings.Contains(shaped["body"].(string), "[gateway]") {
+	if !strings.Contains(shaped["body"].(string), opencodePromptMarker) {
 		t.Fatalf("the key lane did not shape the body, so this case proves nothing: %s", shaped["body"])
 	}
 

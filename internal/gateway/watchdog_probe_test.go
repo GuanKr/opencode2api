@@ -15,6 +15,7 @@ import (
 	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/rotation"
 	"opencode2api/internal/telemetry"
+	"opencode2api/internal/warp"
 )
 
 // The watchdog probe (watchdog.go): the one request that must always reach the
@@ -454,5 +455,28 @@ func TestNextProbeIgnoresGatesAndVisitsEachNodeOnce(t *testing.T) {
 	fresh := pool.CursorFor("")
 	if node := fresh.NextProbe(); node == nil {
 		t.Fatal("a fresh probe cursor must offer a node")
+	}
+}
+
+// TestWatchdogProbeRefusesToMeasureAWARPLane: the probe walks the proxy cursor,
+// which a WARP lane never uses. Answering "no anonymous proxy is configured"
+// would blame the operator's config for a lane that may be serving fine, and
+// switching a Clash node cannot help a lane that does not leave through Clash.
+// The honest answer is config (stop the round) plus a cause that says why.
+func TestWatchdogProbeRefusesToMeasureAWARPLane(t *testing.T) {
+	g := probeGateway(t, "http://127.0.0.1:1")
+	g.warp = &warp.Pool{}
+	rec, out := sendProbe(t, g, `{"model":"probe-free"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a refused probe still answers 200 with a verdict, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if out.Verdict != "config" {
+		t.Fatalf("a WARP lane must report config, got %q (%s)", out.Verdict, out.Cause)
+	}
+	if !strings.Contains(out.Cause, "WARP") {
+		t.Fatalf("the cause must name WARP instead of blaming the proxy config, got %q", out.Cause)
+	}
+	if out.Attempted {
+		t.Fatal("the probe must not claim it transmitted anything")
 	}
 }

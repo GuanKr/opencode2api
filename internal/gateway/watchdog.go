@@ -296,6 +296,18 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 		result.Cause = "anonymous lane is disabled"
 		return result
 	}
+	if g.warp != nil {
+		// The anonymous lane leaves through WARP exits and never touches the
+		// proxy cursor, so this probe has nothing to measure: it would either
+		// report "no anonymous proxy is configured" (a lie about the lane) or
+		// have to write WARP pool state, which this read-only channel must not
+		// do. Switching a Clash node cannot help a WARP lane, so "config" —
+		// stop the round — is the honest answer; /healthz lists
+		// warp_unavailable when the lane is actually broken.
+		result.Verdict = "config"
+		result.Cause = "anonymous lane runs over WARP; the probe measures proxy exits only"
+		return result
+	}
 	// Only models the anonymous lane actually serves are probeable. A paid
 	// model, a disabled one, or an unknown one is gateway-side state: report it
 	// as config instead of spending an attempt that could not be routed.
