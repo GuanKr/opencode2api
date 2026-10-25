@@ -326,9 +326,6 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 				g.logger.Warn("free tier quota refused; rotating the upstream session", "component", "upstream", "event", "session_rotated", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", egress, "generation", generation)
 			}
 			g.logger.Debug("anonymous WARP upstream returned an error response; trying the next upstream or exit", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "status", status, "duration_ms", duration.Milliseconds())
-			if index+1 < len(upstreams) {
-				break
-			}
 		}
 		if halted || ctx.Err() != nil {
 			break
@@ -341,6 +338,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 		}
 	}
 	if halted {
+		g.anonymous.NoteNeutral()
 		return lastResponse, errDeterministicClientRejection, attempts
 	}
 	if lastResponse != nil {

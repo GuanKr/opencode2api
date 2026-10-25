@@ -135,25 +135,21 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 		tunDevice.Close()
 		return nil, err
 	}
-	// A tunnel of one address family cannot handshake with a peer endpoint of
-	// the other one, so the stack decides which endpoints are worth trying.
-	// Without this filter an IPv4 stack still walks the registration's IPv6
-	// endpoints first: each dies with "unreachable network" and costs a full
-	// handshake timeout, so on an IPv4-only host the startup budget is spent
-	// before the IPv4 fallbacks at the end of the list are reached (measured
-	// 2026-10-25: 15s per candidate, three IPv6 candidates, then the 2-minute
-	// context expired without ever dialling 162.159.192.1).
-	endpoints = filterEndpointsByStack(endpoints, stack)
+	// The outer WireGuard family is independent of the tunnel's inner stack: a
+	// stack=ipv6 tunnel still handshakes over IPv4 UDP, which is how an
+	// IPv4-only host keeps working. So nothing is filtered by stack; instead
+	// the family this host can actually route to goes first, and the other one
+	// stays behind it as a fallback. Without the ordering an IPv4-only host
+	// walks the registration's IPv6 endpoints first, each dying with
+	// "unreachable network" after a full handshake timeout, and the startup
+	// budget expires before the IPv4 fallbacks are reached (measured
+	// 2026-10-25: 15s per candidate, three IPv6 candidates, 2-minute deadline).
+	endpoints = orderEndpointsByReachability(endpoints, source.IsValid(),
+		familyReachable("udp4", "1.1.1.1:53"),
+		familyReachable("udp6", "[2606:4700:4700::1111]:53"))
 	if len(endpoints) == 0 {
 		tunDevice.Close()
 		return nil, fmt.Errorf("no WARP endpoint is reachable over the %s stack", stack)
-	}
-	if source.IsValid() {
-		// Try IPv6 endpoints first so the rotating source is used, but keep
-		// the IPv4 ones behind them: a host (or network) that cannot reach
-		// Cloudflare over IPv6 still gets a working tunnel, just with the
-		// shared address the prefix was supposed to avoid.
-		endpoints = preferIPv6Endpoints(endpoints)
 	}
 	wg := device.NewDevice(tunDevice, &simpleBind{source: source}, device.NewLogger(device.LogLevelError, "warp: "))
 	uapi := fmt.Sprintf(
@@ -180,39 +176,18 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 	return e, nil
 }
 
-// preferIPv6Endpoints returns endpoints with the IPv6 ones first and the IPv4
-// ones after them, both in their original order. Nothing is dropped: an IPv4
-// fallback keeps WARP usable on a host that cannot reach Cloudflare over IPv6.
-func preferIPv6Endpoints(endpoints []string) []string {
-	ordered := make([]string, 0, len(endpoints))
+// orderEndpointsByReachability puts the outer family this host can route to
+// first and keeps the other family behind it, so a host whose IPv6 route is
+// missing does not spend a handshake timeout per unreachable candidate before
+// reaching the family that works. Nothing is dropped: the outer WireGuard
+// family is independent of the tunnel's inner stack, and a route that comes
+// back mid-process must still be usable.
+//
+// preferIPv6 is set when an outer IPv6 source prefix is bound; that prefix is
+// only used by IPv6 sockets, so IPv6 must lead even when both families work.
+func orderEndpointsByReachability(endpoints []string, preferIPv6, reachableIPv4, reachableIPv6 bool) []string {
 	ipv4 := make([]string, 0, len(endpoints))
-	for _, endpoint := range endpoints {
-		host, _, err := net.SplitHostPort(endpoint)
-		if err != nil {
-			continue
-		}
-		addr, err := netip.ParseAddr(host)
-		if err != nil || addr.Is4In6() {
-			continue
-		}
-		if addr.Is6() {
-			ordered = append(ordered, endpoint)
-		} else {
-			ipv4 = append(ipv4, endpoint)
-		}
-	}
-	return append(ordered, ipv4...)
-}
-
-// filterEndpointsByStack keeps only the endpoints the tunnel's own stack can
-// handshake with. A dual stack keeps everything: its netstack carries both
-// families and its probe accepts either egress.
-func filterEndpointsByStack(endpoints []string, stack Stack) []string {
-	if stack == StackDual {
-		return endpoints
-	}
-	wantIPv6 := stack == StackIPv6
-	kept := make([]string, 0, len(endpoints))
+	ipv6 := make([]string, 0, len(endpoints))
 	for _, endpoint := range endpoints {
 		host, _, err := net.SplitHostPort(endpoint)
 		if err != nil {
@@ -225,12 +200,35 @@ func filterEndpointsByStack(endpoints []string, stack Stack) []string {
 		if addr.Is4In6() {
 			addr = addr.Unmap()
 		}
-		if addr.Is6() != wantIPv6 {
-			continue
+		if addr.Is6() {
+			ipv6 = append(ipv6, endpoint)
+		} else {
+			ipv4 = append(ipv4, endpoint)
 		}
-		kept = append(kept, endpoint)
 	}
-	return kept
+	switch {
+	case reachableIPv6 && !reachableIPv4:
+		return append(ipv6, ipv4...)
+	case reachableIPv4 && !reachableIPv6:
+		return append(ipv4, ipv6...)
+	case preferIPv6:
+		return append(ipv6, ipv4...)
+	default:
+		return append(ipv4, ipv6...)
+	}
+}
+
+// familyReachable reports whether this host has a route for the outer family.
+// A UDP connect performs the route lookup without sending a packet: a host
+// with no IPv6 route fails immediately, which is exactly the case that used to
+// burn a full handshake timeout per IPv6 candidate.
+func familyReachable(network, address string) bool {
+	conn, err := net.DialTimeout(network, address, 2*time.Second)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func resolveEndpoints(ctx context.Context, candidates []string, fallback string) ([]string, error) {

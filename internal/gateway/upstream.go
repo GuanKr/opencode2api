@@ -508,6 +508,14 @@ func shouldRotateSession(resp *http.Response, err error) bool {
 	return classifyAnonymousVerdict(watchdogCause(resp, nil), false) == "quota"
 }
 
+// shouldRotateSessionFor reports whether this model's session should rotate.
+// Only free models carry a session-scoped allowance; a paid 429 is account
+// level, so rotating there would cost a cold prompt cache and replace the
+// upstream session for no gain.
+func (g *Gateway) shouldRotateSessionFor(model string, resp *http.Response, err error) bool {
+	return g.catalog.IsFreeModel(model) && shouldRotateSession(resp, err)
+}
+
 // anonymousUpstreams returns the ordered base URLs for the keyless free-tier
 // lane, from UpstreamConfig.AnonymousLaneOrder.
 //
@@ -1006,11 +1014,11 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "proxy", proxyLabel, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
 		}
-		if shouldRotateSession(resp, err) {
-			// Same quota contract as the anonymous lane: the free tier scopes
-			// part of its allowance to the session, so a Zen-key attempt on a
-			// free model has to rotate too, or the next key would be refused for
-			// a reason no key change can fix.
+		if g.shouldRotateSessionFor(route.ID, resp, err) {
+			// Same quota contract as the anonymous lane, but only for free
+			// models: their allowance is scoped to the session, so a Zen-key
+			// attempt has to rotate too, or the next key would be refused for a
+			// reason no key change can fix.
 			generation = g.sessions.Rotate(ids.Session)
 			g.logger.Warn("free tier quota refused; rotating the upstream session", "component", "upstream", "event", "session_rotated", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", proxyLabel, "generation", generation)
 		}

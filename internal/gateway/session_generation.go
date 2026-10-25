@@ -11,6 +11,10 @@ import (
 // longer than this starts again from generation 0.
 const sessionGenerationTTL = 2 * time.Hour
 
+// sessionSweepInterval bounds how often an access walks the whole generation
+// map looking for idle entries.
+const sessionSweepInterval = time.Minute
+
 // sessionGenerations remembers how often each client conversation had to rotate
 // its upstream session because the free tier answered a quota 429. The free
 // tier scopes part of its allowance to the session id, so once a conversation
@@ -26,7 +30,13 @@ type sessionGenerations struct {
 	mu  sync.Mutex
 	now func() time.Time
 	ttl time.Duration
-	gen map[string]sessionGenerationEntry
+	// sweepInterval throttles the TTL sweep: Generation runs at least twice per
+	// request, and a full-map walk under the store's single mutex on every call
+	// would serialise every request behind the same lock once a gateway holds
+	// many conversations.
+	sweepInterval time.Duration
+	lastSweep     time.Time
+	gen           map[string]sessionGenerationEntry
 }
 
 type sessionGenerationEntry struct {
@@ -36,9 +46,10 @@ type sessionGenerationEntry struct {
 
 func newSessionGenerations() *sessionGenerations {
 	return &sessionGenerations{
-		now: time.Now,
-		ttl: sessionGenerationTTL,
-		gen: map[string]sessionGenerationEntry{},
+		now:           time.Now,
+		ttl:           sessionGenerationTTL,
+		sweepInterval: sessionSweepInterval,
+		gen:           map[string]sessionGenerationEntry{},
 	}
 }
 
@@ -79,9 +90,14 @@ func (s *sessionGenerations) Rotate(key string) int {
 	return entry.generation
 }
 
-// sweepLocked drops entries idle past the TTL. It runs on access rather than on
-// a ticker: a quiet gateway has nothing to sweep.
+// sweepLocked drops entries idle past the TTL, at most once per sweepInterval.
+// It runs on access rather than on a ticker: a quiet gateway has nothing to
+// sweep, and a busy one does not need a full-map walk per request.
 func (s *sessionGenerations) sweepLocked(now time.Time) {
+	if s.sweepInterval > 0 && now.Sub(s.lastSweep) < s.sweepInterval {
+		return
+	}
+	s.lastSweep = now
 	for key, entry := range s.gen {
 		if now.Sub(entry.seen) > s.ttl {
 			delete(s.gen, key)

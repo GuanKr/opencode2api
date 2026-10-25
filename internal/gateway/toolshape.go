@@ -192,11 +192,16 @@ func renameAndCompleteTools(payload map[string]any, protocol wire.Protocol, v1 b
 		}
 	}
 	if protocol == wire.Chat || protocol == wire.Responses {
-		if legacy, ok := payload["functions"].([]any); ok {
-			// Converted entries keep the client name: the loop below is the one
-			// place that allocates wire names. Renaming here as well produced
-			// clint_clint_<name>, which restored to the wrong tool.
-			items = append(items, convertLegacyFunctions(legacy, protocol)...)
+		if raw, exists := payload["functions"]; exists {
+			if legacy, ok := raw.([]any); ok {
+				// Converted entries keep the client name: the loop below is the
+				// one place that allocates wire names. Renaming here as well
+				// produced clint_clint_<name>, which restored to the wrong tool.
+				items = append(items, convertLegacyFunctions(legacy, protocol)...)
+			}
+			// Removed even when it is not an array: the official client never
+			// sends this legacy field, and leaving a malformed value in the
+			// shaped body only invites an upstream 400.
 			delete(payload, "functions")
 		}
 	}

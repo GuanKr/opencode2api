@@ -145,3 +145,29 @@ func TestBuildConfigCandidateReportsTheFailingSecret(t *testing.T) {
 		t.Fatalf("the rejection must name the field, got %q", code)
 	}
 }
+
+// A PUT that omits warp must keep the switch. config.WarpConfig is a value
+// type, so it cannot tell "absent" from "explicitly off"; without the pointer
+// an older console or a script silently disables WARP on every save.
+func TestBuildConfigCandidateKeepsWarpWhenTheFormOmitsIt(t *testing.T) {
+	current := config.Config{
+		ServerKeys: []string{"local-key"},
+		Warp:       config.WarpConfig{Enabled: true, PoolSize: 3, Stack: "ipv6"},
+	}
+	candidate, code, err := buildConfigCandidate(current, ConfigUpdate{})
+	if err != nil {
+		t.Fatalf("unexpected rejection (%s): %v", code, err)
+	}
+	if !candidate.Warp.Enabled || candidate.Warp.PoolSize != 3 || candidate.Warp.Stack != "ipv6" {
+		t.Fatalf("an omitted warp block must keep the current switch: %+v", candidate.Warp)
+	}
+
+	explicit := config.WarpConfig{Enabled: false}
+	candidate, code, err = buildConfigCandidate(current, ConfigUpdate{Warp: &explicit})
+	if err != nil {
+		t.Fatalf("unexpected rejection (%s): %v", code, err)
+	}
+	if candidate.Warp.Enabled {
+		t.Fatalf("an explicit warp block must win: %+v", candidate.Warp)
+	}
+}

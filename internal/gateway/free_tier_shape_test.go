@@ -413,6 +413,61 @@ func TestFreeTierShapingNotesABodyThatAlreadyCarriesThePrompt(t *testing.T) {
 	}
 }
 
+// TestFreeTierShapingDoesNotDuplicateTheGatewayToolNote: the note has no
+// marker of its own, so without a guard a second shaping pass would stack a
+// second copy (the prompt is protected by opencodePromptMarker, the note was
+// not). Shaping is documented as one-shot, but the guard keeps the blast radius
+// of a future re-shape at "the tools moved" rather than "the note repeats".
+func TestFreeTierShapingDoesNotDuplicateTheGatewayToolNote(t *testing.T) {
+	cases := map[string]struct {
+		protocol wire.Protocol
+		body     string
+	}{
+		"chat": {
+			wire.Chat,
+			`{"model":"m","messages":[{"role":"system","content":"be terse"},{"role":"user","content":"hi"}]}`,
+		},
+		"anthropic": {
+			wire.Anthropic,
+			`{"model":"m","system":"be terse","messages":[]}`,
+		},
+		"responses": {
+			wire.Responses,
+			`{"model":"m","instructions":"be terse","input":[]}`,
+		},
+	}
+	for name, testCase := range cases {
+		first, _ := prepareAnonymousBody([]byte(testCase.body), testCase.protocol, false)
+		second, _ := prepareAnonymousBody(first, testCase.protocol, false)
+		if count := strings.Count(string(second), gatewayToolNote); count != 1 {
+			t.Fatalf("%s: the note appears %d times after two passes, want 1:\n%s", name, count, second)
+		}
+	}
+}
+
+// TestFreeTierShapingFillsAnEmptySystemSlot: an explicitly empty system value is
+// a slot, not a reason to drop the prompt or the note.
+func TestFreeTierShapingFillsAnEmptySystemSlot(t *testing.T) {
+	chat := decodeShaped(t, mustShape(t, []byte(`{"model":"m","messages":[{"role":"system","content":""},`+
+		`{"role":"user","content":"hi"}]}`), wire.Chat, false))
+	messages, _ := chat["messages"].([]any)
+	system, _ := messages[0].(map[string]any)
+	content, _ := system["content"].(string)
+	if !strings.Contains(content, opencodePromptMarker) || !strings.HasSuffix(content, "\n\n"+gatewayToolNote) {
+		t.Fatalf("an empty chat system slot must carry the prompt and the note, got %q", content)
+	}
+
+	anthropic := decodeShaped(t, mustShape(t, []byte(`{"model":"m","system":"","messages":[]}`), wire.Anthropic, false))
+	if system, _ := anthropic["system"].(string); !strings.Contains(system, opencodePromptMarker) || !strings.HasSuffix(system, "\n\n"+gatewayToolNote) {
+		t.Fatalf("an empty anthropic system slot must carry the prompt and the note, got %v", anthropic["system"])
+	}
+
+	responses := decodeShaped(t, mustShape(t, []byte(`{"model":"m","instructions":"","input":[]}`), wire.Responses, false))
+	if instructions, _ := responses["instructions"].(string); !strings.Contains(instructions, opencodePromptMarker) || !strings.HasSuffix(instructions, "\n\n"+gatewayToolNote) {
+		t.Fatalf("empty responses instructions must carry the prompt and the note, got %v", responses["instructions"])
+	}
+}
+
 // TestGatewayToolNoteStaysScopedToTheOfficialSet pins the wording decision: the
 // shaper passes client-declared server tools (Responses web_search, Anthropic
 // server tools) through unrenamed because they have no client name to rewrite,
@@ -633,6 +688,24 @@ func TestFreeTierShapingConvertsLegacyFunctions(t *testing.T) {
 		}
 		if _, ok := jsonutil.MapAt(parameters, "properties")["query"]; !ok {
 			t.Fatalf("%v: the converted tool must keep its parameters, got %v", protocol, parameters)
+		}
+	}
+}
+
+// TestFreeTierShapingDropsMalformedLegacyFunctions: the legacy functions field
+// is converted only when it is an array, but it is removed either way. Leaving
+// a malformed value in the shaped body would send a field the official client
+// never emits and invite an upstream 400.
+func TestFreeTierShapingDropsMalformedLegacyFunctions(t *testing.T) {
+	for _, protocol := range []wire.Protocol{wire.Chat, wire.Responses} {
+		payload := decodeShaped(t, mustShape(t, encodeFixture(t, map[string]any{
+			"model":     "opencode/probe-free",
+			"messages":  []any{map[string]any{"role": "user", "content": "hi"}},
+			"input":     []any{map[string]any{"role": "user", "content": "hi"}},
+			"functions": "not-an-array",
+		}), protocol, false))
+		if _, ok := payload["functions"]; ok {
+			t.Fatalf("%v: a malformed functions field must still be removed, got %v", protocol, payload["functions"])
 		}
 	}
 }

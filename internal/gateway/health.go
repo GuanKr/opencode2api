@@ -114,8 +114,11 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	}
 	// Proxies carry Go-tier traffic whenever Go keys exist, and every lane
 	// while WARP is off; free-model traffic alone does not need them.
-	proxyBlocking := proxyHealthy == 0 && (g.warp == nil || goKeys > 0)
-	if proxyHealthy == 0 {
+	proxyBlocking := proxyBlocksReadiness(g.warp != nil, goKeys, proxyHealthy)
+	// The issue and the readiness flag share one condition. Reporting
+	// no_healthy_proxies while the same document says ready=true would make
+	// status=degraded contradict the only field a consumer should trust.
+	if proxyBlocking {
 		issues = append(issues, "no_healthy_proxies")
 	}
 
@@ -156,6 +159,14 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		Warp:   warpStatus,
 		Issues: issues,
 	})
+}
+
+// proxyBlocksReadiness reports whether an empty proxy pool actually blocks
+// readiness. WARP replaces the proxies for every lane that carries free-model
+// traffic, so a pool with no healthy node only matters while WARP is off (or
+// unconfigured) or when Go-plan keys still need a proxy binding.
+func proxyBlocksReadiness(warpEnabled bool, goKeys, proxyHealthy int) bool {
+	return proxyHealthy == 0 && (!warpEnabled || goKeys > 0)
 }
 
 func (g *Gateway) availableModels() ([]modelcatalog.Route, modelcatalog.CatalogSnapshot) {

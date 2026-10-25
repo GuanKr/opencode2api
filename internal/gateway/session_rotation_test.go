@@ -242,6 +242,40 @@ func TestShouldRotateSessionOnlyOnQuota(t *testing.T) {
 	}
 }
 
+// TestShouldRotateSessionForOnlyFreeModels: a paid 429 is account-level, so a
+// fresh session cannot clear it and rotating would only cost a cold prompt
+// cache. The key lane serves both kinds, hence the model check.
+func TestShouldRotateSessionForOnlyFreeModels(t *testing.T) {
+	g := newStubGateway(t, "http://127.0.0.1:1")
+	quota := func() *http.Response {
+		return upstreamErrorResponse(http.StatusTooManyRequests, `{"error":{"type":"InsufficientQuota","message":"insufficient quota"}}`)
+	}
+	if !g.shouldRotateSessionFor("probe-free", quota(), nil) {
+		t.Fatal("a free model's quota 429 must rotate")
+	}
+	if g.shouldRotateSessionFor("paid-model", quota(), nil) {
+		t.Fatal("a paid model's quota 429 must not rotate")
+	}
+}
+
+// TestShouldRotateSessionKeepsTheBodyIntact: the trigger peeks the error
+// document to read its class; the response the caller may forward has to stay
+// byte-identical.
+func TestShouldRotateSessionKeepsTheBodyIntact(t *testing.T) {
+	const payload = `{"error":{"type":"FreeUsageLimitError","message":"Free usage limit reached"}}`
+	resp := upstreamErrorResponse(http.StatusTooManyRequests, payload)
+	if !shouldRotateSession(resp, nil) {
+		t.Fatal("fixture must classify as quota")
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the restored body failed: %v", err)
+	}
+	if string(body) != payload {
+		t.Fatalf("the peeking trigger changed the body:\n got %q\nwant %q", body, payload)
+	}
+}
+
 // TestSessionGenerationsRotateAndExpire covers the store on its own: rotations
 // accumulate, an idle conversation expires back to 0, and a nil store is inert
 // (so a Gateway built without one cannot panic).
@@ -280,5 +314,32 @@ func TestSessionGenerationsRotateAndExpire(t *testing.T) {
 	}
 	if got := store.Rotate(""); got != 0 {
 		t.Fatalf("an empty key cannot rotate, got %d", got)
+	}
+}
+
+// TestSessionGenerationsSweepIsThrottled: the sweep is O(active conversations)
+// under the store's single mutex, and Generation runs at least twice per
+// request, so it must not walk the map on every call.
+func TestSessionGenerationsSweepIsThrottled(t *testing.T) {
+	store := newSessionGenerations()
+	now := time.Unix(1_700_000_000, 0)
+	store.now = func() time.Time { return now }
+
+	store.Generation("first")
+	firstSweep := store.lastSweep
+	if firstSweep.IsZero() {
+		t.Fatal("the first access must sweep")
+	}
+
+	now = now.Add(time.Second)
+	store.Generation("second")
+	if !store.lastSweep.Equal(firstSweep) {
+		t.Fatalf("the sweep ran again inside the interval: %v -> %v", firstSweep, store.lastSweep)
+	}
+
+	now = now.Add(2 * time.Minute)
+	store.Generation("third")
+	if !store.lastSweep.Equal(now) {
+		t.Fatalf("the sweep did not run after the interval: %v", store.lastSweep)
 	}
 }

@@ -277,6 +277,11 @@ func appendChatToolNote(payload map[string]any) bool {
 		if role != "system" && role != "developer" {
 			continue
 		}
+		if carriesGatewayToolNote(message["content"]) {
+			// Shaping ran before on this body (the caller is supposed to shape
+			// once, but a re-used payload must not stack a second note).
+			return false
+		}
 		switch content := message["content"].(type) {
 		case string:
 			if strings.TrimSpace(content) == "" {
@@ -297,6 +302,9 @@ func appendChatToolNote(payload map[string]any) bool {
 // appendAnthropicToolNote appends the note after the top-level system value,
 // keeping a caller's string or block list intact ahead of it.
 func appendAnthropicToolNote(payload map[string]any) bool {
+	if carriesGatewayToolNote(payload["system"]) {
+		return false
+	}
 	switch system := payload["system"].(type) {
 	case nil:
 		payload["system"] = gatewayToolNote
@@ -316,6 +324,9 @@ func appendAnthropicToolNote(payload map[string]any) bool {
 
 // appendResponsesToolNote appends the note after the Responses instructions.
 func appendResponsesToolNote(payload map[string]any) bool {
+	if carriesGatewayToolNote(payload["instructions"]) {
+		return false
+	}
 	switch instructions := payload["instructions"].(type) {
 	case nil:
 		payload["instructions"] = gatewayToolNote
@@ -329,6 +340,16 @@ func appendResponsesToolNote(payload map[string]any) bool {
 		return false
 	}
 	return true
+}
+
+// carriesGatewayToolNote reports whether a system slot already carries the note.
+func carriesGatewayToolNote(value any) bool {
+	for _, part := range textFragments(value) {
+		if strings.Contains(part, gatewayToolNote) {
+			return true
+		}
+	}
+	return false
 }
 
 // textFragments flattens a system or instruction value into its text: a plain

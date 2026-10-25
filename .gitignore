@@ -32,6 +32,10 @@ opencode2api.exe*
 .usage-history-*.tmp
 watchdog.json
 .playwright-mcp/
+# .workbuddy/ holds local session notes and ad-hoc node/proxy test dumps. Its
+# memory files name live nodes and credentials-adjacent details, so it stays
+# out of the repository entirely.
+.workbuddy/
 
 # merge-analysis/ is the scratch workspace for one upstream update: merge plans,
 # conflict evidence, per-report drafts and the raw command transcripts under it.
