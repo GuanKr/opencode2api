@@ -135,6 +135,19 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 		tunDevice.Close()
 		return nil, err
 	}
+	// A tunnel of one address family cannot handshake with a peer endpoint of
+	// the other one, so the stack decides which endpoints are worth trying.
+	// Without this filter an IPv4 stack still walks the registration's IPv6
+	// endpoints first: each dies with "unreachable network" and costs a full
+	// handshake timeout, so on an IPv4-only host the startup budget is spent
+	// before the IPv4 fallbacks at the end of the list are reached (measured
+	// 2026-10-25: 15s per candidate, three IPv6 candidates, then the 2-minute
+	// context expired without ever dialling 162.159.192.1).
+	endpoints = filterEndpointsByStack(endpoints, stack)
+	if len(endpoints) == 0 {
+		tunDevice.Close()
+		return nil, fmt.Errorf("no WARP endpoint is reachable over the %s stack", stack)
+	}
 	if source.IsValid() {
 		// Try IPv6 endpoints first so the rotating source is used, but keep
 		// the IPv4 ones behind them: a host (or network) that cannot reach
@@ -189,6 +202,35 @@ func preferIPv6Endpoints(endpoints []string) []string {
 		}
 	}
 	return append(ordered, ipv4...)
+}
+
+// filterEndpointsByStack keeps only the endpoints the tunnel's own stack can
+// handshake with. A dual stack keeps everything: its netstack carries both
+// families and its probe accepts either egress.
+func filterEndpointsByStack(endpoints []string, stack Stack) []string {
+	if stack == StackDual {
+		return endpoints
+	}
+	wantIPv6 := stack == StackIPv6
+	kept := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		host, _, err := net.SplitHostPort(endpoint)
+		if err != nil {
+			continue
+		}
+		addr, err := netip.ParseAddr(host)
+		if err != nil {
+			continue
+		}
+		if addr.Is4In6() {
+			addr = addr.Unmap()
+		}
+		if addr.Is6() != wantIPv6 {
+			continue
+		}
+		kept = append(kept, endpoint)
+	}
+	return kept
 }
 
 func resolveEndpoints(ctx context.Context, candidates []string, fallback string) ([]string, error) {
