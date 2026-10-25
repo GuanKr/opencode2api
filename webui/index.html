@@ -1170,6 +1170,13 @@
                         仅在使用 IPv6 网络栈时生效。每个 WARP 出口从该前缀取一个源地址出网，换出口即换公网地址；留空则共用本机默认源地址。
                       </p>
                     </div>
+                    <div class="field full">
+                      <label for="c-warp-proxy" data-i18n="config.warp.proxy">外层 SOCKS5 代理</label>
+                      <input id="c-warp-proxy" placeholder="socks5://127.0.0.1:7890" />
+                      <p class="section-caption" data-i18n="config.warp.proxy.hint">
+                        WARP 注册与外层握手经此 SOCKS5 中继转发（例如开了 UDP 的本地 Clash mixed 口），用于直连不稳定的网络；仅 socks5/socks5h、免认证，与源前缀互斥。留空 = 直连；提交空值会保留当前配置，清空请编辑 config.json。
+                      </p>
+                    </div>
                   </div>
                 </section>
               </div>

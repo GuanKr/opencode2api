@@ -356,6 +356,9 @@ const DICTIONARY = {
       "config.warp.source": "Outer IPv6 source prefix (/64)",
       "config.warp.source.hint":
         "Used only with the IPv6 network stack. Every WARP exit binds one source address from this prefix, so replacing an exit also replaces its public egress; leave empty to share this host's default source address.",
+      "config.warp.proxy": "Outer SOCKS5 proxy",
+      "config.warp.proxy.hint":
+        "The WARP registration and outer handshake leave through this SOCKS5 relay (e.g. a local Clash mixed port with UDP), for networks where direct UDP is unreliable; socks5/socks5h only, no credentials, mutually exclusive with the source prefix. Empty means direct; an empty submit keeps the current value — clear it in config.json.",
       "config.upstream.title": "Upstream and protocol routing",
       "config.upstream.caption":
         "anonymous will use every available proxy; an explicit protocol mapping wins over inferring the protocol from the model name.",
@@ -999,6 +1002,9 @@ const DICTIONARY = {
       "config.warp.source": "Tiền tố nguồn IPv6 bên ngoài (/64)",
       "config.warp.source.hint":
         "Chỉ dùng với ngăn xếp mạng IPv6. Mỗi đầu ra WARP gắn một địa chỉ nguồn trong tiền tố này, nên khi thay đầu ra là thay luôn địa chỉ công cộng; để trống sẽ dùng địa chỉ nguồn mặc định của máy chủ.",
+      "config.warp.proxy": "Proxy SOCKS5 bên ngoài",
+      "config.warp.proxy.hint":
+        "Phần đăng ký và bắt tay WARP đi qua relay SOCKS5 này (ví dụ cổng mixed cục bộ của Clash có bật UDP), cho mạng mà UDP trực tiếp không ổn định; chỉ socks5/socks5h, không dùng thông tin đăng nhập, loại trừ lẫn nhau với tiền tố nguồn. Để trống là đi trực tiếp; gửi giá trị rỗng sẽ giữ nguyên cấu hình hiện tại — muốn xoá thì sửa config.json.",
       "config.upstream.title": "Upstream và định tuyến giao thức",
       "config.upstream.caption":
         "anonymous sẽ dùng hết các Proxy khả dụng; ánh xạ protocol tường minh được ưu tiên hơn việc suy luận từ tên mô hình.",
@@ -1569,6 +1575,9 @@ const DICTIONARY = {
       "config.warp.source": "Prefisso sorgente IPv6 esterno (/64)",
       "config.warp.source.hint":
         "Usato solo con lo stack IPv6. Ogni uscita WARP associa un indirizzo sorgente da questo prefisso, quindi sostituire un'uscita sostituisce anche l'indirizzo pubblico; lascia vuoto per usare l'indirizzo sorgente predefinito dell'host.",
+      "config.warp.proxy": "Proxy SOCKS5 esterno",
+      "config.warp.proxy.hint":
+        "La registrazione e l'handshake WARP passano da questo relay SOCKS5 (es. una porta mixed locale di Clash con UDP), per reti in cui l'UDP diretto è inaffidabile; solo socks5/socks5h, senza credenziali, mutuamente esclusivo con il prefisso sorgente. Vuoto significa diretto; un invio vuoto mantiene il valore attuale — per cancellarlo modifica config.json.",
       "config.upstream.title": "Upstream e instradamento protocolli",
       "config.upstream.caption":
         "anonymous userà ogni proxy disponibile; una mappatura esplicita di protocollo prevale sull'inferenza del protocollo dal nome del modello.",
