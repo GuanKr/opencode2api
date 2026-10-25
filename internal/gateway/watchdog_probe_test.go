@@ -385,6 +385,44 @@ func TestWatchdogProbeVerdictVocabulary(t *testing.T) {
 	}
 }
 
+// TestWatchdogProbeReportsAbuseBlocksAsQuota pins the one 403 the generic peek
+// cannot name: the free tier's IP abuse block. Its document carries no
+// error.type and no gate text (see peekNetworkAbuseBlock), so before the
+// explicit check it fell to probeFallbackVerdict and read fingerprint — the
+// verdict that means "no node switch can fix this", the opposite of the truth
+// for a per-IP block. The status feed has reported the block as quota
+// (NetworkAbuseBlock) ever since blocked exits surfaced there; the probe must
+// agree, because the script records its quota answers in QuotaFailedAt while
+// fingerprint is only logged. Recognition stays classification-only: the probe
+// is read-only and must not bench the exit (markBlocked lives on the production
+// path, see doAnonymousUpstream).
+func TestWatchdogProbeReportsAbuseBlocksAsQuota(t *testing.T) {
+	url, hits := stubUpstream(t, http.StatusForbidden,
+		`{"error":{"message":"Free models aren't available from your current network because we've detected abusive traffic from this IP address."}}`)
+	g := probeGateway(t, url)
+	node := g.anonymous.nodes[0]
+
+	rec, out := sendProbe(t, g, `{"model":"probe-free"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("probe must answer 200 with its verdict, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !out.Attempted || out.Status != http.StatusForbidden {
+		t.Fatalf("probe must report the upstream 403, got %+v", out)
+	}
+	if out.Verdict != "quota" {
+		t.Fatalf("an IP abuse block is fixed by a new exit, so verdict = quota, got %q (cause=%q)", out.Verdict, out.Cause)
+	}
+	if !strings.Contains(out.Cause, freeTierAbuseClass) {
+		t.Fatalf("the cause must publish the class the status feed also uses, got %q", out.Cause)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("probe must reach the upstream exactly once, hits=%d", got)
+	}
+	if node.proxy.blockedUntil.Load() != 0 {
+		t.Fatal("the probe classifies the block but must not bench the exit — only production traffic marks it")
+	}
+}
+
 // TestWatchdogProbeReportsTransportFailure covers the case that used to arrive
 // as an unattributable 502: the dial itself fails. Pointing the lane at a closed
 // loopback port keeps it offline while producing a real connection error.

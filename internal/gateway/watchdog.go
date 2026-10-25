@@ -97,11 +97,13 @@ func (g *Gateway) handleWatchdogStatus(w http.ResponseWriter, _ *http.Request) {
 	resp.Proxies.Unhealthy = proxyTotal - proxyHealthy
 	resp.Proxies.AllDown = proxyTotal > 0 && proxyHealthy == 0
 	resp.Anonymous.Enabled = g.cfg.Anonymous
-	// Single snapshot: seconds and cause must belong to the same cooldown.
+	// Single snapshot: seconds and cause must belong to the same cooldown. An
+	// expired snapshot never carries a cause (maxCooldownSnapshot only pairs one
+	// with a positive remain), so the else branch always starts from cause "".
 	remain, cause := g.anonymous.maxCooldownSnapshot()
 	if remain > 0 {
 		resp.Anonymous.CoolingSeconds = int64(math.Ceil(remain.Seconds()))
-	} else if cause == "" {
+	} else {
 		// No active cooldown. A stale transport cause inside its TTL keeps
 		// voting transport (cooling 0): expiry without any new success is
 		// "no evidence", never "recovered". Non-transport causes are
@@ -124,7 +126,7 @@ func (g *Gateway) handleWatchdogStatus(w http.ResponseWriter, _ *http.Request) {
 		replaced := false
 		switch {
 		case resp.Anonymous.BlockedExits > 0 && g.anonymous.blockedExits(now):
-			cause = "NetworkAbuseBlock (free tier IP block)"
+			cause = freeTierAbuseClass + " (free tier IP block)"
 			replaced = true
 		case resp.Anonymous.PausedSeconds > 0:
 			cause = "anonymous lane paused (circuit breaker)"
@@ -419,12 +421,25 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 		result.Verdict = "ok"
 		return result
 	}
-	// Same peeking path an ordinary failure takes, guards included: the
-	// isEventStream and known-length bounds are exactly what keep a non-2xx event
-	// stream or a multi-megabyte WAF page from being read to the bound.
-	// upstreamErrorType puts the bytes back into resp.Body, so the drain below is
-	// what actually closes the connection.
-	result.Cause = watchdogCauseLabel(upstreamErrorType(resp), result.Status, nil)
+	// The free tier's IP abuse block is the one 403 whose document carries no
+	// error class and no gate text, so the generic peek below cannot name it and
+	// the classless fallback would read fingerprint — a verdict whose meaning is
+	// "no node switch can fix this", the opposite of the truth for a per-IP
+	// block. Match the same text production traffic matches
+	// (peekNetworkAbuseBlock) and publish the same synthesized class the status
+	// feed uses, so the two channels agree on quota. Classification only: the
+	// probe still writes no pool state, so it must not bench the exit
+	// (markBlocked stays on the production path, see doAnonymousUpstream).
+	if peekNetworkAbuseBlock(resp) {
+		result.Cause = watchdogCauseLabel(freeTierAbuseClass, result.Status, nil)
+	} else {
+		// Same peeking path an ordinary failure takes, guards included: the
+		// isEventStream and known-length bounds are exactly what keep a non-2xx event
+		// stream or a multi-megabyte WAF page from being read to the bound.
+		// upstreamErrorType puts the bytes back into resp.Body, so the drain below is
+		// what actually closes the connection.
+		result.Cause = watchdogCauseLabel(upstreamErrorType(resp), result.Status, nil)
+	}
 	httpx.DrainAndClose(resp.Body)
 	result.Verdict = classifyAnonymousVerdict(result.Cause, false)
 	if result.Verdict == "ok" {
@@ -446,15 +461,20 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 //   - 403 is fingerprint, not config. The gateway never authors a 403 (its own
 //     rejections are 401/400/429/503-ModelUnavailable/499/502/504), so a 403 seen
 //     by a probe came from the upstream: an edge/WAF challenge page on that exit
-//     IP (what is left for this row now), or the free tier's gate rejection.
+//     IP (what is left for this row), the free tier's gate rejection, or its IP
+//     abuse block.
 //     Legacy mapped the status to config, which made Invoke-Failover break out of
 //     the candidate loop, roll back to the original node and sleep — one
 //     challenged exit IP could void a whole round.
 //     A gate 403 no longer reaches this row: since 2026-10-17 the gate's message
 //     text is recognized as the FreeTierError class, so such a cause classifies
-//     as quota and this fallback is only the last resort for a body carrying no
-//     class at all. The two differ on purpose — "switch and keep switching" for
-//     the gate, "log and try the next candidate" for a challenge page.
+//     as quota. An abuse-block 403 left it the same way (2026-10-25):
+//     runWatchdogProbe matches the block's wording before this fallback
+//     (peekNetworkAbuseBlock) and publishes freeTierAbuseClass, which also reads
+//     as quota — the same verdict the status feed gives the block. This fallback
+//     is again only the last resort for a body carrying no class at all. The two
+//     differ on purpose — "switch and keep switching" for the gate and the
+//     abuse block, "log and try the next candidate" for a challenge page.
 //   - where a status and a class disagree (400/403 carrying a quota class), the
 //     class wins here and the status won in legacy: the probe reports quota and
 //     keeps switching, where legacy stopped the round. That is the point of the
@@ -850,6 +870,15 @@ func peekCauseGateType(value map[string]any, gateFallback bool) string {
 // message to go on. Spelled once so the two paths cannot drift into two labels
 // for one upstream error.
 const freeTierErrorClass = "FreeTierError"
+
+// freeTierAbuseClass is the class this gateway publishes for the free tier's
+// IP abuse block (see peekNetworkAbuseBlock in abuse.go): that document names
+// neither an error.type nor the gate text, so every channel that reports it
+// has to synthesize a name — the status feed's lane-level replacement and the
+// probe's response classification both publish this one. Spelled once for the
+// same reason as freeTierErrorClass: two labels for one upstream verdict is
+// how the two watchdog channels drift apart.
+const freeTierAbuseClass = "NetworkAbuseBlock"
 
 // freeTierGateText reports whether an upstream error message is the free tier's
 // gate rejection. Two spellings cover the observed variants, both matched
