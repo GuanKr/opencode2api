@@ -2,11 +2,14 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,17 +57,23 @@ func (g *Gateway) resolvedEffort(model string, tier config.Tier, protocol wire.P
 // probePayload builds the probe body for model: a System One arithmetic
 // question, or a minimal streaming "Reply with OK." Chat prompt converted to
 // protocol, with effort forced when non-empty and the result shaped for the
-// free tier by prepareAnonymousBody. v1 reports whether the probe targets the
-// v1 lane (models.IsV1Upstream), which selects the 1.x toolset instead of the
-// 2.x one.
-func probePayload(model string, protocol wire.Protocol, effort string, v1 bool) ([]byte, error) {
+// free tier by prepareAnonymousBody. nonce, when set, is appended to the user
+// turn so two probes never send a byte-identical body; both the watchdog and
+// the availability probe pass a fresh one per request. v1 reports whether the
+// probe targets the v1 lane (models.IsV1Upstream), which selects the 1.x toolset
+// instead of the 2.x one.
+func probePayload(model string, protocol wire.Protocol, effort string, v1 bool, nonce string) ([]byte, error) {
 	if protocol == wire.SystemOne {
 		// TypeSafe's native boolean type is "noul", not JSON Schema boolean.
 		return json.Marshal(map[string]any{"model": model, "state": "1 + 1 = 2", "questions": map[string]any{
 			"arithmetic": map[string]any{"type": "noul", "instructions": "Is 1 + 1 equal to 2?"},
 		}})
 	}
-	payload := map[string]any{"model": model, "stream": true, "max_tokens": 64, "messages": []any{map[string]any{"role": "user", "content": "Reply with OK."}}}
+	content := "Reply with OK."
+	if nonce != "" {
+		content = "Reply with OK. Repeat this number: " + nonce + "."
+	}
+	payload := map[string]any{"model": model, "stream": true, "max_tokens": 64, "messages": []any{map[string]any{"role": "user", "content": content}}}
 	converted, err := wire.ConvertRequest(wire.Chat, protocol, payload)
 	if err != nil {
 		return nil, err
@@ -78,6 +87,35 @@ func probePayload(model string, protocol wire.Protocol, effort string, v1 bool) 
 	}
 	shaped, _ := prepareAnonymousBody(b, protocol, v1)
 	return shaped, nil
+}
+
+// probeNonce returns a random decimal token for one synthetic probe request.
+// Every probe uses it twice: in the user turn, so two probes are never
+// byte-identical, and in the session signal, so a probe never reuses a session
+// id. crypto/rand is the same source identity.RandomID draws from, and a
+// failure there is unrecoverable in the same way (identity.RandomID panics too).
+func probeNonce() string {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		panic("crypto/rand failed: " + err.Error())
+	}
+	return strconv.FormatUint(binary.BigEndian.Uint64(buf[:])%1_000_000_000_000, 10)
+}
+
+// probeSession mints the session id for one probe request from stem: the
+// official ses_ shape CanonicalSessionID produces, plus a fresh nonce so no two
+// probe requests share one. The nonce is returned as well because callers put
+// it in the user turn too.
+//
+// A distinct id per request is not cosmetic. The free tier scopes part of its
+// allowance to the session id: reusing an id that has been exhausted makes
+// healthy exits answer 429, and carrying that id to a fresh exit zeroes the new
+// exit's allowance as well. The id also steers exit/key selection (CursorFor
+// pins a non-empty affinity to one node), so a stable id would let one broken
+// exit or key own every probe for a model.
+func probeSession(stem string) (string, string) {
+	nonce := probeNonce()
+	return identity.CanonicalSessionID(stem + ":" + nonce), nonce
 }
 
 // probeFreeModel checks whether a free model currently answers on the Zen
@@ -97,7 +135,13 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	if !d.AvailableZen || !g.catalog.Supported(model) {
 		return probeResult{reason: "unsupported_probe"}
 	}
-	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("availability:" + model), Project: "opencode2api:default-project"}
+	sessionStem := "availability:" + model
+	// Each attempt inside this check mints its own session id (see
+	// probeAttempt/probeSession): a reused, exhausted id would make every later
+	// check answer quota on healthy lanes, and a stable id also pinned the probe
+	// to one exit forever because CursorFor keeps a non-empty affinity on one
+	// node. The affinity below only picks the starting exit/key of this check.
+	affinity, _ := probeSession(sessionStem)
 	type lane struct {
 		key, name, baseURL string
 		client             *http.Client
@@ -116,7 +160,7 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 					lanes = append(lanes, lane{key: anonymousZenKey, name: "anonymous", baseURL: baseURL, warp: true})
 				}
 			} else {
-				cursor := g.anonymous.CursorFor(ids.Session)
+				cursor := g.anonymous.CursorFor(affinity)
 				if node := cursor.Next(); node != nil {
 					// Try the lanes in the configured order (merge decision D1),
 					// which defaults to /inference alone. The order picks the
@@ -139,7 +183,7 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 			anonymousPaused = true
 		}
 	}
-	cursor := g.zenNodes.CursorFor(ids.Session)
+	cursor := g.zenNodes.CursorFor(affinity)
 	if node := cursor.Next(); node != nil {
 		if g.usesWARP(model, config.TierZen, false) {
 			lanes = append(lanes, lane{key: node.key, name: "zen", baseURL: g.cfg.Upstream.Zen, warp: true})
@@ -157,7 +201,7 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 			return probeResult{reason: "canceled"}
 		}
 		run := func(effort string) probeResult {
-			return g.probeAttempt(ctx, lane.client, lane.baseURL, lane.key, model, protocol, ids, effort, lane.warp)
+			return g.probeAttempt(ctx, lane.client, lane.baseURL, lane.key, model, sessionStem, protocol, effort, lane.warp)
 		}
 		result = run("")
 		result.channel = lane.name
@@ -208,21 +252,24 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 
 // probeAttempt sends one probe request through client with a 60-second budget
 // and classifies the result. Unlike live traffic it bypasses
-// doInferenceAttempt and records nothing against keys or proxies. When overWARP
-// is set the probe leaves through an acquired WARP exit instead of client, and
-// the pool sees the outcome (Report on a response, Fail on a transport error).
-// Success requires a 2xx whose SSE stream collapses cleanly or whose JSON
-// document has the protocol's result field; a failure carries a reason code
-// (http_<status>, model_unavailable, probe_timeout, warp_unavailable, ...) and
-// whether the upstream rejected the reasoning effort.
-func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, baseURL, key, model string, protocol wire.Protocol, ids identity.RequestIDs, effort string, overWARP bool) probeResult {
-	b, err := probePayload(model, protocol, effort, models.IsV1Upstream(baseURL))
+// doInferenceAttempt and records nothing against keys or proxies. It mints its
+// own session id and prompt nonce from sessionStem (see probeSession), so two
+// attempts never share a session id even inside one availability check. When
+// overWARP is set the probe leaves through an acquired WARP exit instead of
+// client, and the pool sees the outcome (Report on a response, Fail on a
+// transport error). Success requires a 2xx whose SSE stream collapses cleanly
+// or whose JSON document has the protocol's result field; a failure carries a
+// reason code (http_<status>, model_unavailable, probe_timeout,
+// warp_unavailable, ...) and whether the upstream rejected the reasoning effort.
+func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, baseURL, key, model, sessionStem string, protocol wire.Protocol, effort string, overWARP bool) probeResult {
+	session, nonce := probeSession(sessionStem)
+	ids := identity.RequestIDs{Session: session, Project: "opencode2api:default-project", Request: identity.RandomID("req", 16)}
+	b, err := probePayload(model, protocol, effort, models.IsV1Upstream(baseURL), nonce)
 	if err != nil {
 		return probeResult{reason: "request_conversion_error"}
 	}
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
-	ids.Request = identity.RandomID("req", 16)
 	req, err := upstreamRequest(ctx, baseURL, protocol, b, ids, key)
 	if err != nil {
 		return probeResult{reason: "request_creation_error"}

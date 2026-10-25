@@ -3,10 +3,13 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,6 +146,90 @@ func TestWatchdogProbeReachesUpstreamThroughClosedGates(t *testing.T) {
 	}
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("probe must reach the upstream exactly once, hits=%d — the forced path is not wired", got)
+	}
+}
+
+// TestWatchdogProbeSendsAFreshSessionAndPromptEveryTime pins the two freshness
+// guarantees the probe needs. The free tier scopes part of its allowance to the
+// session id, and carrying an exhausted id to a fresh exit burns that exit too,
+// so a probe that reused one id would keep answering quota on healthy nodes
+// after a single exhaustion. A byte-identical body has the same smell: it makes
+// every probe the same request. Reverting the random session signal, the nonce,
+// or the official-prompt injection turns this red.
+func TestWatchdogProbeSendsAFreshSessionAndPromptEveryTime(t *testing.T) {
+	type captured struct {
+		session, child, body string
+	}
+	var mu sync.Mutex
+	var seen []captured
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		seen = append(seen, captured{
+			session: r.Header.Get("x-opencode-session"),
+			child:   r.Header.Get("x-opencode-session-id"),
+			body:    string(body),
+		})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","choices":[]}`))
+	}))
+	t.Cleanup(server.Close)
+	g := probeGateway(t, server.URL)
+
+	for i := 0; i < 2; i++ {
+		if _, out := sendProbe(t, g, `{"model":"probe-free"}`); out.Verdict != "ok" {
+			t.Fatalf("probe %d must succeed, got %+v", i, out)
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("two probes must reach the upstream twice, got %d", len(seen))
+	}
+
+	number := regexp.MustCompile(`Repeat this number: (\d+)`)
+	for i, got := range seen {
+		if !strings.HasPrefix(got.session, "ses_") || len(got.session) != 30 {
+			t.Fatalf("probe %d sent a non-canonical session id %q", i, got.session)
+		}
+		if got.child != got.session {
+			t.Fatalf("probe %d child session %q must follow the top-level session %q", i, got.child, got.session)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(got.body), &payload); err != nil {
+			t.Fatalf("probe %d body is not JSON: %v", i, err)
+		}
+		system, user := "", ""
+		messages, _ := payload["messages"].([]any)
+		for _, raw := range messages {
+			message, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch message["role"] {
+			case "system":
+				value, _ := message["content"].(string)
+				system += value
+			case "user":
+				user, _ = message["content"].(string)
+			}
+		}
+		if !strings.Contains(system, opencodePromptMarker) {
+			t.Fatalf("probe %d body must carry the official CLI prompt, system=%q", i, system)
+		}
+		if !strings.Contains(user, "Reply with OK.") || !number.MatchString(user) {
+			t.Fatalf("probe %d user turn lost the baseline prompt or the nonce: %q", i, user)
+		}
+	}
+
+	if seen[0].session == seen[1].session {
+		t.Fatalf("both probes reused the session id %q; an exhausted id would poison every later exit", seen[0].session)
+	}
+	if seen[0].body == seen[1].body {
+		t.Fatalf("both probes sent a byte-identical body; the nonce is not in the request")
+	}
+	first, second := number.FindStringSubmatch(seen[0].body), number.FindStringSubmatch(seen[1].body)
+	if first == nil || second == nil || first[1] == second[1] {
+		t.Fatalf("the prompt nonce must change per probe, got %v and %v", first, second)
 	}
 }
 

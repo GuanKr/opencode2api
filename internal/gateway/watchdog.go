@@ -337,12 +337,13 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 	baseURL := upstreams[0]
 	legacy := models.IsV1Upstream(baseURL)
 	// probePayload routes the body through prepareAnonymousBody, so the probe
-	// carries the forced stream:true and the genuine core tool definitions —
-	// the same agent shape real anonymous traffic sends, which is what the free
-	// tier's gate judges. The lane decides which shaper and therefore which
-	// tools: legacy only needs a single "read", /inference needs genuine core
-	// definitions.
-	payload, err := probePayload(model, protocol, "", legacy)
+	// carries the forced stream:true, the official CLI system prompt and the
+	// full official tool set of the lane — the same agent shape real anonymous
+	// traffic sends, which is what the free tier's gate judges. The session id
+	// and the nonce in the user turn both come from probeSession, so two probes
+	// never reuse a session id and never send a byte-identical body.
+	session, nonce := probeSession("watchdog:" + model)
+	payload, err := probePayload(model, protocol, "", legacy, nonce)
 	if err != nil {
 		result.Verdict = "config"
 		result.Cause = "probe request could not be built"
@@ -363,8 +364,13 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 		return result
 	}
 	proxyName = config.RedactURL(node.proxy.name)
+	// Every probe must mint its own session id (see probeSession): the free tier
+	// scopes part of its allowance to the session id, and carrying an exhausted
+	// id to a fresh exit burns that exit's allowance too. Reusing one id would
+	// make every later probe answer quota on a perfectly healthy node and send
+	// the watchdog switching in a circle.
 	ids := identity.RequestIDs{
-		Session: identity.CanonicalSessionID("watchdog:" + model),
+		Session: session,
 		Project: "opencode2api:default-project",
 		Request: identity.RandomID("probe", 16),
 	}
