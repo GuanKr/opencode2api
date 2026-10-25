@@ -712,7 +712,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// then reports errDeterministicClientRejection so the caller keeps this
 	// 4xx instead of replacing it with a later tier's answer.
 	halted := false
-	cursor := g.anonymous.CursorFor(ids.Session)
+	// The cursor's starting exit follows the session that goes on the wire, so a
+	// conversation that rotated past an exhausted quota also leaves from a
+	// different exit on its next turn.
+	generation := g.sessions.Generation(ids.Session)
+	cursor := g.anonymous.CursorFor(ids.WithSessionGeneration(generation).Session)
 	limit := min(g.anonymous.Len(), g.maxAnonymousExits())
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
 		limit = g.cfg.Retry.MaxAttempts
@@ -792,7 +796,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				httpx.DrainAndClose(lastResponse.Body)
 				lastResponse = nil
 			}
-			req, err := upstreamRequest(ctx, baseURL, protocol, preparedBodies[index], ids, anonymousZenKey)
+			// Re-derived per attempt: a quota 429 on an earlier attempt rotates
+			// the generation, and every following attempt must go out under the
+			// new session (see shouldRotateSession).
+			attemptIDs := ids.WithSessionGeneration(generation)
+			req, err := upstreamRequest(ctx, baseURL, protocol, preparedBodies[index], attemptIDs, anonymousZenKey)
 			if err != nil {
 				return nil, err, attempts
 			}
@@ -863,6 +871,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				break
 			} else {
 				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			}
+			if shouldRotateSession(resp, err) {
+				// The free tier scopes part of its quota to the session id: the
+				// same id is refused on every exit, and switching the proxy while
+				// keeping it burns the new egress too. Rotating here makes every
+				// later attempt — in this request and in the following turns —
+				// leave under a fresh session.
+				generation = g.sessions.Rotate(ids.Session)
+				g.logger.Warn("free tier quota refused; rotating the upstream session", "component", "upstream", "event", "session_rotated", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "generation", generation)
 			}
 			if index+1 < len(upstreams) && !node.proxy.healthy.Load() {
 				break
@@ -949,6 +966,27 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 	}
 	return nil, lastErr, attempts
+}
+
+// shouldRotateSession reports whether an upstream answer was a free-tier quota
+// refusal — the one failure a fresh upstream session can clear. Only a 429 whose
+// error class reads as quota counts:
+//
+//   - 403 is the free tier's gate verdict (or, without the gate text, a
+//     fingerprint/WAF rejection). Rotating there would hide a body-shaping bug
+//     behind a quota story; the 2026-10-15 measurements pinned 403 to shape.
+//   - A 429 classified as rate limit is throttling: a new session changes
+//     nothing and would only spend the conversation's rotations for no reason.
+//   - 5xx, transport failures, timeouts and cancellations say nothing about the
+//     session.
+//
+// watchdogCause peeks at most httpx.MaxDrainBytes of the error document and puts
+// it back, so a response the caller forwards is byte-identical.
+func shouldRotateSession(resp *http.Response, err error) bool {
+	if err != nil || resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		return false
+	}
+	return classifyAnonymousVerdict(watchdogCause(resp, nil), false) == "quota"
 }
 
 // anonymousUpstreams returns the ordered base URLs for the keyless free-tier
@@ -1357,7 +1395,8 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		nodes = g.goNodes
 		baseURL = g.cfg.Upstream.Go
 	}
-	cursor := nodes.CursorFor(ids.Session)
+	generation := g.sessions.Generation(ids.Session)
+	cursor := nodes.CursorFor(ids.WithSessionGeneration(generation).Session)
 	if nodes.Len() == 0 {
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0
 	}
@@ -1397,7 +1436,8 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 			httpx.DrainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := upstreamRequest(ctx, baseURL, route.Protocol, body, ids, node.key)
+		attemptIDs := ids.WithSessionGeneration(generation)
+		req, err := upstreamRequest(ctx, baseURL, route.Protocol, body, attemptIDs, node.key)
 		if err != nil {
 			return nil, err, attempts
 		}
@@ -1459,6 +1499,14 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route models.Route, bodies 
 		if isNonRetryableClientResponse(resp, err) {
 			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "proxy", proxyLabel, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
+		}
+		if shouldRotateSession(resp, err) {
+			// Same quota contract as the anonymous lane: the free tier scopes
+			// part of its allowance to the session, so a Zen-key attempt on a
+			// free model has to rotate too, or the next key would be refused for
+			// a reason no key change can fix.
+			generation = g.sessions.Rotate(ids.Session)
+			g.logger.Warn("free tier quota refused; rotating the upstream session", "component", "upstream", "event", "session_rotated", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", proxyLabel, "generation", generation)
 		}
 		lastResponse = resp
 		if useWARP && errors.Is(err, errWARPUnavailable) {

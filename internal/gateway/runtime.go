@@ -68,6 +68,11 @@ type RuntimeController struct {
 	// and stack are unchanged. warpKey is the identity used for that reuse.
 	warpPool *warp.Pool
 	warpKey  string
+	// sessions holds per-conversation upstream session generations. It is
+	// created once per process and handed to every runtime, so saving a setting
+	// in the console does not send a rotated conversation back to the exhausted
+	// session id.
+	sessions *sessionGenerations
 }
 
 // EffectiveListeners are the listener settings the running process actually
@@ -88,6 +93,7 @@ func RuntimeManager(root context.Context, configPath string, cfg config.Config, 
 	manager := &RuntimeController{
 		configPath: configPath, root: root, logger: logger, monitor: monitor, hub: hub, redactor: redactor, level: level,
 		effective: EffectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled},
+		sessions:  newSessionGenerations(),
 	}
 	manager.metadata = modelcatalog.PricingStore(configPath, logger)
 	// OpenCode metadata refreshes ride the active runtime's healthy proxy
@@ -227,6 +233,11 @@ func (m *RuntimeController) build(cfg config.Config) (*gatewayRuntime, error) {
 		return nil, err
 	}
 	gateway.rotation = m.rotation
+	// The controller's store outlives this runtime: a config save must not send
+	// a rotated conversation back to the session id that already hit quota.
+	if m.sessions != nil {
+		gateway.sessions = m.sessions
+	}
 	availabilityPath := ""
 	if m.configPath != "" {
 		availabilityPath = m.configPath + "." + config.Fingerprint(cfg.Upstream.Zen) + ".availability.json"

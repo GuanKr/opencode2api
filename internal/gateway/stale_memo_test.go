@@ -422,6 +422,7 @@ func newStubGateway(t *testing.T, baseURL string) *Gateway {
 		anonymous:  anonymousPool(true, transports, time.Second, anonymousBackoff{}),
 		catalog:    models.Catalog(config.TierZen, nil),
 		monitor:    telemetry.Monitor(),
+		sessions:   newSessionGenerations(),
 	}
 }
 

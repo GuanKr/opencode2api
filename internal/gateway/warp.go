@@ -250,6 +250,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 	var lastErr error
 	blocked, halted := false, false
 	attempts := 0
+	generation := g.sessions.Generation(ids.Session)
 	for attempts < limit {
 		if ctx.Err() != nil {
 			if lastErr == nil {
@@ -272,7 +273,8 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 				httpx.DrainAndClose(lastResponse.Body)
 				lastResponse = nil
 			}
-			req, err := upstreamRequest(ctx, baseURL, protocol, prepared[index], ids, anonymousZenKey)
+			attemptIDs := ids.WithSessionGeneration(generation)
+			req, err := upstreamRequest(ctx, baseURL, protocol, prepared[index], attemptIDs, anonymousZenKey)
 			if err != nil {
 				return nil, err, attempts
 			}
@@ -316,6 +318,12 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 				halted = true
 				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", status, "duration_ms", duration.Milliseconds())
 				break
+			}
+			if shouldRotateSession(resp, err) {
+				// Same quota contract as the proxy lane: the session, not only the
+				// exit, carries part of the free allowance.
+				generation = g.sessions.Rotate(ids.Session)
+				g.logger.Warn("free tier quota refused; rotating the upstream session", "component", "upstream", "event", "session_rotated", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", egress, "generation", generation)
 			}
 			g.logger.Debug("anonymous WARP upstream returned an error response; trying the next upstream or exit", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", egress, "status", status, "duration_ms", duration.Milliseconds())
 			if index+1 < len(upstreams) {

@@ -18,6 +18,7 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"opencode2api/internal/jsonutil"
@@ -113,6 +114,36 @@ func scopedSessionID(scope, signal string) string {
 		signal = scope + "\x00" + signal
 	}
 	return CanonicalSessionID(signal)
+}
+
+// WithSessionGeneration returns ids with every session field re-derived under
+// generation gen. Generation 0 is the client's own conversation and returns ids
+// unchanged.
+//
+// A later generation exists because the free tier scopes part of its quota to
+// the session: once a conversation exhausts it, the same session id keeps
+// answering 429 even from an egress that has never been used, and switching the
+// proxy alone therefore burns the new IP too. Rotating the session is the only
+// lever, and it costs one prompt-cache miss (the conversation itself lives in
+// the body, not in the header).
+//
+// The suffix is hashed into Session, ChildSession and ParentSession together so
+// the parent/child shape the v2 lane sends stays self-consistent. A generation
+// above 0 also deliberately stops a client-minted official id from passing
+// through: after a rotation the upstream session is ours, not the client's.
+func (ids RequestIDs) WithSessionGeneration(gen int) RequestIDs {
+	if gen <= 0 {
+		return ids
+	}
+	tag := "#gen" + strconv.Itoa(gen)
+	ids.Session = CanonicalSessionID(ids.Session + tag)
+	if ids.ChildSession != "" {
+		ids.ChildSession = CanonicalSessionID(ids.ChildSession + tag)
+	}
+	if ids.ParentSession != "" {
+		ids.ParentSession = CanonicalSessionID(ids.ParentSession + tag)
+	}
+	return ids
 }
 
 // claudeCodeSessionPattern extracts the per-session UUID Claude Code embeds in

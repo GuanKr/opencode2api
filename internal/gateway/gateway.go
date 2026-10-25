@@ -113,6 +113,11 @@ type Gateway struct {
 	// freeTierBlock is how long an exit the free tier flagged stays out of the
 	// anonymous cursor. Zero uses defaultFreeTierBlockTTL.
 	freeTierBlock time.Duration
+	// sessions remembers per-conversation upstream session generations, so a
+	// free-tier quota refusal rotates the session id for the rest of the
+	// conversation instead of only for the attempt that hit it. It is shared
+	// across hot reloads by the runtime controller.
+	sessions *sessionGenerations
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
@@ -155,6 +160,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 		monitor:        monitor,
 		attemptTimeout: attemptDeadline(cfg),
 		freeTierBlock:  time.Duration(cfg.Performance.FreeTierBlockSeconds) * time.Second,
+		sessions:       newSessionGenerations(),
 	}, nil
 }
 
