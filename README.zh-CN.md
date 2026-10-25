@@ -220,7 +220,7 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 匿名阶段不受 `retry.max_attempts` 截断，但所有阶段共享请求总超时。网络错误、认证失败、限流和服务端错误可以触发出口轮换。长度/上下文类拒绝（`413`，或正文含 `context_length_exceeded`、`maximum context length`、`string_above_max_length`、`prompt is too long` 的 `400`/`422`）会立即结束请求：换出口或换 Tier 都无法改变请求本身。IP 级 abuse `403` 只淘汰当前出口；所有出口都被封时停止扫描，已配置的 Go Key 仍可继续服务。
 
-匿名通道也可能自己答 `503`，用 `error.type` 区分是哪一侧出的问题：`proxy_error` = 没有出口可连；`free_tier_ip_blocked` = 出口 IP 被免费层判为滥用（该出口停用 `performance.free_tier_block_seconds` 秒）；`free_tier_lane_paused` = lane 级熔断已打开。只是出口在冷却时答 `429` + `Retry-After`。
+匿名通道也可能自己答 `503`，用 `error.type` 区分是哪一侧出的问题：`proxy_error` = 没有出口可连；`free_tier_ip_blocked` = 出口 IP 被免费层判为滥用（该出口停用 `performance.free_tier_block_seconds` 秒）；`free_tier_lane_paused` = lane 级熔断已打开；`warp_unavailable` = 免费通道走 WARP 但一个出口都拿不到（请求没有到达上游）。只是出口在冷却时答 `429` + `Retry-After`。
 
 配置 `models.anonymous_backoff` 后，连续 `threshold` 次匿名失败或所有出口都被 IP 封禁会暂停整条匿名通道 `base_hours`，之后每次再触发翻倍，直到 `max_hours`。单个非滥用 `403` 只计入连续失败（不会立即熔断）；`429` 及其它额度/限流应答**不计入**——那条路径走短冷却 + `Retry-After`，配额烧完应该等几秒，而不是被暂停一小时。免费层自己的门 `403`（`FreeTierError`）同样不计入：它是对该出口所发请求形状的判决，不是「通道坏了」的证据。暂停期间不取代理、不发任何上游请求（包括模型目录刷新和可用性探测），路由直接落到认证通道。窗口到期后只允许一个请求做半开探测：成功关闭熔断并恢复匿名通道，失败则开启下一个更长的窗口。省略该配置块时熔断关闭。
 
@@ -238,7 +238,7 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 `warp.pool_size`（1–32，默认 `2`）是**上限**而不是固定数量。活跃出口按并发动态调整：每个在途请求一个出口，另加一个备用，最少 1 个、最多不超过配置上限；空闲 60 秒的多余出口会被回收，因此突发流量会把出口环撑大，空闲后再缩回。出口第一次收到上游 429 或 403 即被淘汰并立刻在后台重新注册（注册仍受 Cloudflare 12 秒的 API 节奏限制，上限越大预热越慢，应按免费模型的并发峰值设置）；免费模型请求会持续切换到其他出口，直到用完 `retry.max_attempts` 次才把最后一个 429 返回客户端。`warp.stack` 默认 `ipv6`，可选 `ipv4` 或 `dual`。
 
-上游的免费额度按**出口网段**计算，所以只有替换出口能拿到不同网段时轮换才有意义：IPv6 出口按 `/64` 去重并冷却 30 分钟，IPv4 出口按 `/32`。Cloudflare WARP 的 IPv4 出口通常是同一个共享 NAT 地址，常被其他用户用尽；IPv6 网络栈的出口则由外层 WireGuard 源地址决定。把 `warp.source_ipv6` 设为路由到本机的 IPv6 前缀（通常是 `/64`，`warp.stack` 默认已是 `ipv6`），每个出口就会从该前缀绑定自己的源地址。Linux 下该地址通过 `IPV6_FREEBIND` 绑定（网关已自动设置），或要求地址已分配到网卡。不会预先探测地址族：握手先尝试 IPv6 端点，全部失败时自动回退到 IPv4 端点（此时出口为共享地址）。留空则共用本机默认源地址。某些网络的 WARP 出口池本身已被用尽，此时每个新出口也会返回 429，网关会持续轮换出口，但仍会在尝试次数用尽后返回 429。`/healthz` 会返回 `warp` 状态块；启用 WARP 但没有任何活跃出口时返回 503。只有 WARP 关闭或存在 Go Key 需要代理时，`no_healthy_proxies` 才会阻塞就绪。诊断请求会占用出口，但不会轮换或淘汰它。关闭 WARP 后，免费通道恢复使用代理。
+上游的免费额度按**出口网段**计算，所以只有替换出口能拿到不同网段时轮换才有意义：IPv6 出口按 `/64` 去重并冷却 30 分钟，IPv4 出口按 `/32`。Cloudflare WARP 的 IPv4 出口通常是同一个共享 NAT 地址，常被其他用户用尽；IPv6 网络栈的出口则由外层 WireGuard 源地址决定。把 `warp.source_ipv6` 设为路由到本机的 IPv6 前缀（通常是 `/64`，`warp.stack` 默认已是 `ipv6`），每个出口就会从该前缀绑定自己的源地址。Linux 下该地址通过 `IPV6_FREEBIND` 绑定（网关已自动设置），或要求地址已分配到网卡。端点按可达性排序而不是逐个硬试：一次 UDP 路由查询（不发包）把本机可路由的地址族排在前面、另一族保留为后备，IPv4-only 主机不再先烧满 IPv6 握手超时。外层端点族与 `warp.stack` 无关：本机只有 IPv4 路由时，`ipv6` 隧道照样经 IPv4 端点握手（此时出口为共享地址）。留空则共用本机默认源地址。某些网络的 WARP 出口池本身已被用尽，此时每个新出口也会返回 429，网关会持续轮换出口，但仍会在尝试次数用尽后返回 429。`/healthz` 会返回 `warp` 状态块；启用 WARP 但没有任何活跃出口时返回 503。只有 WARP 关闭或存在 Go Key 需要代理时，`no_healthy_proxies` 才会阻塞就绪。诊断请求会占用出口，但不会轮换或淘汰它。关闭 WARP 后，免费通道恢复使用代理。
 
 ### 官方系统提示词
 
@@ -434,7 +434,7 @@ Playground 需要已登录的 Session 和 `X-CSRF-Token`，每个客户端 IP �
 }
 ```
 
-服务端强制设置 `stream: false`。需要指定 Key 时，使用 `{"mode":"selected","tier":"zen","id":"KEY_FINGERPRINT"}`，其中指纹来自 `/api/debug/models`。指定 Key 的诊断最多执行一次上游尝试，不进入匿名通道，不轮换 Key，不切换 Tier，也不重放 reasoning 请求。
+服务端强制设置 `stream: false`。需要指定 Key 时，使用 `{"mode":"selected","tier":"zen","id":"KEY_FINGERPRINT"}`，其中指纹来自 `/api/debug/models`。指定 Key 的诊断最多执行一次上游尝试，不进入匿名通道，不轮换 Key，不切换 Tier。
 
 **自动模式和指定 Key 模式都不会改变生产 Key 的冷却、失败次数，以及代理的健康状态和绑定关系。** 诊断仍会真实访问上游，可能消耗供应商配额，并会计入监控。
 
