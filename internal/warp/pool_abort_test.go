@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -24,13 +25,16 @@ func fakeExit(n int) *exit {
 
 // fakeExitFactory numbers exits so each registration gets a distinct /64.
 // failFrom makes every call from that position fail; blockFrom holds calls
-// there until release is closed.
+// there until release is closed, and started signals that the first blocked
+// call has entered.
 type fakeExitFactory struct {
 	mu        sync.Mutex
 	created   int
 	failFrom  int
 	blockFrom int
 	release   chan struct{}
+	started   chan struct{}
+	exits     []*exit
 }
 
 func (f *fakeExitFactory) create(context.Context) (*exit, error) {
@@ -39,12 +43,30 @@ func (f *fakeExitFactory) create(context.Context) (*exit, error) {
 	n := f.created
 	f.mu.Unlock()
 	if f.blockFrom > 0 && n >= f.blockFrom && f.release != nil {
+		if f.started != nil && n == f.blockFrom {
+			close(f.started)
+		}
 		<-f.release
 	}
 	if f.failFrom > 0 && n >= f.failFrom {
 		return nil, errors.New("WARP registration refused")
 	}
-	return fakeExit(n), nil
+	candidate := fakeExit(n)
+	f.mu.Lock()
+	f.exits = append(f.exits, candidate)
+	f.mu.Unlock()
+	return candidate, nil
+}
+
+func (f *fakeExitFactory) exitAt(n int) *exit {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, candidate := range f.exits {
+		if candidate.id == fmt.Sprintf("exit-%d", n) {
+			return candidate
+		}
+	}
+	return nil
 }
 
 func waitFor(t *testing.T, what string, condition func() bool) {
@@ -377,4 +399,245 @@ func TestFailureKindLabels(t *testing.T) {
 			t.Fatalf("failureKind(%q) = %q, want %q", reason, got, want)
 		}
 	}
+}
+
+func TestResetDuringRefillDiscardsPreResetExit(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	factory := &fakeExitFactory{blockFrom: 2, release: release, started: started}
+	pool, err := newPool(context.Background(), nil, 2, factory.create)
+	if err != nil {
+		t.Fatalf("newPool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the background refill never started")
+	}
+
+	if removed := pool.Reset(errors.New("watchdog node switch")); removed != 1 {
+		t.Fatalf("Reset removed %d exits, want 1", removed)
+	}
+	close(release)
+
+	waitFor(t, "the pre-reset refill candidate to be discarded", func() bool {
+		candidate := factory.exitAt(2)
+		if candidate == nil {
+			return false
+		}
+		_, _, closed := exitState(candidate)
+		return closed
+	})
+	waitFor(t, "the new generation to refill", func() bool {
+		return pool.Snapshot().Active >= 1
+	})
+	for _, candidate := range poolActive(pool) {
+		if candidate.id == "exit-2" {
+			t.Fatal("an exit registered before Reset joined the new ring")
+		}
+	}
+}
+
+func TestResetDuringReplaceDiscardsPreResetExit(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{})
+	factory := &fakeExitFactory{blockFrom: 2, release: release, started: started}
+	pool, err := newPool(context.Background(), nil, 1, factory.create)
+	if err != nil {
+		t.Fatalf("newPool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	lease, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	original := lease.exit
+	pool.Report(lease, http.StatusTooManyRequests, nil)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the replacement registration never started")
+	}
+
+	if removed := pool.Reset(errors.New("watchdog node switch")); removed != 0 {
+		t.Fatalf("Reset removed %d exits, want 0 (the exit was already penalized)", removed)
+	}
+	close(release)
+
+	waitFor(t, "the pre-reset replacement to be discarded", func() bool {
+		candidate := factory.exitAt(2)
+		if candidate == nil {
+			return false
+		}
+		_, _, closed := exitState(candidate)
+		return closed
+	})
+	waitFor(t, "the new generation to refill", func() bool {
+		return pool.Snapshot().Active >= 1
+	})
+	for _, candidate := range poolActive(pool) {
+		if candidate.id == "exit-2" {
+			t.Fatal("an exit registered before Reset joined the new ring")
+		}
+	}
+	waitFor(t, "the old exit to retire", func() bool {
+		_, retired, _ := exitState(original)
+		return retired
+	})
+	lease.Release()
+	waitClosed(t, original)
+}
+
+func TestReportedLeaseDoesNotRepenalizeRestoredExit(t *testing.T) {
+	factory := &fakeExitFactory{failFrom: 2}
+	pool, err := newPool(context.Background(), nil, 1, factory.create)
+	if err != nil {
+		t.Fatalf("newPool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	reporter, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire reporter: %v", err)
+	}
+	other, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire other: %v", err)
+	}
+	if reporter.exit != other.exit {
+		t.Fatal("the two leases must hold the same exit")
+	}
+	original := reporter.exit
+	pool.Report(reporter, http.StatusTooManyRequests, nil)
+	waitFor(t, "the failed replacement to restore the old exit", func() bool {
+		active := poolActive(pool)
+		return len(active) == 1 && active[0] == original
+	})
+	if !reporter.Reported() {
+		t.Fatal("the lease that reported the 429 must be marked reported")
+	}
+	if !other.Aborted() {
+		t.Fatal("the other lease on the penalized exit must be aborted")
+	}
+	before := pool.Snapshot()
+	if before.FailuresTotal != 2 {
+		t.Fatalf("failures_total = %d, want the 429 and the failed create", before.FailuresTotal)
+	}
+
+	// Late read/idle failures from either lease must not penalize the restored
+	// exit a second time.
+	pool.Fail(reporter, "stream read error")
+	pool.Fail(other, "stream idle timeout")
+	after := pool.Snapshot()
+	if after.FailuresTotal != before.FailuresTotal || after.FailureStreak != before.FailureStreak {
+		t.Fatalf("late failures counted again: before total=%d streak=%d, after total=%d streak=%d",
+			before.FailuresTotal, before.FailureStreak, after.FailuresTotal, after.FailureStreak)
+	}
+	active := poolActive(pool)
+	if len(active) != 1 || active[0] != original {
+		t.Fatalf("late failures removed the restored exit: active=%v", active)
+	}
+	other.Release()
+	reporter.Release()
+}
+
+func TestReplaceWithPreResetGenerationDoesNotRestore(t *testing.T) {
+	var calls atomic.Int32
+	create := func(context.Context) (*exit, error) {
+		n := int(calls.Add(1))
+		if n == 2 {
+			return nil, errors.New("WARP registration refused")
+		}
+		return fakeExit(n), nil
+	}
+	pool, err := newPool(context.Background(), nil, 1, create)
+	if err != nil {
+		t.Fatalf("newPool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	lease, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	old := lease.exit
+	pool.mu.Lock()
+	generation := pool.generation
+	pool.mu.Unlock()
+
+	// A Reset lands between the penalty and the replace goroutine actually
+	// running. replace must still use the generation captured in penalize.
+	pool.Reset(errors.New("watchdog node switch"))
+	pool.replace(old, "HTTP 429", generation)
+
+	waitFor(t, "the new generation to refill", func() bool {
+		return pool.Snapshot().Active >= 1
+	})
+	for _, candidate := range poolActive(pool) {
+		if candidate == old {
+			t.Fatal("a pre-Reset replace restored the old exit")
+		}
+	}
+	next, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire after refill: %v", err)
+	}
+	if next.exit == old {
+		t.Fatal("a pre-Reset exit was leased after the refill")
+	}
+	next.Release()
+	lease.Release()
+	waitClosed(t, old)
+}
+
+func TestMarkReportedOnlyOnce(t *testing.T) {
+	lease := &Lease{}
+	var wins atomic.Int32
+	var wait sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if lease.markReported() {
+				wins.Add(1)
+			}
+		}()
+	}
+	wait.Wait()
+	if wins.Load() != 1 {
+		t.Fatalf("markReported won %d times, want exactly 1", wins.Load())
+	}
+	if !lease.Reported() {
+		t.Fatal("the lease must report reported after one winner")
+	}
+}
+
+func TestConcurrentFailureReportsPenalizeOnce(t *testing.T) {
+	factory := &fakeExitFactory{}
+	pool, err := newPool(context.Background(), nil, 1, factory.create)
+	if err != nil {
+		t.Fatalf("newPool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	lease, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	var wait sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			if i%2 == 0 {
+				pool.Report(lease, http.StatusTooManyRequests, nil)
+			} else {
+				pool.Fail(lease, "stream read error")
+			}
+		}(i)
+	}
+	wait.Wait()
+	snapshot := pool.Snapshot()
+	if snapshot.FailuresTotal != 1 || snapshot.FailureStreak != 1 {
+		t.Fatalf("concurrent reports counted %d failures (streak %d), want one", snapshot.FailuresTotal, snapshot.FailureStreak)
+	}
+	lease.Release()
 }

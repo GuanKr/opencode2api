@@ -463,10 +463,12 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			copyErrorResponse(w, external, resp, ids.Request)
 			return
 		}
+		var rawStreamBody io.ReadCloser
 		if stream && g.streamIdleTimeout > 0 {
 			// Only a committed 2xx SSE stream gets the idle bound. Error bodies
 			// are read by copyErrorResponse and must not be cut short.
-			resp.Body = newStreamIdleBody(resp.Body, g.streamIdleTimeout)
+			rawStreamBody = resp.Body
+			resp.Body = newStreamIdleBody(rawStreamBody, g.streamIdleTimeout)
 		}
 		shape := requestShapeFrom(r.Context())
 		toolRenames := shape.renames
@@ -500,6 +502,13 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				}
 			}
 			if errors.Is(err, wire.ErrStreamIdleTimeout) {
+				// The idle wrapper no longer owns the WARP failure: only this
+				// classified timeout retires the exit, so a timer that fires in
+				// the same read as a terminal event cannot retire a completed
+				// stream.
+				if fail := warpStreamFailure(rawStreamBody); fail != nil {
+					fail()
+				}
 				proxy := ""
 				if meta != nil {
 					proxy = meta.Proxy

@@ -226,7 +226,7 @@ When the free tier is blocked for the whole deployment (an IP-level `403` abuse 
 
 Requests are encoded for each tier's own protocol. With `performance.first_event_timeout_seconds` enabled, a successful SSE response is held until the first complete data event. A timeout or disconnect before that event uses the existing key/proxy retry budget; comments do not satisfy the timeout. Once released downstream, the stream is never replayed. The default is `0` (disabled); try `15` seconds for upstreams that accept requests but send no events. This bounds the first event, not the first text token, and does not apply to System One. Rotation aliases use their separate `rotation.first_output_seconds` timeout.
 
-Once a stream is released downstream, `performance.stream_idle_timeout_seconds` (default `60`) bounds how long the upstream may stay silent between chunks. A timeout closes the stream without a synthetic error event and retires the WARP exit that carried it; the client is expected to retry. Set `0` to use the default; negative values and values above `86400` are rejected.
+Once a committed inference SSE stream is released downstream, `performance.stream_idle_timeout_seconds` (default `60`) bounds how long the upstream may stay silent between chunks. A timeout closes the stream without a synthetic error event and retires the WARP exit that carried it; the client is expected to retry. The bound covers the standard inference streaming paths only: rotation aliases and System One streams are not wrapped, and a stream that has delivered its terminal event is complete even if the upstream keeps the connection open. Set `0` to use the default; negative values and values above `86400` are rejected.
 
 When only anonymous access is configured, `/v1/models` exposes only models eligible for that lane.
 
@@ -384,7 +384,7 @@ Use it when the endpoint behind the URL already performs the rotation and the po
 | `retry.max_attempts`                    | `3`     | Attempts per authenticated tier, including the first.  |
 | `retry.timeout_seconds`                 | `300`   | Total inference timeout, including stream consumption. |
 | `performance.attempt_timeout_seconds`   | `0`     | Whole-attempt bound; 0 uses the request timeout.       |
-| `performance.stream_idle_timeout_seconds` | `60`  | Idle bound between reads of a committed SSE stream.   |
+| `performance.stream_idle_timeout_seconds` | `60`  | Idle bound between reads of a committed inference SSE stream. |
 | `performance.max_anonymous_exits`       | `8`     | Distinct static proxy exits per anonymous request.     |
 | `performance.free_tier_block_seconds`   | `900`   | Cool-down for an exit the free tier flagged.           |
 | `performance.connect_timeout_seconds`   | `5`     | Connection establishment timeout.                      |

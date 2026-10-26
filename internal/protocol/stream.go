@@ -35,8 +35,8 @@ var ErrStreamIdleTimeout = errors.New("upstream stream idle timeout")
 // ErrStreamAborted reports that a committed upstream stream was cut short
 // because the exit carrying it left the rotation. It is returned to the caller
 // without a synthetic downstream error event, like ErrStreamIdleTimeout: the
-// client already holds a partial response and the gateway retries the request
-// on another exit.
+// client already holds a partial response; any retry belongs to the next
+// request.
 var ErrStreamAborted = errors.New("upstream stream aborted")
 
 // streamTermination records how a transcoded stream ended, so the code after
@@ -132,6 +132,9 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		if errors.Is(readErr, ErrStreamIdleTimeout) || errors.Is(readErr, ErrStreamAborted) {
 			return emitter.usage, emitter.usageReported, readErr
 		}
+		if readerAborted(reader) {
+			return emitter.usage, emitter.usageReported, ErrStreamAborted
+		}
 		if ClientCanceled(ctx, readErr) {
 			return emitter.usage, emitter.usageReported, readErr
 		}
@@ -147,6 +150,9 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 	}
 	if termination == streamErrorTermination {
 		return emitter.usage, emitter.usageReported, errStreamUpstreamFailure
+	}
+	if readerAborted(reader) {
+		return emitter.usage, emitter.usageReported, ErrStreamAborted
 	}
 	if ClientCanceled(ctx, nil) {
 		return emitter.usage, emitter.usageReported, ctx.Err()
@@ -181,6 +187,17 @@ func ClientCanceled(ctx context.Context, streamErr error) bool {
 	return ctx != nil && ctx.Err() != nil
 }
 
+// abortedReader reports whether a stream reader was cut short because its
+// egress lease was rotated, as opposed to the upstream ending the body.
+type abortedReader interface {
+	Aborted() bool
+}
+
+func readerAborted(reader io.Reader) bool {
+	aborted, ok := reader.(abortedReader)
+	return ok && aborted.Aborted()
+}
+
 // sseFlushWriter preserves an upstream SSE byte stream while making each
 // successful write visible to the client immediately. io.Copy is free to
 // choose large writes, so flushing in Write is the only reliable place to
@@ -200,19 +217,50 @@ func (writer *sseFlushWriter) Write(data []byte) (int, error) {
 
 // ForwardStream relays a same-protocol upstream stream to the client byte for
 // byte, flushing each write, while a usage tracker reads the same bytes
-// through a TeeReader. It returns the tracked usage and whether the upstream
-// reported any, plus an error: the copy error, if any, for a normal
-// termination that parsed cleanly; otherwise errStreamUpstreamFailure when an
-// upstream error event was relayed, the copy error, or the parse error (or
-// errSSEUnexpectedEOF) after an error event was emitted for a stream that
-// ended early. A canceled client gets no synthetic error event.
+// through a TeeReader. It stops as soon as that tracker sees a clean terminal
+// event, so a delayed EOF or idle deadline after the terminal cannot turn a
+// completed response into a stream failure. It returns the tracked usage and
+// whether the upstream reported any, plus an error: the copy error, if any,
+// for a normal termination that parsed cleanly; otherwise
+// errStreamUpstreamFailure when an upstream error event was relayed, the copy
+// error, or the parse error (or errSSEUnexpectedEOF) after an error event was
+// emitted for a stream that ended early. A canceled client gets no synthetic
+// error event.
 func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader, protocol Protocol, model string) (Usage, bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return Usage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
 	observer := streamUsageObserver(protocol)
-	_, copyErr := io.Copy(&sseFlushWriter{writer: w, flusher: flusher}, io.TeeReader(reader, observer))
+	writer := &sseFlushWriter{writer: w, flusher: flusher}
+	tee := io.TeeReader(reader, observer)
+	buffer := make([]byte, 32<<10)
+	var copyErr error
+	for {
+		n, readErr := tee.Read(buffer)
+		if n > 0 {
+			if _, writeErr := writer.Write(buffer[:n]); writeErr != nil {
+				copyErr = writeErr
+				break
+			}
+		}
+		if observer.NormalTermination() && observer.ParseError() == nil {
+			// The terminal event completed the response. Do not wait for EOF:
+			// an upstream that keeps the connection open would otherwise
+			// trigger the idle bound (or a rotation abort) after a success.
+			copyErr = nil
+			break
+		}
+		if readErr != nil {
+			// io.Copy treats EOF as the ordinary end of input. Keep that
+			// contract so a stream that simply ends without a terminal event
+			// still reaches the errSSEUnexpectedEOF branch below.
+			if readErr != io.EOF {
+				copyErr = readErr
+			}
+			break
+		}
+	}
 	usage := observer.Finish()
 	if errors.Is(copyErr, ErrStreamIdleTimeout) || errors.Is(copyErr, ErrStreamAborted) {
 		return usage, observer.Reported(), copyErr
@@ -225,6 +273,9 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 	}
 	if observer.NormalTermination() && observer.ParseError() == nil {
 		return usage, observer.Reported(), copyErr
+	}
+	if readerAborted(reader) {
+		return usage, observer.Reported(), ErrStreamAborted
 	}
 	if ClientCanceled(ctx, copyErr) {
 		if copyErr == nil {
@@ -259,6 +310,7 @@ func RenameStreamReader(reader io.Reader, protocol Protocol, renames *ToolRename
 		return reader
 	}
 	return &renameStreamReader{
+		source:  reader,
 		buffer:  bufio.NewReaderSize(reader, 64<<10),
 		renamer: &streamToolRenamer{protocol: protocol, renames: renames, tools: map[string]*streamToolRenameState{}},
 	}
@@ -268,10 +320,18 @@ func RenameStreamReader(reader io.Reader, protocol Protocol, renames *ToolRename
 // upstream stream line by line, rewrites the data lines that need it, and
 // serves the rewritten bytes, carrying an error over to the next Read.
 type renameStreamReader struct {
+	source  io.Reader
 	buffer  *bufio.Reader
 	renamer *streamToolRenamer
 	pending []byte
 	err     error
+}
+
+// Aborted forwards the source reader's rotation state so a stream cut at EOF
+// can still be classified as exit rotation.
+func (reader *renameStreamReader) Aborted() bool {
+	aborted, ok := reader.source.(abortedReader)
+	return ok && aborted.Aborted()
 }
 
 // Read returns the rewritten stream bytes, buffering one line at a time.

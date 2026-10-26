@@ -146,7 +146,7 @@ func (s *recordingWarpSink) reasonsSnapshot() []string {
 	return append([]string(nil), s.reasons...)
 }
 
-func TestNewStreamIdleBodyRetiresWarpExitOnIdle(t *testing.T) {
+func TestNewStreamIdleBodyDoesNotRetireWarpExit(t *testing.T) {
 	sink := &recordingWarpSink{}
 	lease := new(warp.Lease)
 	body := &warpBody{
@@ -163,13 +163,20 @@ func TestNewStreamIdleBodyRetiresWarpExitOnIdle(t *testing.T) {
 	if _, err := reader.Read(make([]byte, 8)); !errors.Is(err, wire.ErrStreamIdleTimeout) {
 		t.Fatalf("Read error = %v, want ErrStreamIdleTimeout", err)
 	}
-	calls, gotLease, _ := sink.snapshot()
-	if calls == 0 || gotLease != lease {
-		t.Fatalf("Fail calls=%d lease=%p, want at least one call for %p", calls, gotLease, lease)
+	// The wrapper only bounds and closes. The handler retires the exit after it
+	// classifies the returned timeout, so a terminal in the same read can still
+	// win.
+	if calls, _, _ := sink.snapshot(); calls != 0 {
+		t.Fatalf("the idle wrapper must not retire the exit, calls=%d", calls)
 	}
-	reasons := sink.reasonsSnapshot()
-	if len(reasons) == 0 || reasons[0] != "stream idle timeout" {
-		t.Fatalf("Fail reasons = %v, want stream idle timeout first", reasons)
+	fail := warpStreamFailure(body)
+	if fail == nil {
+		t.Fatal("a *warpBody must yield a failure callback")
+	}
+	fail()
+	calls, gotLease, reason := sink.snapshot()
+	if calls != 1 || gotLease != lease || reason != "stream idle timeout" {
+		t.Fatalf("Fail calls=%d lease=%p reason=%q, want 1/%p/stream idle timeout", calls, gotLease, reason, lease)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

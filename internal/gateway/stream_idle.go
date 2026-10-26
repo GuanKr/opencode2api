@@ -27,8 +27,7 @@ type idleReadCloser struct {
 }
 
 // newIdleReadCloser wraps body with a per-read idle deadline. onTimeout runs
-// before the body is closed, so a WARP failure callback still observes a live
-// lease.
+// before the body is closed.
 func newIdleReadCloser(body io.ReadCloser, timeout time.Duration, onTimeout func()) *idleReadCloser {
 	return &idleReadCloser{body: body, timeout: timeout, onTimeout: onTimeout}
 }
@@ -59,10 +58,20 @@ func (r *idleReadCloser) Read(data []byte) (int, error) {
 
 func (r *idleReadCloser) expire() {
 	r.timedOut.Store(true)
+	if aware, ok := r.body.(interface{ markIdleTimeout() }); ok {
+		aware.markIdleTimeout()
+	}
 	if r.onTimeout != nil {
 		r.onTimeout()
 	}
 	_ = r.closeBody()
+}
+
+// Aborted forwards the underlying body's rotation state so a stream cut at
+// EOF can still be classified as exit rotation.
+func (r *idleReadCloser) Aborted() bool {
+	aborted, ok := r.body.(interface{ Aborted() bool })
+	return ok && aborted.Aborted()
 }
 
 // Close stops the idle timer and closes the underlying body exactly once. It
@@ -85,14 +94,16 @@ func (r *idleReadCloser) closeBody() error {
 }
 
 // newStreamIdleBody applies the configured idle deadline to a committed SSE
-// body and wires the WARP failure callback for the exit carrying it.
+// body. It only bounds and closes the body; the caller decides whether the
+// resulting timeout should penalize the exit, so a timer that fires in the
+// same read as a terminal event cannot retire a completed stream.
 func newStreamIdleBody(body io.ReadCloser, timeout time.Duration) io.ReadCloser {
-	return newIdleReadCloser(body, timeout, warpStreamFailure(body))
+	return newIdleReadCloser(body, timeout, nil)
 }
 
 // warpStreamFailure returns a callback that retires the WARP exit carrying a
-// stream after that stream goes idle. Non-WARP bodies return nil, so the same
-// idle wrapper can serve every route.
+// stream that the caller classified as idle. Non-WARP bodies return nil, so the
+// same handler branch can serve every route.
 func warpStreamFailure(body io.ReadCloser) func() {
 	wb, ok := body.(*warpBody)
 	if !ok {

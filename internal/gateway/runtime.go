@@ -506,13 +506,20 @@ type ResourceSnapshot struct {
 
 // WarpStatus is the operator view of the WARP egress pool.
 type WarpStatus struct {
-	Enabled bool     `json:"enabled"`
-	Stack   string   `json:"stack"`
-	Size    int      `json:"size"`
-	Active  int      `json:"active"`
-	Standby int      `json:"standby"`
-	Cooling int      `json:"cooling"`
-	Egress  []string `json:"egress,omitempty"`
+	Enabled             bool       `json:"enabled"`
+	Stack               string     `json:"stack"`
+	Size                int        `json:"size"`
+	Active              int        `json:"active"`
+	Standby             int        `json:"standby"`
+	Cooling             int        `json:"cooling"`
+	Egress              []string   `json:"egress,omitempty"`
+	StartedAt           time.Time  `json:"started_at"`
+	FailuresTotal       uint64     `json:"failures_total"`
+	FailureStreak       int        `json:"failure_streak"`
+	CreateFailuresTotal uint64     `json:"create_failures_total"`
+	LastFailureAt       *time.Time `json:"last_failure_at,omitempty"`
+	LastFailureKind     string     `json:"last_failure_kind"`
+	LastSuccessAt       *time.Time `json:"last_success_at,omitempty"`
 }
 
 // KeyStatus describes one upstream key by its display ID (its last five
@@ -576,7 +583,17 @@ func (m *RuntimeController) Resources() ResourceSnapshot {
 		result.Warp = &WarpStatus{
 			Enabled: true, Stack: snapshot.Stack, Size: snapshot.Size,
 			Active: snapshot.Active, Standby: snapshot.Standby, Cooling: snapshot.Cooling,
-			Egress: snapshot.Egress,
+			Egress: snapshot.Egress, StartedAt: snapshot.StartedAt.UTC(),
+			FailuresTotal: snapshot.FailuresTotal, FailureStreak: snapshot.FailureStreak,
+			CreateFailuresTotal: snapshot.CreateFailuresTotal, LastFailureKind: snapshot.LastFailureKind,
+		}
+		if !snapshot.LastFailureAt.IsZero() {
+			lastFailure := snapshot.LastFailureAt.UTC()
+			result.Warp.LastFailureAt = &lastFailure
+		}
+		if !snapshot.LastSuccessAt.IsZero() {
+			lastSuccess := snapshot.LastSuccessAt.UTC()
+			result.Warp.LastSuccessAt = &lastSuccess
 		}
 	}
 	return result

@@ -89,20 +89,21 @@ type Pool struct {
 	stack   Stack
 	newExit func(context.Context) (*exit, error)
 
-	mu        sync.Mutex
-	startedAt time.Time
-	active    []*exit
-	inflight  int
-	waiting   int
-	next      int
-	reserved  map[string]bool
-	cooling   map[string]time.Time
-	changed   chan struct{}
-	closed    bool
-	refilling bool
-	scaling   bool
-	wait      sync.WaitGroup
-	createMu  sync.Mutex
+	mu         sync.Mutex
+	startedAt  time.Time
+	generation uint64
+	active     []*exit
+	inflight   int
+	waiting    int
+	next       int
+	reserved   map[string]bool
+	cooling    map[string]time.Time
+	changed    chan struct{}
+	closed     bool
+	refilling  bool
+	scaling    bool
+	wait       sync.WaitGroup
+	createMu   sync.Mutex
 
 	failuresTotal       uint64
 	failureStreak       int
@@ -121,6 +122,10 @@ type Lease struct {
 	// aborted is set before the lease context is canceled, so a reader that
 	// sees the cancellation can tell a rotation from an ordinary release.
 	aborted atomic.Bool
+	// reported records that this lease already reported an exit failure. It
+	// outlives the penalty so a late read or idle failure cannot penalize the
+	// same exit again after a failed replacement restored it.
+	reported atomic.Bool
 }
 
 // Snapshot is a point-in-time view of a pool for health and admin reporting.
@@ -351,6 +356,9 @@ func (p *Pool) Report(lease *Lease, status int, body []byte) {
 		}
 		return
 	}
+	if lease.Aborted() || !lease.markReported() {
+		return
+	}
 	p.penalize(lease.exit, lease, reason)
 }
 
@@ -359,6 +367,9 @@ func (p *Pool) Report(lease *Lease, status int, body []byte) {
 // token. Retrying the same user-space tunnel would only repeat the stall.
 func (p *Pool) Fail(lease *Lease, reason string) {
 	if lease == nil || lease.exit == nil || reason == "" {
+		return
+	}
+	if lease.Aborted() || !lease.markReported() {
 		return
 	}
 	p.penalize(lease.exit, lease, reason)
@@ -473,6 +484,11 @@ func (p *Pool) penalize(bad *exit, exclude *Lease, reason string) {
 	}
 	p.notifyLocked()
 	p.wait.Add(1)
+	// Capture the generation that produced this penalty while the pool lock is
+	// held. A Reset between the spawn and the goroutine's first instruction
+	// must not let the replacement adopt the new generation and restore an
+	// exit from the old ring.
+	generation := p.generation
 	p.mu.Unlock()
 
 	// Abort every other request on this exit now instead of letting it wait
@@ -487,20 +503,23 @@ func (p *Pool) penalize(bad *exit, exclude *Lease, reason string) {
 	// and the retry draws whichever active exit is ready first.
 	go func() {
 		defer p.wait.Done()
-		p.replace(bad, reason)
+		p.replace(bad, reason, generation)
 	}()
 }
 
-func (p *Pool) replace(old *exit, reason string) {
+func (p *Pool) replace(old *exit, reason string, generation uint64) {
 	replacement, err := p.createExit(p.ctx)
 	p.mu.Lock()
-	if p.closed {
+	if p.closed || p.generation != generation {
+		// A Reset happened while this registration was in flight. Its result
+		// belongs to the old generation and must not join the new ring.
 		p.mu.Unlock()
 		if replacement != nil {
 			p.releaseReservation(replacement)
 			replacement.close()
 		}
 		old.retire()
+		p.startRefill()
 		return
 	}
 	if err != nil {
@@ -557,14 +576,16 @@ func (p *Pool) refill() {
 		p.mu.Unlock()
 		return
 	}
+	generation := p.generation
 	p.refilling = true
 	p.mu.Unlock()
 
 	replacement, err := p.createExit(p.ctx)
 	p.mu.Lock()
 	p.refilling = false
+	stale := p.generation != generation
 	placed := false
-	if err == nil && !p.closed && len(p.active) < p.size {
+	if err == nil && !p.closed && !stale && len(p.active) < p.size {
 		p.active = append(p.active, replacement)
 		replacement = nil
 		placed = true
@@ -577,6 +598,13 @@ func (p *Pool) refill() {
 	if replacement != nil {
 		p.releaseReservation(replacement)
 		replacement.close()
+	}
+	if stale {
+		// Reset already started the new generation; this registration cannot
+		// serve it, so start the replacement refill now instead of waiting for
+		// the ordinary retry delay.
+		p.startRefill()
+		return
 	}
 	if err != nil && p.ctx.Err() == nil {
 		if p.logger != nil {
@@ -686,6 +714,7 @@ func (p *Pool) Reset(cause error) int {
 	active := p.active
 	p.active = nil
 	p.next = 0
+	p.generation++
 	for _, item := range active {
 		if key := item.egressKey(); key != "" {
 			delete(p.reserved, key)
@@ -835,6 +864,17 @@ func (l *Lease) Done() <-chan struct{} {
 // rotation, rather than released normally.
 func (l *Lease) Aborted() bool {
 	return l != nil && l.aborted.Load()
+}
+
+// Reported reports whether this lease already reported an exit failure. A
+// lease reports at most once, so a late read or idle failure cannot penalize a
+// restored exit a second time.
+func (l *Lease) Reported() bool {
+	return l != nil && l.reported.Load()
+}
+
+func (l *Lease) markReported() bool {
+	return l != nil && l.reported.CompareAndSwap(false, true)
 }
 
 // Abort cancels the lease with cause and marks it aborted.

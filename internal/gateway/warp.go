@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"opencode2api/internal/config"
@@ -137,22 +138,45 @@ func (l *warpLease) close() {
 // mid-body retires the exit that carried it.
 type warpBody struct {
 	io.ReadCloser
-	lease      *warpLease
-	diagnostic bool
-	cancel     context.CancelFunc
+	lease       *warpLease
+	diagnostic  bool
+	cancel      context.CancelFunc
+	idleTimeout atomic.Bool
+}
+
+// markIdleTimeout tells this body that the idle wrapper closed it. The wrapper
+// owns that classification, so the read error caused by the close must not be
+// reported as a separate stream failure.
+func (b *warpBody) markIdleTimeout() {
+	if b != nil {
+		b.idleTimeout.Store(true)
+	}
 }
 
 func (b *warpBody) Read(data []byte) (int, error) {
 	n, err := b.ReadCloser.Read(data)
-	if err != nil && err != io.EOF {
-		if b.lease != nil && b.lease.lease != nil && b.lease.lease.Aborted() {
+	if err != nil {
+		// EOF is a clean end for a complete non-streaming body, so it stays
+		// EOF even after a rotation. The stream layers classify an aborted
+		// stream through Aborted instead of through the read error.
+		if err != io.EOF && b.Aborted() {
 			return n, wire.ErrStreamAborted
 		}
-		if !b.diagnostic && !errors.Is(err, context.Canceled) {
+		if err != io.EOF && !b.diagnostic && !b.idleTimeout.Load() && !errors.Is(err, context.Canceled) {
 			b.fail("stream read error")
 		}
 	}
 	return n, err
+}
+
+// Aborted reports whether the lease carrying this body was aborted by a
+// rotation. The stream layers use it to tell an exit cut apart from an
+// upstream that simply ended its body.
+func (b *warpBody) Aborted() bool {
+	if b == nil || b.lease == nil || b.lease.lease == nil {
+		return false
+	}
+	return b.lease.lease.Aborted()
 }
 
 func (b *warpBody) Close() error {
@@ -164,10 +188,14 @@ func (b *warpBody) Close() error {
 	return err
 }
 
-// fail retires the exit behind this body. Missing state is a no-op; Pool.Fail
-// already handles a nil lease and is idempotent.
+// fail retires the exit behind this body. Missing state is a no-op; the pool
+// ignores a lease that was already aborted or reported its failure, so a late
+// stream failure cannot penalize a restored exit a second time.
 func (b *warpBody) fail(reason string) {
 	if b == nil || b.lease == nil || b.lease.pool == nil || b.diagnostic {
+		return
+	}
+	if b.lease.lease != nil && (b.lease.lease.Aborted() || b.lease.lease.Reported()) {
 		return
 	}
 	b.lease.pool.Fail(b.lease.lease, reason)
@@ -372,7 +400,7 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 		if halted || ctx.Err() != nil {
 			break
 		}
-		if !leaseBlocked && upstreamStatus(lastResponse) != http.StatusTooManyRequests {
+		if anonymousCountsFailure(lastErr, lastResponse, leaseBlocked) {
 			if pause, tripped := g.anonymous.NoteFailure(); tripped {
 				g.logger.Warn("anonymous lane circuit breaker opened", "component", "upstream", "event", "anonymous_breaker_open", "status", upstreamStatus(lastResponse), "paused_for", pause.String())
 				break
@@ -396,6 +424,17 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 		lastErr = errWARPUnavailable
 	}
 	return nil, lastErr, attempts
+}
+
+// anonymousCountsFailure reports whether one anonymous WARP round should count
+// against the lane breaker. A rotation abort is a property of the exit that
+// carried the attempt, not of the lane: several requests interrupted by one
+// 429 would otherwise trip the breaker together. Lease-scoped 429s and IP
+// blocks are excluded for the same reason.
+func anonymousCountsFailure(lastErr error, lastResponse *http.Response, leaseBlocked bool) bool {
+	return !leaseBlocked &&
+		upstreamStatus(lastResponse) != http.StatusTooManyRequests &&
+		!errors.Is(lastErr, warp.ErrExitRotated)
 }
 
 // observeKeyResultWARP is observeKeyResult for a keyed attempt that left

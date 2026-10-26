@@ -67,3 +67,35 @@ func TestTranscodeStreamIdleTimeoutHasNoSyntheticError(t *testing.T) {
 		t.Fatalf("an idle timeout must not emit a synthetic error event, got %q", body)
 	}
 }
+
+// A terminal event completes a response. The idle deadline must not be able to
+// turn that success into a failure when the upstream delays EOF afterwards.
+func TestForwardStreamStopsAtNormalTerminalBeforeIdle(t *testing.T) {
+	rec := httptest.NewRecorder()
+	_, _, err := ForwardStream(context.Background(), rec, &errAfterReader{
+		data: []byte(idleChatFrame + "data: [DONE]\n\n"),
+		err:  ErrStreamIdleTimeout,
+	}, Chat, "m")
+	if err != nil {
+		t.Fatalf("error = %v, want success after the terminal event", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"content":"hi"`) || !strings.Contains(body, "[DONE]") {
+		t.Fatalf("the completed stream must be forwarded, got %q", body)
+	}
+}
+
+func TestTranscodeStreamStopsAtNormalTerminalBeforeIdle(t *testing.T) {
+	rec := httptest.NewRecorder()
+	_, _, err := TranscodeStream(context.Background(), rec, &errAfterReader{
+		data: []byte(idleChatFrame + "data: [DONE]\n\n"),
+		err:  ErrStreamIdleTimeout,
+	}, Chat, Anthropic, "m")
+	if err != nil {
+		t.Fatalf("error = %v, want success after the terminal event", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "hi") {
+		t.Fatalf("the completed transcoded stream must be forwarded, got %q", body)
+	}
+}
