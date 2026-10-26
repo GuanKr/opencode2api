@@ -111,12 +111,21 @@
   // threshold 轮（本地计数）同样触发，避免“建不出任何出口”时永远不动作。
   // 整个块可省略；省略即 enabled=false（保持旧行为）。未知键/类型不对/小数/越界
   // 一律启动失败，与其它配置项同一口径。
+  // 旧网关 /healthz 没有 failure_streak/failures_total 时只打一次兼容警告并禁用主信号，
+  // 保留 active=0/unavailable 副信号；升级并重启网关后恢复。
+  // 升级/回滚注意：warp_exit_failure 是新顶层键。旧版 watchdog-clash.ps1 读到本文件会因
+  // 未知键启动失败；回滚时必须把脚本与 watchdog.json 一起回滚。网关的新 /healthz 计数字段
+  // 与 /v1/watchdog/warp/reset 也需网关与看门狗一起升级/重启（旧网关缺计数时主信号禁用、
+  // 仅副信号可用；reset 404/405 会被忽略）。
   "warp_exit_failure": {
     // 总开关。省略整块时默认 false；开启后才会读 /healthz 并可能刷新/切换。
     "enabled": true,
 
     // failure_streak（或出口池不可用本地轮数）达到多少才动作（1-100，默认 9）。
     // 动作后以当时连击为新基线，需再涨同样多才会重复触发。
+    // 进程启动/网关重启后的首次观察，若出口池已满（active>=size、status=ready）且历史
+    // failure_streak 已达阈值，先记为基线、不立即切换（重启后可能是旧 streak）；之后的
+    // 新增失败仍会触发（需再累计 threshold 次）。
     "threshold": 9,
 
     // 动作后的冷却分钟数（0-120，默认 15）：冷却期内即使再次达标也不动作。
@@ -132,8 +141,10 @@
     //   refresh_then_switch  先刷新（节流/失败只记日志、继续），再按 WARP 候选排序切换；
     //   switch_only          不刷新，直接切换。
     // 成功切换后 POST /v1/watchdog/warp/reset（server_keys 鉴权；404/405 视为旧网关忽略），
-    // 让网关退役旧出口。等价命令行参数：-WarpExitFailureEnabled / -WarpExitFailureThreshold /
-    // -WarpExitFailureCooldownMinutes / -WarpExitFailureResetRounds / -WarpExitFailureAction。
+    // 让网关退役旧出口。等价命令行参数：-WarpExitFailureEnabled:$true / :$false（[bool] 经
+    // pwsh -File 必须带冒号传值，单独写 -WarpExitFailureEnabled 会被当成缺参数）/
+    // -WarpExitFailureThreshold / -WarpExitFailureCooldownMinutes / -WarpExitFailureResetRounds /
+    // -WarpExitFailureAction。
     "action": "refresh_then_switch"
   }
 }

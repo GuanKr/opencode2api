@@ -125,7 +125,13 @@
   （$script:LastSwitch 变化，含中继 failover）都会清零基线与冷却。此触发只挂在 WARP
   中继检查通过的分支，不影响中继失败路径，也不会调用 legacy Invoke-Failover（其探针
   在 WARP 下无意义）。阈值/连续轮数只靠常驻循环推进：-Once 单轮不做本地累计，只按
-  网关当前 failure_streak 判断（已达标仍会动作，返回 Acted 供退出码使用）。
+  网关当前 failure_streak 判断（已达标仍会动作，返回 Acted/ActionFailed 供退出码使用）。
+  F2 注意（2026-10-26）：进程启动或网关重启后的首次观察，若出口池已满（active >= size、
+  status=ready）且历史 failure_streak 已达阈值，先把它记为基线、不立即切换（重启后看到的
+  高连击可能是上一个进程遗留的历史，尚未发生真正的 2xx）；代价是需要再新增 threshold 次
+  失败才会动作，基线之后的增量失败仍会触发。若 active=0/unavailable 则照常动作。
+  F1 注意：旧网关 /healthz 没有 failure_streak/failures_total 时只打一次兼容警告并禁用
+  主信号，保留 active=0/unavailable 副信号；升级并重启网关后恢复主信号。
   优先级：显式命令行参数 > 配置文件 > 内置默认值——所以临时 -DeprioritizeContains
   试一把仍然压过文件，不必先改文件。exclude_contains 没有对应的命令行参数，
   它写错了只能改文件或把 -WatchdogConfig 指向别的路径。
@@ -137,6 +143,11 @@
   （既有行为，别照上面那句推断）。
   只在启动时读一次，改完 watchdog.json 必须重启看门狗才生效。
   新建文件请从 watchdog.example.json 复制；未创建则全部走内置默认值，行为与从前一致。
+  升级/回滚注意（2026-10-26）：warp_exit_failure 是新增顶层键。旧版 watchdog-clash.ps1
+  读到含该键的新 watchdog.json 会按未知键直接启动失败——回滚必须把脚本与 watchdog.json
+  一起回滚，不能只换其中一个。网关的新 /healthz 计数字段与 /v1/watchdog/warp/reset 也需
+  网关与看门狗同批升级/重启：旧网关缺计数时主信号禁用（仅副信号），reset 404/405 会被
+  忽略；新网关配旧看门狗则不会读取这些字段。
 
   本脚本会写的文件(试运行 -DryRun 除外，-DryRun 除运行日志外零写入)：
     - profiles/<uid>.yaml        订阅刷新时覆盖(先备份 .bak-yyyyMMdd-HHmmss)
@@ -211,6 +222,8 @@
   GET 网关 /healthz，按 warp.failure_streak（主信号）或出口池持续 unavailable/active=0
   （本地连续轮数）触发订阅刷新/节点切换。等价于 watchdog.json 的
   warp_exit_failure.enabled；命令行显式传参优先。
+  注意 [bool] 参数经 pwsh -File 必须带冒号传值：-WarpExitFailureEnabled:$true 或
+  -WarpExitFailureEnabled:$false；单独写 -WarpExitFailureEnabled 会被当成缺参数。
 
 .PARAMETER WarpExitFailureThreshold
   WARP 出口失败阈值（1-100，默认 9）：failure_streak 达到它才动作；动作后以当时的
@@ -1555,10 +1568,12 @@ function Test-JsonObjectShape {
 }
 
 function Get-ShapeName {
+  # 字符串值可能来自误路由的 HTTP 错误正文（如带 token 的 URL），先脱敏再截断，
+  # 不能原样拼进异常/日志；类型名与数组项数不包含正文，保持原样。
   param($Value)
   if ($null -eq $Value) { return '<null>' }
   if ($Value -is [System.Array]) { return "数组（$(@($Value).Count) 项）" }
-  if ($Value -is [string]) { return "字符串（$Value）" }
+  if ($Value -is [string]) { return "字符串（$(Shorten (Mask-Text $Value) 120)）" }
   return $Value.GetType().Name
 }
 
@@ -2152,11 +2167,20 @@ function Get-WatchdogStatus {
 function ConvertTo-WarpExitCounter {
   # /healthz 的计数只接受 JSON 整数；null / 缺失 / 字符串 / 对象一律按 0 处理。
   # 直接 [int64]$null 得 0，但 [int64]'abc' 会抛、[int64]$true 会得 1，所以先判类型。
+  # 小数不能四舍五入：8.6 被转成 9 会越过 threshold 误触发；非有限值同样按 0。
   param($Value)
   if ($null -eq $Value) { return [int64]0 }
   if ($Value -is [bool]) { return [int64]0 }
-  if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
-    try { return [int64]$Value } catch { return [int64]0 }
+  if ($Value -is [int] -or $Value -is [long]) { return [int64]$Value }
+  if ($Value -is [double]) {
+    $d = [double]$Value
+    if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -ne [Math]::Truncate($d)) { return [int64]0 }
+    try { return [int64]$d } catch { return [int64]0 }
+  }
+  if ($Value -is [decimal]) {
+    $dec = [decimal]$Value
+    if ($dec -ne [decimal]::Truncate($dec)) { return [int64]0 }
+    try { return [int64]$dec } catch { return [int64]0 }
   }
   return [int64]0
 }
@@ -2225,7 +2249,7 @@ function Get-GatewayHealthz {
   try {
     $doc = $content | ConvertFrom-Json -Depth 10 -ErrorAction Stop
   } catch {
-    $msg = "GET /healthz 返回的不是 JSON：$(Shorten $content 120)"
+    $msg = "GET /healthz 返回的不是 JSON：$(Shorten (Mask-Text $content) 120)"
     Set-WarpExitHealthFailure -Signature ('healthz|json|' + [string]$_.Exception.Message) -Message $msg
     return @{ Ok = $false; Skipped = $false; HasWarp = $false; Error = $msg; Status = $status }
   }
@@ -3653,13 +3677,14 @@ function Invoke-GatewayWarpReset {
 }
 
 function Invoke-WarpExitFailureTrigger {
-  # 由 Invoke-WarpProxyIteration 的中继健康分支调用。返回 Acted=$true 表示真的动作了
-  # （切换成功，或 refresh_only 刷新成功），供 -Once 退出码使用。只使用本触发器自己的
+  # 由 Invoke-WarpProxyIteration 的中继健康分支调用。Acted=$true 表示真的动作了
+  # （切换成功，或 refresh_only 刷新成功）；ActionFailed=$true 表示动作尝试过但失败
+  # （切换失败/实际刷新失败），供 -Once 分别映射 exit 0/1。只使用本触发器自己的
   # cooldown/baseline，不碰 $script:RoundCooldownUntil（那是中继失败/legacy 的轮冷却）。
   # 主信号：/healthz 的 warp.failure_streak。副信号：failure_streak 缺失/为 0 但
   # warp.status=unavailable 或 warp.active=0 连续达到 threshold 轮（本地计数）。
   param($Health)
-  $res = @{ Acted = $false; Switched = $false; Refreshed = $false; ResetSent = $false; Cause = ''; Node = '' }
+  $res = @{ Acted = $false; Switched = $false; Refreshed = $false; ResetSent = $false; ActionFailed = $false; Cause = ''; Node = '' }
   if (-not $script:WarpExitFailureEnabled) { return $res }
   if ($Health -eq $null -or -not [bool](Get-Prop $Health 'Ok')) { return $res }
   if (-not [bool](Get-Prop $Health 'HasWarp')) {
@@ -3668,6 +3693,8 @@ function Invoke-WarpExitFailureTrigger {
     $script:WarpExitLastObservedStreak = [int64]0
     $script:WarpExitLastSuccessAt = ''
     $script:WarpExitStartedAt = ''
+    $script:WarpExitNoCountersWarned = $false
+    $script:WarpExitFirstObservation = $true
     if ($hadState -and -not $script:WarpExitNoWarpLogged) {
       $script:WarpExitNoWarpLogged = $true
       Write-WdLog 'WARP 出口失败触发：/healthz 无 warp 段（WARP 未启用），已清零触发状态并跳过' 'INFO'
@@ -3680,6 +3707,7 @@ function Invoke-WarpExitFailureTrigger {
   $streak = [int64](Get-Prop $Health 'FailureStreak')
   $warpStatus = [string](Get-Prop $Health 'WarpStatus')
   $warpActive = [int64](Get-Prop $Health 'WarpActive')
+  $warpSize = [int64](Get-Prop $Health 'WarpSize')
   $startedAt = [string](Get-Prop $Health 'StartedAt')
   $lastSuccess = [string](Get-Prop $Health 'LastSuccessAt')
   $kind = [string](Get-Prop $Health 'LastFailureKind')
@@ -3692,6 +3720,8 @@ function Invoke-WarpExitFailureTrigger {
     Write-WdLog "WARP 出口失败触发：网关已重启（started_at $($script:WarpExitStartedAt) → $startedAt），清零连击基线与冷却" 'INFO'
     Reset-WarpExitTriggerState -ClearCooldown -GraceRounds $script:WarpExitFailureResetRounds
     $script:WarpExitLastObservedStreak = [int64]0
+    $script:WarpExitNoCountersWarned = $false
+    $script:WarpExitFirstObservation = $true
     $didReset = $true
   }
   if ($startedAt -ne '') { $script:WarpExitStartedAt = $startedAt }
@@ -3703,6 +3733,7 @@ function Invoke-WarpExitFailureTrigger {
     }
     Reset-WarpExitTriggerState -ClearCooldown
     $script:WarpExitLastObservedStreak = [int64]0
+    $script:WarpExitFirstObservation = $false
     $didReset = $true
   }
   if ($lastSuccess -ne '') { $script:WarpExitLastSuccessAt = $lastSuccess }
@@ -3726,7 +3757,34 @@ function Invoke-WarpExitFailureTrigger {
     }
     Reset-WarpExitTriggerState -BaselineStreak $streak -ClearCooldown -GraceRounds $script:WarpExitFailureResetRounds
     $script:WarpExitLastObservedStreak = $streak
+    $script:WarpExitFirstObservation = $false
     $didReset = $true
+  }
+
+  # F1：旧网关 /healthz 没有 failure_streak/failures_total。主信号禁用，只保留
+  # active=0/unavailable 副信号；兼容警告每次网关世代只打一次，升级/重启后重报。
+  if (-not [bool](Get-Prop $Health 'HasFailureStreak')) {
+    if (-not $script:WarpExitNoCountersWarned) {
+      Write-WdLog 'WARP 出口失败触发：网关 /healthz 的 warp 段没有 failure_streak/failures_total（旧网关），主信号 failure_streak 禁用，仅保留 active=0/unavailable 副信号；请升级并重启网关' 'WARN'
+      $script:WarpExitNoCountersWarned = $true
+    }
+  } else {
+    $script:WarpExitNoCountersWarned = $false
+  }
+
+  # F2：进程启动/网关重启后的首次有效观察，若出口池已满（active >= size>0、status=ready）
+  # 且历史 failure_streak 已达阈值，先记为基线、不立即切换：重启后看到的高连击可能是
+  # 上一个进程/旧网关遗留的历史，真正 2xx 尚未发生。代价：需要再新增 threshold 次失败
+  # 才会动作；基线之后的增量失败仍会触发（新故障不会被吞掉）。
+  if ($script:WarpExitFirstObservation) {
+    $script:WarpExitFirstObservation = $false
+    if ([bool](Get-Prop $Health 'HasFailureStreak') -and $streak -ge $script:WarpExitFailureThreshold -and
+      $warpSize -gt 0 -and $warpActive -ge $warpSize -and $warpStatus -eq 'ready') {
+      $script:WarpExitBaselineStreak = [int64]$streak
+      $script:WarpExitWaitLoggedStreak = -1
+      $script:WarpExitLastObservedStreak = [int64]$streak
+      Write-WdLog "WARP 出口失败触发：首次观察（进程启动/网关重启）出口池已满（active=$warpActive size=$warpSize, status=ready）且历史 failure_streak=$streak 已达阈值 $($script:WarpExitFailureThreshold)，先记为基线、不立即切换；之后的增量失败仍会触发（新失败需再累计 $($script:WarpExitFailureThreshold) 次）" 'WARN'
+    }
   }
 
   # 主信号：failure_streak 上涨时打一条（同一数字不重复刷）。
@@ -3810,6 +3868,7 @@ function Invoke-WarpExitFailureTrigger {
   Write-WdLog "WARP 出口失败触发：$causeDetail，action=$($script:WarpExitFailureAction)（cooldown $($script:WarpExitFailureCooldownMinutes) 分钟）" 'WARN'
   $action = $script:WarpExitFailureAction
   $refreshed = $false
+  $refreshFailed = $false
   if ($action -ne 'switch_only') {
     $rr = $null
     try { $rr = Refresh-Subscription -Uid $script:SubscriptionUid }
@@ -3822,6 +3881,7 @@ function Invoke-WarpExitFailureTrigger {
     } elseif (Get-Prop $rr 'Throttled') {
       Write-WdLog 'WARP 出口失败触发：订阅刷新被节流，继续' 'WARN'
     } else {
+      $refreshFailed = $true
       Write-WdLog "WARP 出口失败触发：订阅刷新失败：$((Get-Prop $rr 'Error'))，继续" 'WARN'
     }
   }
@@ -3899,8 +3959,13 @@ function Invoke-WarpExitFailureTrigger {
   # 冷却从动作真正结束时起算：刷新/切换可能耗时几十秒，用动作前的 $now 会缩短冷却。
   $script:WarpExitCooldownUntil = (Get-Date).AddMinutes([int]$script:WarpExitFailureCooldownMinutes)
   $script:WarpExitLastObservedStreak = $streak
+  $script:WarpExitFirstObservation = $false
   # refresh_only 刷新成功也算“动作了”（verifier F2）：-Once 能据此退出 0，不再显示为无动作。
   $res.Acted = ($switched -or ($action -eq 'refresh_only' -and $refreshed))
+  # F4：切换类动作（refresh_then_switch / switch_only）没切成功，或 refresh_only 实际刷新
+  # 失败，都算“尝试过但失败”；-Once 据此 exit 1。节流/本地跳过属于 no-op，不算失败。
+  $res.ActionFailed = ((($action -ne 'refresh_only') -and (-not $switched)) -or
+    (($action -eq 'refresh_only') -and $refreshFailed))
   $res.Switched = $switched
   $res.Refreshed = $refreshed
   $res.Cause = $cause
@@ -3909,7 +3974,8 @@ function Invoke-WarpExitFailureTrigger {
 }
 
 function Invoke-WarpProxyIteration {
-  # WARP proxy 状态机（design §6）。返回 @{Acted;ConfigError;ConfirmedDown}，供 -Once 固定退出码。
+  # WARP proxy 状态机（design §6）。返回 @{Acted;ConfigError;ConfirmedDown;ActionFailed}，
+  # 供 -Once 固定退出码。
   param($Plan)
   if ($Plan -eq $null -or $Plan.Mode -ne 'warp-proxy') {
     return @{ Acted = $false; ConfigError = $false; ConfirmedDown = $false }
@@ -3968,7 +4034,10 @@ function Invoke-WarpProxyIteration {
           $wr = Invoke-WarpExitFailureTrigger -Health $hz
           $script:WarpExitTriggerErrSig = ''
           if ([bool](Get-Prop $wr 'Acted')) {
-            return @{ Acted = $true; ConfigError = $false; ConfirmedDown = $false }
+            return @{ Acted = $true; ConfigError = $false; ConfirmedDown = $false; ActionFailed = $false }
+          }
+          if ([bool](Get-Prop $wr 'ActionFailed')) {
+            return @{ Acted = $false; ConfigError = $false; ConfirmedDown = $false; ActionFailed = $true }
           }
         }
       } catch {
@@ -4492,6 +4561,10 @@ $script:LastStaleProbe = [DateTime]::MinValue
 #   LocalGraceRounds         动作后的前 N 轮不累计副信号（等 WARP 重新注册）
 #   CooldownUntil            本触发器自己的冷却，不碰 RoundCooldownUntil
 #   HealthBackoffUntil        /healthz 失败后的 60s 退避
+#   NoCountersWarned         旧网关缺 failure_streak 的兼容警告只打一次（F1）
+#   FirstObservation         进程/网关重启后的首次有效观察，用于历史连击基线（F2）
+$script:WarpExitNoCountersWarned = $false
+$script:WarpExitFirstObservation = $true
 $script:WarpExitStartedAt = ''
 $script:WarpExitLastSuccessAt = ''
 $script:WarpExitLastSwitchSeen = $null
@@ -4637,10 +4710,12 @@ try {
       -MaxCandidates $script:MaxCandidates -SwitchGapSeconds 0 -VerifyTimeoutSeconds $VerifyTimeoutSeconds `
       -Uid $script:SubscriptionUid -RoundCooldownMinutes $RoundCooldownMinutes -NormalLogMinutes $NormalLogMinutes -RefreshSettleSeconds $RefreshSettleSeconds `
       -TransportConfirmRounds 1
-    # legacy 返回 @{Acted}；WARP 模式额外带 ConfigError/ConfirmedDown。固定退出码：
-    # 2=config；1=确认 down 但未切（failover 关闭/非本机 auto/cooldown）或 failover 失败；
-    # 0=无动作/健康/抖动恢复/切换成功。legacy 的 0/1 语义不变。
+    # legacy 返回 @{Acted}；WARP 模式额外带 ConfigError/ConfirmedDown/ActionFailed。固定退出码：
+    # 2=config；1=确认 down 但未切（failover 关闭/非本机 auto/cooldown）、failover 失败，
+    # 或 WARP 出口触发动作尝试过但失败（切换失败/实际刷新失败）；0=无动作/健康/抖动恢复/
+    # 切换成功/刷新成功/节流或本地跳过。legacy 的 0/1 语义不变。
     if ((Get-Prop $onceResult 'ConfigError')) { exit 2 }
+    if ((Get-Prop $onceResult 'ActionFailed')) { exit 1 }
     if ((Get-Prop $onceResult 'ConfirmedDown') -and -not (Get-Prop $onceResult 'Acted')) { exit 1 }
     if ($onceResult -ne $null -and $onceResult.Acted -and (Get-Date) -lt $script:RoundCooldownUntil) { exit 1 }
     exit 0
