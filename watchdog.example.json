@@ -101,5 +101,39 @@
   // quota / all_down / 节点失效走立即路径，不受此项影响。计数只存在进程内存，重启清零。
   // -Once 单轮模式不使用这个值（单轮攒不出连续计数，固定按 1 轮执行）。
   // 配置只在看门狗启动时读一次：改完本文件必须重启看门狗才生效。
-  "transport_confirm_rounds": 2
+  "transport_confirm_rounds": 2,
+
+  // ---- WARP 出口失败触发（2026-10-26）----
+  // 背景：WARP 模式下 SOCKS5 中继可能健康，但网关的 WARP 出口连续失败（上游 429/403/
+  // 传输失败/首事件超时等），此时换 Clash 节点才是解法。脚本在中继检查通过后只读
+  // GET /healthz（5s 超时；失败后 60s 退避），读 warp.failure_streak（主信号）与
+  // warp.status/active；主信号缺失或为 0、但出口池连续 unavailable/active=0 达
+  // threshold 轮（本地计数）同样触发，避免“建不出任何出口”时永远不动作。
+  // 整个块可省略；省略即 enabled=false（保持旧行为）。未知键/类型不对/小数/越界
+  // 一律启动失败，与其它配置项同一口径。
+  "warp_exit_failure": {
+    // 总开关。省略整块时默认 false；开启后才会读 /healthz 并可能刷新/切换。
+    "enabled": true,
+
+    // failure_streak（或出口池不可用本地轮数）达到多少才动作（1-100，默认 9）。
+    // 动作后以当时连击为新基线，需再涨同样多才会重复触发。
+    "threshold": 9,
+
+    // 动作后的冷却分钟数（0-120，默认 15）：冷却期内即使再次达标也不动作。
+    // 只作用于本触发器，不碰中继失败/legacy 的 round cooldown。
+    "cooldown_minutes": 15,
+
+    // 连击连续归零多少轮才清除动作基线（1-10，默认 2）；动作后的前 N 轮也不累计
+    // “出口池不可用”本地计数，给 WARP 重新注册留时间。
+    "reset_rounds": 2,
+
+    // 触发后的动作：
+    //   refresh_only         只刷新订阅（受 RefreshCooldownMinutes 节流）；
+    //   refresh_then_switch  先刷新（节流/失败只记日志、继续），再按 WARP 候选排序切换；
+    //   switch_only          不刷新，直接切换。
+    // 成功切换后 POST /v1/watchdog/warp/reset（server_keys 鉴权；404/405 视为旧网关忽略），
+    // 让网关退役旧出口。等价命令行参数：-WarpExitFailureEnabled / -WarpExitFailureThreshold /
+    // -WarpExitFailureCooldownMinutes / -WarpExitFailureResetRounds / -WarpExitFailureAction。
+    "action": "refresh_then_switch"
+  }
 }

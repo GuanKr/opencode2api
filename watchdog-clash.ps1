@@ -8,6 +8,9 @@
     2) 网关 /v1/watchdog/status 报 proxies.all_down=true（传输全坏） → 刷新后原地复测一次，仍坏才切换
     3) 网关 /v1/watchdog/status 报 anonymous.verdict=transport（传输坏，常见为 cause=transport (connection failed) 网络抖动） → 累计 TransportConfirmRounds 轮（默认 2，可用 watchdog.json 的 transport_confirm_rounds 或命令行 -TransportConfirmRounds 改）仍坏才刷新，刷新后原地复测一次，仍坏才切换（单个 ok/限流轮不再清零，连续 4 轮非 transport 才衰减；网关冷却过期后 5 分钟内仍报 transport，防“两次失败→过期→误报恢复”死循环）
     4) 网关 /v1/watchdog/status 报 anonymous.verdict=quota（额度尽） → 与上面三类同样先刷新，刷新后原地复测一次（刷新换的是同名节点背后的出口 IP，额度可能已恢复），仍坏才切换；探针走网关的 /v1/watchdog/probe 时只测匿名通道、不回退付费 key，复测 200 就等于这条出口 IP 的匿名通道真恢复了（旧探针 legacy 才需要再复查 verdict 翻离 quota）
+    5) WARP 模式：Clash SOCKS5 中继健康、但网关 /healthz 的 warp.failure_streak 连续达到
+       阈值（或出口池持续 unavailable/active=0） → 按 watchdog.json 的 warp_exit_failure.action
+       刷新订阅/切换节点，并 POST /v1/watchdog/warp/reset 让旧 WARP 出口退役（默认关闭）
   verdict=ratelimit/cooling（纯限流/普通冷却）只记日志，不刷新、不切换、不验证；verdict=ok 且有 transport 前科未验证时只打一次节流验证探针（5 分钟一次），无前科的 ok 轮不验证。
   切换前不再为确认 verdict 打探针：verdict 已由网关内部分类给出原因，不花配额；
   仅订阅刷新成功后打一次恢复复测（见下），恢复则跳过切换。
@@ -44,9 +47,11 @@
   10-14 更正（勿再按旧文案“优化”回去）：早期版本按“quota 刷新不变 IP，复测必败”跳过了刷新后的原地复测，
   与本段实证直接矛盾——刷新换的正是同名节点背后的出口 IP，原 IP 额度烧尽不代表新 IP 也用尽；
   已改为四类触发统一走刷新 + 原地复测。
-  网关侧新增两个脚本专用接口（server_keys 鉴权，不动路由与配置结构）：
+  网关侧新增三个脚本专用接口（server_keys 鉴权，不动路由与配置结构）：
   GET /v1/watchdog/status 是只读 decision 快照；POST /v1/watchdog/probe 是强制真发上游的探针
   （忽略代理健康闸门与冷却、只测匿名通道、不写任何池状态）。切换 Selector 即换出口 IP，网关零重启生效。
+  2026-10-26 新增 POST /v1/watchdog/warp/reset（同一鉴权）：WARP 出口失败触发切换成功后调用，
+  退役全部旧 WARP 出口（旧请求失败、新注册走新 Clash 节点）；旧网关 404/405 时忽略。
 
   并发与密钥说明：脚本用全局命名互斥保证单实例（双开时后者直接退出），避免并发写三文件与重复切换；
   网关 server key 与推理 key 同权（可打全量推理），脚本只放网关本机、config.json 用文件 ACL 收紧，长期考虑只读 token 或回环绑定。
@@ -90,7 +95,11 @@
       "max_candidates": 120,
       "exclude_contains": ["剩余","到期","重置","流量","套餐","官网","中国"],
       "deprioritize": { "contains": ["新加坡"], "penalty_ms": 500 },
-      "transport_confirm_rounds": 2
+      "transport_confirm_rounds": 2,
+      "warp_exit_failure": {
+        "enabled": true, "threshold": 9, "cooldown_minutes": 15,
+        "reset_rounds": 2, "action": "refresh_then_switch"
+      }
     }
   语义：exclude_contains / deprioritize.contains 是整体替换内置默认值（不是追加），
   [] 即关闭该项；省略的键仍用内置默认值。deprioritize.penalty_ms 省略即用 500。
@@ -100,6 +109,23 @@
   max_candidates 是单轮最多试多少个候选节点（1-300，省略即 120），等价于命令行 -MaxCandidates。
   transport_confirm_rounds 省略即用 2（1-10 的整数）：网关报 verdict=transport 时需连续
   N 轮仍坏才刷新切换，等价于命令行 -TransportConfirmRounds，-Once 单轮模式忽略它。
+  warp_exit_failure 是 WARP 出口失败触发（省略即 enabled=false）：WARP 中继检查通过后，
+  脚本再只读 GET 网关 /healthz（5s 超时；失败后 60s 退避，网关没起时不拖慢每轮巡检），
+  读 warp.failure_streak（主信号）与 warp.status/active。failure_streak 达到 threshold
+  （1-100，默认 9）时按 action 动作：refresh_only = 只刷新订阅；refresh_then_switch
+  （默认）= 先刷新（节流/失败只记日志、继续）再按 Get-RankedCandidates 的 WARP 排序
+  切到第一个可切换候选；switch_only = 不刷新直接切。failure_streak 缺失或为 0、但
+  warp.status=unavailable 或 warp.active=0 连续达到 threshold 轮（本地计数，日志单列
+  原因）同样触发，覆盖“出口池建不出任何出口”的故障；主信号有数时不再重复累计。
+  动作成功后 POST /v1/watchdog/warp/reset（server_keys 鉴权；404/405 视为旧网关忽略）
+  让旧出口退役，然后进入 cooldown_minutes（0-120，默认 15）冷却并把当前连击记为基线，
+  连击需再涨 threshold 才会重复触发；连击连续归零 reset_rounds（1-10，默认 2）轮才
+  清除基线。动作后的前 reset_rounds 轮不累计“出口池不可用”本地计数，给 WARP 重新
+  注册留时间。网关重启（started_at 变化）、last_success_at 前进、或检测到任何节点切换
+  （$script:LastSwitch 变化，含中继 failover）都会清零基线与冷却。此触发只挂在 WARP
+  中继检查通过的分支，不影响中继失败路径，也不会调用 legacy Invoke-Failover（其探针
+  在 WARP 下无意义）。阈值/连续轮数只靠常驻循环推进：-Once 单轮不做本地累计，只按
+  网关当前 failure_streak 判断（已达标仍会动作，返回 Acted 供退出码使用）。
   优先级：显式命令行参数 > 配置文件 > 内置默认值——所以临时 -DeprioritizeContains
   试一把仍然压过文件，不必先改文件。exclude_contains 没有对应的命令行参数，
   它写错了只能改文件或把 -WatchdogConfig 指向别的路径。
@@ -119,7 +145,7 @@
     - clash-verge.yaml           订阅刷新时同步 proxies/proxy-groups/rules 等节(先备份)
     - .tmp/clash-watchdog.log    运行日志(密钥/订阅 token 自动脱敏)
   只读不写的文件：
-    - watchdog.json              看门狗专用配置(selector/uid/候选上限/排除/降权/transport 轮数)，
+    - watchdog.json              看门狗专用配置(selector/uid/候选上限/排除/降权/transport 轮数/WARP 出口失败触发)，
                                  默认取脚本同目录，-WatchdogConfig 可改路径
     - config.json                只读 server_keys[0]
 
@@ -151,9 +177,9 @@
 .PARAMETER WatchdogConfig
   看门狗专用配置文件路径，默认脚本同目录 watchdog.json。文件不存在即全部用内置默认值；
   存在则用其中的 selector（代理组候选，字符串或数组）、subscription_uid（profile uid，空=自动）、
-  max_candidates（候选上限）、exclude_contains（子串排除）、deprioritize（地区降权）与
-  transport_confirm_rounds（transport 连续确认轮数）覆盖对应内置默认值，
-  省略的键不受影响。除 exclude_contains 外，其余键在显式传同名命令行参数时以命令行优先
+  max_candidates（候选上限）、exclude_contains（子串排除）、deprioritize（地区降权）、
+  transport_confirm_rounds（transport 连续确认轮数）与 warp_exit_failure（WARP 出口失败触发）
+  覆盖对应内置默认值，省略的键不受影响。除 exclude_contains 外，其余键在显式传同名命令行参数时以命令行优先
   （selector / subscription_uid / max_candidates / transport_confirm_rounds 被覆盖也照样
   先校验，写错会中止启动；deprioritize.* 被覆盖时跳过校验，属既有行为）。
   只在启动时读一次，改完需重启看门狗。
@@ -179,6 +205,33 @@
   时，需连续 N 轮仍为 transport 才刷新/切换，单轮抖动只观察不动作。quota / all_down / 节点失效
   走立即路径，不受此值影响。也可以写进 watchdog.json 的 transport_confirm_rounds；
   两者同时存在时命令行显式传参优先。计数只存在进程内存（重启清零），且 -Once 单轮模式忽略此值。
+
+.PARAMETER WarpExitFailureEnabled
+  WARP 出口失败触发总开关（默认 false）。开启后，WARP 中继检查通过的轮次会只读
+  GET 网关 /healthz，按 warp.failure_streak（主信号）或出口池持续 unavailable/active=0
+  （本地连续轮数）触发订阅刷新/节点切换。等价于 watchdog.json 的
+  warp_exit_failure.enabled；命令行显式传参优先。
+
+.PARAMETER WarpExitFailureThreshold
+  WARP 出口失败阈值（1-100，默认 9）：failure_streak 达到它才动作；动作后以当时的
+  连击为新基线，需再涨同样多才会重复触发。出口池不可用的本地计数也用同一阈值。
+  等价于 watchdog.json 的 warp_exit_failure.threshold。
+
+.PARAMETER WarpExitFailureCooldownMinutes
+  动作后的冷却分钟数（0-120，默认 15）：冷却期内即使连击再次达标也不动作。
+  只作用于本触发器，不碰 $script:RoundCooldownUntil。等价于
+  watchdog.json 的 warp_exit_failure.cooldown_minutes。
+
+.PARAMETER WarpExitFailureResetRounds
+  连击归零后清除动作基线的连续轮数（1-10，默认 2）；动作后的前 N 轮也不累计
+  “出口池不可用”本地计数，给 WARP 重新注册留时间。等价于 watchdog.json 的
+  warp_exit_failure.reset_rounds。
+
+.PARAMETER WarpExitFailureAction
+  触发后的动作：refresh_only = 只刷新订阅；refresh_then_switch（默认）= 先刷新
+  （节流/失败只记日志）再切换；switch_only = 不刷新直接切换。成功切换后还会
+  POST /v1/watchdog/warp/reset 让网关退役旧出口。等价于 watchdog.json 的
+  warp_exit_failure.action。
 
 .EXAMPLE
   pwsh -NoProfile -ExecutionPolicy Bypass -File watchdog-clash.ps1 -DryRun
@@ -271,6 +324,15 @@ param(
   # 诊断专用：覆盖 config.json 的 warp.proxy；只在 -ProxyCheckProbeOnly / -DryRun 下生效，
   # 正常常驻循环忽略并 WARN（防止误把诊断目标当成生产切换依据）。
   [string]$ProxyCheckEndpoint = '',
+  # WARP 出口失败触发（2026-10-26）：Clash SOCKS5 中继检查通过、但网关 /healthz 的
+  # warp.failure_streak 连续达到阈值（或出口池持续 unavailable/active=0）时，按 action
+  # 刷新订阅/切换节点，并 POST /v1/watchdog/warp/reset 让旧出口退役。默认关闭；
+  # watchdog.json 的 warp_exit_failure 块可覆盖，命令行显式传参优先。
+  [bool]$WarpExitFailureEnabled = $false,
+  [ValidateRange(1, 100)][int]$WarpExitFailureThreshold = 9,
+  [ValidateRange(0, 120)][int]$WarpExitFailureCooldownMinutes = 15,
+  [ValidateRange(1, 10)][int]$WarpExitFailureResetRounds = 2,
+  [ValidateSet('refresh_only', 'refresh_then_switch', 'switch_only')][string]$WarpExitFailureAction = 'refresh_then_switch',
   # 独立诊断入口：只做一次 proxy 检查、打印结果并按 0/1/2 退出；早于实例互斥与所有 Resolve-*，
   # 因此网关看门狗常驻运行时也能执行。不切换、不写配置/状态文件（运行日志除外）。
   [switch]$ProxyCheckProbeOnly,
@@ -338,6 +400,13 @@ $script:ProxyCheckFailover = $ProxyCheckFailover
 $script:ProxySwitchGapSeconds = $ProxySwitchGapSeconds
 $script:ProxyFailoverBudgetSeconds = $ProxyFailoverBudgetSeconds
 $script:ProxyCheckEndpoint = $ProxyCheckEndpoint
+# WARP 出口失败触发：param 绑定值起步，watchdog.json 的 warp_exit_failure 可覆盖
+# （命令行显式传参优先）。运行状态在启动块统一初始化（进程内存，重启清零）。
+$script:WarpExitFailureEnabled = $WarpExitFailureEnabled
+$script:WarpExitFailureThreshold = $WarpExitFailureThreshold
+$script:WarpExitFailureCooldownMinutes = $WarpExitFailureCooldownMinutes
+$script:WarpExitFailureResetRounds = $WarpExitFailureResetRounds
+$script:WarpExitFailureAction = $WarpExitFailureAction
 # 运行状态：主循环按 WarpProxyActive 选择 sleep 间隔；LastState/LastLogAt 做心跳与状态切换
 # 去重；ConfigErrSig 让同一配置错误只打一次；DirectWarned 让直连 WARP 告警只打一次。
 $script:WarpProxyActive = $false
@@ -1637,7 +1706,7 @@ function Read-WatchdogConfig {
       'transport_confirm_rounds', 'proxy_check_mode', 'proxy_check_interval_seconds',
       'proxy_check_recheck_seconds', 'proxy_check_timeout_seconds', 'proxy_check_udp_target',
       'proxy_check_require_udp', 'proxy_check_failover', 'proxy_switch_gap_seconds',
-      'proxy_failover_budget_seconds')
+      'proxy_failover_budget_seconds', 'warp_exit_failure')
     $unknownTop = @(@($cfg.PSObject.Properties | ForEach-Object { $_.Name }) |
       Where-Object { $knownTop -notcontains $_ })
     if ($unknownTop.Count -gt 0) {
@@ -1903,6 +1972,79 @@ function Read-WatchdogConfig {
       Write-WdLog "配置生效：proxy_check_failover = $foVal"
     }
   }
+  # ---- WARP 出口失败触发（2026-10-26）新增块：类型/范围/枚举从严，写错启动即失败 ----
+  if (Test-HasKey $cfg 'warp_exit_failure') {
+    $wef = Get-Prop $cfg 'warp_exit_failure'
+    if (-not (Test-JsonObjectShape $wef)) {
+      throw ('看门狗配置 warp_exit_failure 必须是对象（{"enabled": true, "threshold": 9, "cooldown_minutes": 15, "reset_rounds": 2, "action": "refresh_then_switch"}），实际是 ' + (Get-ShapeName $wef))
+    }
+    $knownWef = @('enabled', 'threshold', 'cooldown_minutes', 'reset_rounds', 'action')
+    $unknownWef = @(@($wef.PSObject.Properties | ForEach-Object { $_.Name }) |
+      Where-Object { $knownWef -notcontains $_ })
+    if ($unknownWef.Count -gt 0) {
+      throw "看门狗配置 warp_exit_failure 含未知键：$($unknownWef -join ' / ')，只支持 $($knownWef -join '、')"
+    }
+    if (Test-HasKey $wef 'enabled') {
+      $seen++
+      $rawWefEnabled = Get-Prop $wef 'enabled'
+      if (-not ($rawWefEnabled -is [bool])) {
+        $tn = if ($null -eq $rawWefEnabled) { 'null' } else { $rawWefEnabled.GetType().Name }
+        throw "看门狗配置 warp_exit_failure.enabled 非法：[$rawWefEnabled]（类型 $tn；必须是 true/false，不要加引号）"
+      }
+      if ($script:ExplicitParams -contains 'WarpExitFailureEnabled') {
+        $covered++
+        Write-WdLog '命令行已显式传 -WarpExitFailureEnabled，配置文件的 warp_exit_failure.enabled 不生效' 'INFO'
+      } else {
+        $script:WarpExitFailureEnabled = [bool]$rawWefEnabled
+        $applied++
+        Write-WdLog "配置生效：warp_exit_failure.enabled = $([bool]$rawWefEnabled)"
+      }
+    }
+    foreach ($wefInt in @(
+        @{ Key = 'threshold'; Min = 1; Max = 100; Explicit = 'WarpExitFailureThreshold'; Field = 'WarpExitFailureThreshold' },
+        @{ Key = 'cooldown_minutes'; Min = 0; Max = 120; Explicit = 'WarpExitFailureCooldownMinutes'; Field = 'WarpExitFailureCooldownMinutes' },
+        @{ Key = 'reset_rounds'; Min = 1; Max = 10; Explicit = 'WarpExitFailureResetRounds'; Field = 'WarpExitFailureResetRounds' }
+      )) {
+      if (-not (Test-HasKey $wef $wefInt.Key)) { continue }
+      $seen++
+      $rawWefInt = Get-Prop $wef $wefInt.Key
+      if (-not ($rawWefInt -is [int] -or $rawWefInt -is [long])) {
+        $tn = if ($null -eq $rawWefInt) { 'null' } else { $rawWefInt.GetType().Name }
+        throw "看门狗配置 warp_exit_failure.$($wefInt.Key) 非法：[$rawWefInt]（类型 $tn；必须是 $($wefInt.Min)-$($wefInt.Max) 的整数，不要加引号、不要写小数）"
+      }
+      if ($rawWefInt -lt $wefInt.Min -or $rawWefInt -gt $wefInt.Max) {
+        throw "看门狗配置 warp_exit_failure.$($wefInt.Key) 越界：[$rawWefInt]（应为 $($wefInt.Min)-$($wefInt.Max)）"
+      }
+      if ($script:ExplicitParams -contains $wefInt.Explicit) {
+        $covered++
+        Write-WdLog "命令行已显式传 -$($wefInt.Explicit)，配置文件的 warp_exit_failure.$($wefInt.Key) 不生效" 'INFO'
+      } else {
+        Set-Variable -Name ('script:' + $wefInt.Field) -Value ([int]$rawWefInt)
+        $applied++
+        Write-WdLog "配置生效：warp_exit_failure.$($wefInt.Key) = $([int]$rawWefInt)"
+      }
+    }
+    if (Test-HasKey $wef 'action') {
+      $seen++
+      $rawWefAction = Get-Prop $wef 'action'
+      if (-not ($rawWefAction -is [string])) {
+        $tn = if ($null -eq $rawWefAction) { 'null' } else { $rawWefAction.GetType().Name }
+        throw "看门狗配置 warp_exit_failure.action 非法：[$rawWefAction]（类型 $tn；必须是 refresh_only / refresh_then_switch / switch_only）"
+      }
+      $wefActionVal = ([string]$rawWefAction).Trim().ToLowerInvariant()
+      if (@('refresh_only', 'refresh_then_switch', 'switch_only') -notcontains $wefActionVal) {
+        throw "看门狗配置 warp_exit_failure.action 非法：[$rawWefAction]（必须是 refresh_only / refresh_then_switch / switch_only）"
+      }
+      if ($script:ExplicitParams -contains 'WarpExitFailureAction') {
+        $covered++
+        Write-WdLog '命令行已显式传 -WarpExitFailureAction，配置文件的 warp_exit_failure.action 不生效' 'INFO'
+      } else {
+        $script:WarpExitFailureAction = $wefActionVal
+        $applied++
+        Write-WdLog "配置生效：warp_exit_failure.action = $wefActionVal"
+      }
+    }
+  }
   # {} 是合法的“不改任何默认值”，但很容易是误建/误清空后的残留，单独提示一句。
   # 注意别把「键全被命令行覆盖」也说成「空对象 {}」——那与上一行的 INFO 自相矛盾。
   if ($applied -eq 0) {
@@ -2005,6 +2147,126 @@ function Get-WatchdogStatus {
   $key = Resolve-GatewayKey
   $uri = $script:GatewayBase + '/v1/watchdog/status'
   return Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $key" } -TimeoutSec 10 -UseBasicParsing
+}
+
+function ConvertTo-WarpExitCounter {
+  # /healthz 的计数只接受 JSON 整数；null / 缺失 / 字符串 / 对象一律按 0 处理。
+  # 直接 [int64]$null 得 0，但 [int64]'abc' 会抛、[int64]$true 会得 1，所以先判类型。
+  param($Value)
+  if ($null -eq $Value) { return [int64]0 }
+  if ($Value -is [bool]) { return [int64]0 }
+  if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+    try { return [int64]$Value } catch { return [int64]0 }
+  }
+  return [int64]0
+}
+
+function ConvertTo-WarpExitTimestamp {
+  # ConvertFrom-Json 会把 RFC3339 字符串自动转成 [datetime]；直接 [string] 会变成
+  # 本地化格式（如 01/01/2026 00:00:00），既不便于日志比对，也丢掉时区信息。
+  # 统一回 RFC3339（UTC，带小数秒）；非日期字符串原样返回，null 返回空串。
+  param($Value)
+  if ($null -eq $Value) { return '' }
+  if ($Value -is [DateTime]) { return $Value.ToUniversalTime().ToString('o') }
+  if ($Value -is [DateTimeOffset]) { return $Value.ToUniversalTime().ToString('o') }
+  return [string]$Value
+}
+
+function Set-WarpExitHealthFailure {
+  # /healthz 失败：统一打一条 WARN、记录签名，并退避 60s。同一签名 60s 内只打一次，
+  # 网关没起时不会每轮巡检都刷日志、也不会每轮都白等 5s 超时。
+  param([string]$Signature, [string]$Message)
+  $now = Get-Date
+  $script:WarpExitHealthBackoffUntil = $now.AddSeconds(60)
+  if ($script:WarpExitHealthErrSig -ne $Signature -or
+    $script:WarpExitHealthErrLogAt -eq [DateTime]::MinValue -or
+    ($now - $script:WarpExitHealthErrLogAt).TotalSeconds -ge 60) {
+    $script:WarpExitHealthErrSig = $Signature
+    $script:WarpExitHealthErrLogAt = $now
+    Write-WdLog ('WARP 出口健康检查失败：' + (Shorten (Mask-Text $Message) 200) + '（60s 内不再重试）') 'WARN'
+  }
+}
+
+function Get-GatewayHealthz {
+  # 只读 GET /healthz（无需鉴权）。warp.active==0 时网关回 503，但正文仍是合法 JSON，
+  # 所以用 pwsh 7 的 -SkipHttpErrorCheck 直接拿正文，不把 503 当异常。
+  # 5s 超时；失败后 60s 退避（见 Set-WarpExitHealthFailure）。返回的字段全部经
+  # Get-Prop/Test-HasKey 安全读取，缺失/为 null 的计数按 0 处理。
+  param([switch]$Force)
+  $now = Get-Date
+  if (-not $Force -and $now -lt $script:WarpExitHealthBackoffUntil) {
+    return @{ Ok = $false; Skipped = $true; HasWarp = $false; Error = 'backoff' }
+  }
+  $uri = $script:GatewayBase + '/healthz'
+  $resp = $null
+  try {
+    $resp = Invoke-WebRequest -Uri $uri -Method Get -TimeoutSec 5 -UseBasicParsing -SkipHttpErrorCheck
+  } catch {
+    $info = Get-HttpErrorInfo $_
+    $statusTxt = ''
+    try { $statusTxt = [string](Get-Prop $info 'Status') } catch { }
+    $msg = 'GET /healthz 失败'
+    if ($statusTxt -ne '' -and $statusTxt -ne '0') { $msg += "（HTTP $statusTxt）" }
+    $msg += '：' + (Mask-Text $_.Exception.Message)
+    Set-WarpExitHealthFailure -Signature ('healthz|' + $statusTxt + '|' + [string]$_.Exception.GetType().Name) -Message $msg
+    return @{ Ok = $false; Skipped = $false; HasWarp = $false; Error = $msg; Status = 0 }
+  }
+  $status = 0
+  try { $status = [int]$resp.StatusCode } catch { $status = 0 }
+  $content = $resp.Content
+  if ($content -is [byte[]]) { $content = [Text.Encoding]::UTF8.GetString($content) }
+  $content = [string]$content
+  if ($status -ne 200 -and $status -ne 503) {
+    $msg = "GET /healthz 返回 HTTP $status（只接受 200/503）"
+    Set-WarpExitHealthFailure -Signature ('healthz|status|' + $status) -Message $msg
+    return @{ Ok = $false; Skipped = $false; HasWarp = $false; Error = $msg; Status = $status }
+  }
+  $doc = $null
+  try {
+    $doc = $content | ConvertFrom-Json -Depth 10 -ErrorAction Stop
+  } catch {
+    $msg = "GET /healthz 返回的不是 JSON：$(Shorten $content 120)"
+    Set-WarpExitHealthFailure -Signature ('healthz|json|' + [string]$_.Exception.Message) -Message $msg
+    return @{ Ok = $false; Skipped = $false; HasWarp = $false; Error = $msg; Status = $status }
+  }
+  if (-not (Test-JsonObjectShape $doc)) {
+    $msg = "GET /healthz 顶层不是 JSON 对象（$(Get-ShapeName $doc)）"
+    Set-WarpExitHealthFailure -Signature 'healthz|shape' -Message $msg
+    return @{ Ok = $false; Skipped = $false; HasWarp = $false; Error = $msg; Status = $status }
+  }
+  # 解析成功：清掉退避与错误签名。
+  $script:WarpExitHealthBackoffUntil = [DateTime]::MinValue
+  $script:WarpExitHealthErrSig = ''
+  $hasWarp = $false
+  $warp = $null
+  if (Test-HasKey $doc 'warp') {
+    $warp = Get-Prop $doc 'warp'
+    if (Test-JsonObjectShape $warp) { $hasWarp = $true }
+    else { $warp = $null }
+  }
+  $out = @{
+    Ok = $true; Skipped = $false; Status = $status; HasWarp = $hasWarp; Warp = $warp; Error = ''
+    StartedAt = ''; LastSuccessAt = ''; LastFailureAt = ''; LastFailureKind = ''
+    FailureStreak = [int64]0; FailuresTotal = [int64]0; CreateFailuresTotal = [int64]0
+    HasFailureStreak = $false; WarpStatus = ''; WarpActive = [int64]0
+    WarpStandby = [int64]0; WarpSize = [int64]0; WarpCooling = [int64]0
+  }
+  if ($hasWarp) {
+    $out.StartedAt = ConvertTo-WarpExitTimestamp (Get-Prop $warp 'started_at')
+    $out.LastSuccessAt = ConvertTo-WarpExitTimestamp (Get-Prop $warp 'last_success_at')
+    $out.LastFailureAt = ConvertTo-WarpExitTimestamp (Get-Prop $warp 'last_failure_at')
+    $out.LastFailureKind = [string](Get-Prop $warp 'last_failure_kind')
+    $out.HasFailureStreak = Test-HasKey $warp 'failure_streak'
+    $out.FailureStreak = ConvertTo-WarpExitCounter (Get-Prop $warp 'failure_streak')
+    $out.FailuresTotal = ConvertTo-WarpExitCounter (Get-Prop $warp 'failures_total')
+    $out.CreateFailuresTotal = ConvertTo-WarpExitCounter (Get-Prop $warp 'create_failures_total')
+    $out.WarpStatus = [string](Get-Prop $warp 'status')
+    $out.WarpActive = ConvertTo-WarpExitCounter (Get-Prop $warp 'active')
+    $out.WarpStandby = ConvertTo-WarpExitCounter (Get-Prop $warp 'standby')
+    $out.WarpSize = ConvertTo-WarpExitCounter (Get-Prop $warp 'size')
+    $out.WarpCooling = ConvertTo-WarpExitCounter (Get-Prop $warp 'cooling')
+  }
+  return $out
 }
 
 function Test-HasFlagEmoji {
@@ -3353,6 +3615,299 @@ function Invoke-WarpProxyFailover {
   return @{ Ok = $false; Node = $null; ConfigError = $false }
 }
 
+function Reset-WarpExitTriggerState {
+  # 清零 WARP 出口失败触发状态。BaselineStreak > 0 表示刚动作/刚切换：连击需再涨
+  # threshold 才会重复触发；GraceRounds 是动作后不累计“出口池不可用”本地计数的轮数。
+  param([int64]$BaselineStreak = 0, [switch]$ClearCooldown, [int]$GraceRounds = 0)
+  $script:WarpExitBaselineStreak = [int64]$BaselineStreak
+  $script:WarpExitZeroRounds = 0
+  $script:WarpExitWaitLoggedStreak = -1
+  $script:WarpExitLocalStrikes = 0
+  $script:WarpExitLocalGraceRounds = [int]$GraceRounds
+  if ($ClearCooldown) { $script:WarpExitCooldownUntil = [DateTime]::MinValue }
+}
+
+function Invoke-GatewayWarpReset {
+  # POST /v1/watchdog/warp/reset（与 /v1/watchdog/status 同一 server_keys 鉴权）：
+  # 让网关退役全部旧 WARP 出口，旧请求失败、新注册走刚切到的 Clash 节点。
+  # 老网关没有该端点（404/405）时静默跳过；其他失败只回错误文本，由调用方记日志。
+  $uri = $script:GatewayBase + '/v1/watchdog/warp/reset'
+  try { $key = Resolve-GatewayKey } catch {
+    return @{ Ok = $false; Status = 0; Unsupported = $false; Error = ('读取网关 key 失败：' + (Mask-Text $_.Exception.Message)) }
+  }
+  $body = [Text.Encoding]::UTF8.GetBytes('{}')
+  try {
+    $r = Invoke-WebRequest -Uri $uri -Method Post -Headers @{ Authorization = "Bearer $key" } -Body $body -ContentType 'application/json; charset=utf-8' -TimeoutSec 5 -UseBasicParsing
+    $code = 0
+    try { $code = [int]$r.StatusCode } catch { }
+    return @{ Ok = ($code -ge 200 -and $code -lt 300); Status = $code; Unsupported = $false; Error = '' }
+  } catch {
+    $info = Get-HttpErrorInfo $_
+    $code = 0
+    try { $code = [int](Get-Prop $info 'Status') } catch { }
+    if ($code -eq 404 -or $code -eq 405) {
+      return @{ Ok = $false; Status = $code; Unsupported = $true; Error = '' }
+    }
+    return @{ Ok = $false; Status = $code; Unsupported = $false; Error = (Mask-Text $_.Exception.Message) }
+  }
+}
+
+function Invoke-WarpExitFailureTrigger {
+  # 由 Invoke-WarpProxyIteration 的中继健康分支调用。返回 Acted=$true 表示真的动作了
+  # （切换成功，或 refresh_only 刷新成功），供 -Once 退出码使用。只使用本触发器自己的
+  # cooldown/baseline，不碰 $script:RoundCooldownUntil（那是中继失败/legacy 的轮冷却）。
+  # 主信号：/healthz 的 warp.failure_streak。副信号：failure_streak 缺失/为 0 但
+  # warp.status=unavailable 或 warp.active=0 连续达到 threshold 轮（本地计数）。
+  param($Health)
+  $res = @{ Acted = $false; Switched = $false; Refreshed = $false; ResetSent = $false; Cause = ''; Node = '' }
+  if (-not $script:WarpExitFailureEnabled) { return $res }
+  if ($Health -eq $null -or -not [bool](Get-Prop $Health 'Ok')) { return $res }
+  if (-not [bool](Get-Prop $Health 'HasWarp')) {
+    $hadState = ($script:WarpExitBaselineStreak -gt 0) -or ($script:WarpExitLocalStrikes -gt 0) -or ($script:WarpExitLastObservedStreak -gt 0)
+    Reset-WarpExitTriggerState -ClearCooldown
+    $script:WarpExitLastObservedStreak = [int64]0
+    $script:WarpExitLastSuccessAt = ''
+    $script:WarpExitStartedAt = ''
+    if ($hadState -and -not $script:WarpExitNoWarpLogged) {
+      $script:WarpExitNoWarpLogged = $true
+      Write-WdLog 'WARP 出口失败触发：/healthz 无 warp 段（WARP 未启用），已清零触发状态并跳过' 'INFO'
+    }
+    return $res
+  }
+  $script:WarpExitNoWarpLogged = $false
+
+  $now = Get-Date
+  $streak = [int64](Get-Prop $Health 'FailureStreak')
+  $warpStatus = [string](Get-Prop $Health 'WarpStatus')
+  $warpActive = [int64](Get-Prop $Health 'WarpActive')
+  $startedAt = [string](Get-Prop $Health 'StartedAt')
+  $lastSuccess = [string](Get-Prop $Health 'LastSuccessAt')
+  $kind = [string](Get-Prop $Health 'LastFailureKind')
+  $failuresTotal = [int64](Get-Prop $Health 'FailuresTotal')
+  $createFailures = [int64](Get-Prop $Health 'CreateFailuresTotal')
+  $didReset = $false
+
+  # 1) 网关重启（started_at 变化）= 新纪元：旧连击/基线/冷却全部作废。
+  if ($startedAt -ne '' -and $script:WarpExitStartedAt -ne '' -and $startedAt -ne $script:WarpExitStartedAt) {
+    Write-WdLog "WARP 出口失败触发：网关已重启（started_at $($script:WarpExitStartedAt) → $startedAt），清零连击基线与冷却" 'INFO'
+    Reset-WarpExitTriggerState -ClearCooldown -GraceRounds $script:WarpExitFailureResetRounds
+    $script:WarpExitLastObservedStreak = [int64]0
+    $didReset = $true
+  }
+  if ($startedAt -ne '') { $script:WarpExitStartedAt = $startedAt }
+
+  # 2) 新的真实 WARP 成功（last_success_at 变化/前进）：可用出口已出现，清零触发状态。
+  if ($lastSuccess -ne '' -and $script:WarpExitLastSuccessAt -ne '' -and $lastSuccess -ne $script:WarpExitLastSuccessAt) {
+    if (-not $didReset) {
+      Write-WdLog "WARP 出口失败触发：检测到新的 WARP 成功（last_success_at=$lastSuccess），清零连击基线与冷却" 'OK'
+    }
+    Reset-WarpExitTriggerState -ClearCooldown
+    $script:WarpExitLastObservedStreak = [int64]0
+    $didReset = $true
+  }
+  if ($lastSuccess -ne '') { $script:WarpExitLastSuccessAt = $lastSuccess }
+
+  # 3) 任何节点切换（含中继 failover）：以当前连击为新基线，避免旧连击立刻触发。
+  # 首次观察时若 LastSwitch 已不是 MinValue（例如首轮中继 failover 刚切过），也要
+  # 按“已观察到的切换”处理，否则同一进程里旧连击基线会被直接沿用。
+  $lastSwitch = $script:LastSwitch
+  $firstSwitchObservation = ($script:WarpExitLastSwitchSeen -eq $null)
+  $switchObserved = $false
+  if ($firstSwitchObservation) {
+    $switchObserved = ($lastSwitch -ne [DateTime]::MinValue)
+    $script:WarpExitLastSwitchSeen = $lastSwitch
+  } elseif ($lastSwitch -ne $script:WarpExitLastSwitchSeen) {
+    $switchObserved = $true
+    $script:WarpExitLastSwitchSeen = $lastSwitch
+  }
+  if ($switchObserved) {
+    if (-not $didReset) {
+      Write-WdLog "WARP 出口失败触发：检测到节点切换（$($lastSwitch.ToString('HH:mm:ss'))），以当前连击 $streak 为新基线" 'INFO'
+    }
+    Reset-WarpExitTriggerState -BaselineStreak $streak -ClearCooldown -GraceRounds $script:WarpExitFailureResetRounds
+    $script:WarpExitLastObservedStreak = $streak
+    $didReset = $true
+  }
+
+  # 主信号：failure_streak 上涨时打一条（同一数字不重复刷）。
+  $prevStreak = [int64]$script:WarpExitLastObservedStreak
+  if ($streak -gt $prevStreak -and $streak -gt 0) {
+    Write-WdLog "WARP 出口失败连击 $streak/$($script:WarpExitFailureThreshold)（kind=$kind，累计 $failuresTotal 次，创建失败 $createFailures 次）" 'WARN'
+  }
+  if ($streak -gt 0) {
+    # 主信号有数时不累计副信号，避免同一故障双重计数。
+    $script:WarpExitLocalStrikes = 0
+  }
+
+  # 副信号：failure_streak 缺失/为 0，但出口池持续 unavailable / active==0。
+  # 动作后的前 reset_rounds 轮与冷却期内不累计，给 WARP 重新注册留时间。
+  $unavailable = ($streak -le 0) -and (($warpStatus -eq 'unavailable') -or ($warpActive -le 0))
+  if ($unavailable) {
+    if ($now -lt $script:WarpExitCooldownUntil) {
+      $script:WarpExitLocalStrikes = 0
+      if ($script:WarpExitLocalGraceRounds -gt 0) { $script:WarpExitLocalGraceRounds-- }
+    } elseif ($script:WarpExitLocalGraceRounds -gt 0) {
+      $script:WarpExitLocalGraceRounds--
+      $script:WarpExitLocalStrikes = 0
+    } else {
+      $script:WarpExitLocalStrikes++
+      Write-WdLog "WARP 出口池连续不可用 $($script:WarpExitLocalStrikes)/$($script:WarpExitFailureThreshold) 轮（failure_streak=$streak，status=$warpStatus active=$warpActive）" 'WARN'
+    }
+  } else {
+    if ($script:WarpExitLocalStrikes -gt 0) {
+      Write-WdLog "WARP 出口池恢复可用（本地不可用计数 $($script:WarpExitLocalStrikes) 清零）" 'OK'
+    }
+    $script:WarpExitLocalStrikes = 0
+    if ($script:WarpExitLocalGraceRounds -gt 0) { $script:WarpExitLocalGraceRounds-- }
+  }
+
+  # 连击连续归零 reset_rounds 轮才清除动作基线；出口池不可用不算“恢复”。
+  if ($streak -le 0 -and -not $unavailable) {
+    if ($script:WarpExitBaselineStreak -gt 0) {
+      $script:WarpExitZeroRounds++
+      if ($script:WarpExitZeroRounds -ge $script:WarpExitFailureResetRounds) {
+        Write-WdLog "WARP 出口失败连击已连续归零 $($script:WarpExitZeroRounds) 轮，清除触发基线并重新布防" 'OK'
+        Reset-WarpExitTriggerState
+      }
+    } else {
+      $script:WarpExitZeroRounds = 0
+    }
+  } elseif ($streak -gt 0) {
+    $script:WarpExitZeroRounds = 0
+  }
+
+  $primaryTarget = [int64]$script:WarpExitBaselineStreak + [int64]$script:WarpExitFailureThreshold
+  $cause = ''
+  $causeDetail = ''
+  if ($streak -ge $primaryTarget) {
+    $cause = 'failure_streak'
+    $causeDetail = "failure_streak=$streak 达阈值 $primaryTarget（kind=$kind，累计 $failuresTotal 次，创建失败 $createFailures 次）"
+  } elseif ($script:WarpExitLocalStrikes -ge $script:WarpExitFailureThreshold) {
+    $cause = 'unavailable_rounds'
+    $causeDetail = "出口池连续不可用 $($script:WarpExitLocalStrikes) 轮达阈值 $($script:WarpExitFailureThreshold)（failure_streak=$streak，status=$warpStatus active=$warpActive）"
+  }
+  $script:WarpExitLastObservedStreak = $streak
+  if ($cause -eq '') {
+    $script:WarpExitWaitLoggedStreak = -1
+    return $res
+  }
+  if ($now -lt $script:WarpExitCooldownUntil) {
+    if ($script:WarpExitWaitLoggedStreak -ne $streak) {
+      $script:WarpExitWaitLoggedStreak = $streak
+      Write-WdLog "WARP 出口失败触发条件已满足（$causeDetail），但冷却中（$($script:WarpExitCooldownUntil.ToString('HH:mm:ss')) 后恢复），本轮不动作" 'WARN'
+    }
+    return $res
+  }
+  $lastSwitchGap = ($now - $script:LastSwitch).TotalSeconds
+  if ($script:LastSwitch -ne [DateTime]::MinValue -and $lastSwitchGap -lt [double]$script:SwitchGapSeconds) {
+    if ($script:WarpExitWaitLoggedStreak -ne $streak) {
+      $script:WarpExitWaitLoggedStreak = $streak
+      Write-WdLog "WARP 出口失败触发条件已满足（$causeDetail），但距上次切换不足 $($script:SwitchGapSeconds)s，本轮不动作" 'WARN'
+    }
+    return $res
+  }
+
+  Write-WdLog "WARP 出口失败触发：$causeDetail，action=$($script:WarpExitFailureAction)（cooldown $($script:WarpExitFailureCooldownMinutes) 分钟）" 'WARN'
+  $action = $script:WarpExitFailureAction
+  $refreshed = $false
+  if ($action -ne 'switch_only') {
+    $rr = $null
+    try { $rr = Refresh-Subscription -Uid $script:SubscriptionUid }
+    catch { $rr = @{ Ok = $false; Error = ('订阅刷新异常：' + (Mask-Text $_.Exception.Message)) } }
+    if ([bool](Get-Prop $rr 'Ok')) {
+      $refreshed = $true
+      Write-WdLog 'WARP 出口失败触发：订阅已刷新' 'OK'
+    } elseif (Get-Prop $rr 'Skipped') {
+      Write-WdLog "WARP 出口失败触发：跳过订阅刷新：$((Get-Prop $rr 'Error'))" 'INFO'
+    } elseif (Get-Prop $rr 'Throttled') {
+      Write-WdLog 'WARP 出口失败触发：订阅刷新被节流，继续' 'WARN'
+    } else {
+      Write-WdLog "WARP 出口失败触发：订阅刷新失败：$((Get-Prop $rr 'Error'))，继续" 'WARN'
+    }
+  }
+  $switched = $false
+  $switchedNode = ''
+  if ($action -ne 'refresh_only') {
+    try {
+      $sel = [uri]::EscapeDataString($script:Selector)
+      $detail = Invoke-ClashGet -Path "/proxies/$sel"
+      $original = [string](Get-Prop $detail 'now')
+      $rawAll = Get-Prop $detail 'all'
+      $all = @($rawAll | Where-Object { $_ -ne $null -and $_ -ne '' })
+      if (@($all).Count -eq 0) {
+        Write-WdLog "WARP 出口失败触发：Selector [$($script:Selector)] 无 all 列表，跳过切换" 'ERROR'
+      } else {
+        $map = Get-ProxyMap
+        $cands = Get-RankedCandidates -ProxyMap $map -SelectorAll $all -ExcludeNow $original -IgnoreQuotaPenalty
+        Write-WdLog "WARP 出口失败触发：候选池 $(@($cands).Count) 个（已忽略 legacy quota 降权），按排名尝试切换" 'INFO'
+        $switchSw = [System.Diagnostics.Stopwatch]::StartNew()
+        foreach ($c in @($cands | Select-Object -First $script:MaxCandidates)) {
+          if ($switchSw.Elapsed.TotalSeconds -ge $script:ProxyFailoverBudgetSeconds) {
+            Write-WdLog "WARP 出口失败触发：切换候选预算 $($script:ProxyFailoverBudgetSeconds)s 已耗尽，停止本轮切换" 'WARN'
+            break
+          }
+          try {
+            if (Switch-ClashNode -Name $c.Name -Uid $script:SubscriptionUid) {
+              $switched = $true
+              $switchedNode = $c.Name
+              break
+            }
+            Write-WdLog "WARP 出口失败触发：切换 [$($c.Name)] 返回失败，试下一个候选" 'WARN'
+          } catch {
+            Write-WdLog "WARP 出口失败触发：切换 [$($c.Name)] 异常：$(Mask-Text $_.Exception.Message)" 'WARN'
+          }
+        }
+      }
+    } catch {
+      Write-WdLog "WARP 出口失败触发：读取/切换候选失败：$(Mask-Text $_.Exception.Message)" 'ERROR'
+    }
+  }
+  if ($switched) {
+    $script:LastSwitch = Get-Date
+    $script:LastSeenNow = $switchedNode
+    $script:WarpExitLastSwitchSeen = $script:LastSwitch
+    Write-WdLog "WARP 出口失败触发：已切换到 [$switchedNode]" 'OK'
+    $reset = Invoke-GatewayWarpReset
+    if ([bool](Get-Prop $reset 'Ok')) {
+      $res.ResetSent = $true
+      Write-WdLog 'WARP 出口失败触发：已请求网关退役旧 WARP 出口（POST /v1/watchdog/warp/reset 2xx）' 'OK'
+    } elseif ([bool](Get-Prop $reset 'Unsupported')) {
+      Write-WdLog "WARP 出口失败触发：网关不支持出口重置端点（HTTP $((Get-Prop $reset 'Status'))，旧版本），跳过" 'INFO'
+    } else {
+      Write-WdLog "WARP 出口失败触发：出口重置失败（HTTP $((Get-Prop $reset 'Status'))）：$((Get-Prop $reset 'Error'))" 'WARN'
+    }
+  } elseif ($action -eq 'refresh_only') {
+    Write-WdLog 'WARP 出口失败触发：action=refresh_only，本轮只刷新订阅不切换' 'INFO'
+  } else {
+    Write-WdLog 'WARP 出口失败触发：本轮未切换节点（候选全部失败）' 'WARN'
+  }
+
+  # 动作后进入冷却并记录新基线：
+  #   - 切换成功：baseline=当前连击，旧故障需再涨 threshold 才重复触发；
+  #   - refresh_only 刷新成功：同样保留 baseline，给新出口 IP 一个机会；
+  #   - 切换失败 / refresh_only 未成功（节流/失败/本地跳过）：baseline=0，
+  #     冷却结束后同一 failure_streak 可重试，不会被旧基线卡住（verifier F1）。
+  if ($switched -or ($action -eq 'refresh_only' -and $refreshed)) {
+    $script:WarpExitBaselineStreak = [int64]$streak
+  } else {
+    $script:WarpExitBaselineStreak = [int64]0
+  }
+  $script:WarpExitZeroRounds = 0
+  $script:WarpExitWaitLoggedStreak = -1
+  $script:WarpExitLocalStrikes = 0
+  $script:WarpExitLocalGraceRounds = [int]$script:WarpExitFailureResetRounds
+  # 冷却从动作真正结束时起算：刷新/切换可能耗时几十秒，用动作前的 $now 会缩短冷却。
+  $script:WarpExitCooldownUntil = (Get-Date).AddMinutes([int]$script:WarpExitFailureCooldownMinutes)
+  $script:WarpExitLastObservedStreak = $streak
+  # refresh_only 刷新成功也算“动作了”（verifier F2）：-Once 能据此退出 0，不再显示为无动作。
+  $res.Acted = ($switched -or ($action -eq 'refresh_only' -and $refreshed))
+  $res.Switched = $switched
+  $res.Refreshed = $refreshed
+  $res.Cause = $cause
+  $res.Node = $switchedNode
+  return $res
+}
+
 function Invoke-WarpProxyIteration {
   # WARP proxy 状态机（design §6）。返回 @{Acted;ConfigError;ConfirmedDown}，供 -Once 固定退出码。
   param($Plan)
@@ -3404,6 +3959,26 @@ function Invoke-WarpProxyIteration {
       $script:WarpProxyLastLogAt = $now
     }
     $script:WarpProxyLastState = 'ok'
+    # WARP 出口失败触发只挂在中继检查通过的分支：中继失败路径完全不变。
+    # /healthz 只读、失败 60s 退避；触发器的 cooldown/baseline 与轮冷却无关。
+    if ($script:WarpExitFailureEnabled) {
+      try {
+        $hz = Get-GatewayHealthz
+        if (-not [bool](Get-Prop $hz 'Skipped')) {
+          $wr = Invoke-WarpExitFailureTrigger -Health $hz
+          $script:WarpExitTriggerErrSig = ''
+          if ([bool](Get-Prop $wr 'Acted')) {
+            return @{ Acted = $true; ConfigError = $false; ConfirmedDown = $false }
+          }
+        }
+      } catch {
+        $sig = 'warp-exit-trigger|' + [string]($_.Exception.Message)
+        if ($script:WarpExitTriggerErrSig -ne $sig) {
+          $script:WarpExitTriggerErrSig = $sig
+          Write-WdLog ('WARP 出口失败触发异常：' + (Shorten (Mask-Text $_.Exception.Message) 200)) 'WARN'
+        }
+      }
+    }
     return @{ Acted = $false; ConfigError = $false; ConfirmedDown = $false }
   }
   $failTxt = 'stage=' + $r.Stage + ' kind=' + $r.Kind + ' reason=' + (Shorten (Mask-Proxy (Mask-Text ([string]$r.Reason))) 200)
@@ -3779,6 +4354,21 @@ function Invoke-DryRun {
   } else {
     Write-WdLog 'proxy-check 未启用（legacy 巡检）'
   }
+  # WARP 出口失败触发预览：只读 /healthz，不刷新订阅、不切换、不写任何配置。
+  if ($script:WarpExitFailureEnabled) {
+    $hzDry = Get-GatewayHealthz -Force
+    if ([bool](Get-Prop $hzDry 'Ok')) {
+      if ([bool](Get-Prop $hzDry 'HasWarp')) {
+        Write-WdLog ("WARP 出口失败触发（DryRun 只读，不动作）：enabled=true threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction) healthz=$(Get-Prop $hzDry 'Status') status=$(Get-Prop $hzDry 'WarpStatus') active=$(Get-Prop $hzDry 'WarpActive') standby=$(Get-Prop $hzDry 'WarpStandby') cooling=$(Get-Prop $hzDry 'WarpCooling') failure_streak=$(Get-Prop $hzDry 'FailureStreak') failures_total=$(Get-Prop $hzDry 'FailuresTotal') create_failures=$(Get-Prop $hzDry 'CreateFailuresTotal') last_failure_kind=$(Get-Prop $hzDry 'LastFailureKind') started_at=$(Get-Prop $hzDry 'StartedAt') last_success_at=$(Get-Prop $hzDry 'LastSuccessAt')")
+      } else {
+        Write-WdLog 'WARP 出口失败触发（DryRun 只读）：/healthz 无 warp 段（WARP 未启用），不会触发'
+      }
+    } else {
+      Write-WdLog "WARP 出口失败触发（DryRun 只读）：/healthz 不可用（$(Get-Prop $hzDry 'Error')）"
+    }
+  } else {
+    Write-WdLog 'WARP 出口失败触发：enabled=false（不读 /healthz）'
+  }
   $wd = Get-WatchdogStatus
   $prox = Get-Prop $wd 'proxies'
   $anon = Get-Prop $wd 'anonymous'
@@ -3893,6 +4483,30 @@ $script:TransportStrikes = 0
 $script:OkStreak = 0
 $script:StreakStart = [DateTime]::MinValue
 $script:LastStaleProbe = [DateTime]::MinValue
+# WARP 出口失败触发状态（进程内存，重启清零）：
+#   StartedAt/LastSuccessAt  网关 /healthz 的 warp 字段，用于识别重启与真实成功
+#   LastSwitchSeen           $script:LastSwitch 的上次观察值（任何切换都清零基线）
+#   BaselineStreak           动作/切换后的连击基线，需再涨 threshold 才重复触发
+#   ZeroRounds               连击连续归零的轮数（达 reset_rounds 才清基线）
+#   LocalStrikes             副信号：failure_streak=0 但出口池持续不可用的连续轮数
+#   LocalGraceRounds         动作后的前 N 轮不累计副信号（等 WARP 重新注册）
+#   CooldownUntil            本触发器自己的冷却，不碰 RoundCooldownUntil
+#   HealthBackoffUntil        /healthz 失败后的 60s 退避
+$script:WarpExitStartedAt = ''
+$script:WarpExitLastSuccessAt = ''
+$script:WarpExitLastSwitchSeen = $null
+$script:WarpExitBaselineStreak = [int64]0
+$script:WarpExitZeroRounds = 0
+$script:WarpExitCooldownUntil = [DateTime]::MinValue
+$script:WarpExitLastObservedStreak = [int64]0
+$script:WarpExitLocalStrikes = 0
+$script:WarpExitLocalGraceRounds = 0
+$script:WarpExitWaitLoggedStreak = -1
+$script:WarpExitNoWarpLogged = $false
+$script:WarpExitHealthBackoffUntil = [DateTime]::MinValue
+$script:WarpExitHealthErrSig = ''
+$script:WarpExitHealthErrLogAt = [DateTime]::MinValue
+$script:WarpExitTriggerErrSig = ''
 
 try {
   # watchdog.json 只读且不依赖 Clash/网关：必须在实例互斥与所有 Resolve-* 之前读取，
@@ -3998,6 +4612,10 @@ try {
   $bannerPlan = Resolve-ProxyCheckPlan
   $bannerTarget = if ($bannerPlan.Endpoint -ne '') { Format-ProxyEndpoint -Url $bannerPlan.Endpoint } else { '(无)' }
   Write-WdLog "proxy-check 模式=$($bannerPlan.Mode) target=$bannerTarget source=$($bannerPlan.Source) 间隔=$($script:ProxyCheckIntervalSeconds)s 复检=$($script:ProxyCheckRecheckSeconds)s 超时=$($script:ProxyCheckTimeoutSeconds)s failover=$($script:ProxyCheckFailover) 预算=$($script:ProxyFailoverBudgetSeconds)s udp=$($script:ProxyCheckUdpTarget) require_udp=$($script:ProxyCheckRequireUdp)"
+  $wefBanner = if ($script:WarpExitFailureEnabled) {
+    "enabled threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction)"
+  } else { 'disabled' }
+  Write-WdLog "WARP 出口失败触发=$wefBanner（中继健康时只读 /healthz；副信号本地连续轮数仅常驻循环推进）"
   if ($DryRun) {
     Invoke-DryRun -Uid $script:SubscriptionUid
     exit 0
