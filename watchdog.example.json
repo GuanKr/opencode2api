@@ -50,6 +50,48 @@
     "penalty_ms": 500
   },
 
+  // ---- WARP proxy 检查（Phase 1，2026-10-26）----
+  // 背景：WARP 开启且 warp.proxy 指向本机 Clash 的 SOCKS5 入口时，看门狗改为检查
+  // 该 SOCKS5 中继（TCP CONNECT + UDP DNS 往返），不再用 /v1/watchdog/probe 判断。
+  // 注意：proxy 可用 ≠ WARP 可用；真实 egress 仍看 /healthz 的 warp_unavailable 与池日志。
+
+  // 模式：auto = warp.enabled 且有 warp.proxy 时进入 proxy-check；off = 完全 legacy
+  // （不读 config.json 的 warp 字段、不建 SOCKS5 连接）；force = warp.enabled=false
+  // 但 warp.proxy 有值时也检查。默认 auto，复制本文件不会改变现有行为。
+  "proxy_check_mode": "auto",
+
+  // WARP 模式检查间隔（5-300 秒）。健康路径按它轮询；失败路径还要多等 recheck。
+  "proxy_check_interval_seconds": 15,
+
+  // 首次失败后的复检等待（0-30 秒）；0 = 跳过复检，直接确认失败（仍受切换条件约束）。
+  // 失败轮的实际确认周期 ≈ interval + recheck（默认约 20s+）。
+  "proxy_check_recheck_seconds": 5,
+
+  // 单次完整检查（TCP + UDP）的总预算（3-30 秒），不是每步预算。
+  // TCP 每目标最多 2s（api.cloudflareclient.com:443 → cloudflare.com:443 → 1.1.1.1:443），
+  // UDP 每目标最多 3s（默认 1.1.1.1:53，失败回退 8.8.8.8:53）；剩余 <1s 不再启动新目标。
+  "proxy_check_timeout_seconds": 8,
+
+  // UDP DNS 检查目标（host:port 或 [IPv6]:port）。只证明 SOCKS5 UDP relay 能往返，
+  // 不证明到 WARP 外层端点 engage.cloudflareclient.com:2408 的 UDP 可用。
+  "proxy_check_udp_target": "1.1.1.1:53",
+
+  // 是否要求 UDP 也通过（默认 true）。某些节点允许 WARP UDP 但封 DNS 53，可设 false
+  // 降级为 TCP-only（此时 WARP 仍可能不可用）；也可换 proxy_check_udp_target。
+  "proxy_check_require_udp": true,
+
+  // 是否允许切 Clash 节点：auto（默认）只认「warp.proxy 是 loopback 且端口等于
+  // clash-verge.yaml 的 mixed-port/socks-port」这一正向证据；HTTP port 不算。
+  // 读不到 yaml / 端口不匹配 / 远端 SOCKS5 → 只监控并打日志，不切换。on 强制，off 只监控。
+  "proxy_check_failover": "auto",
+
+  // 切到候选后、验证前的等待（0-30 秒，等 Clash 收敛）。
+  "proxy_switch_gap_seconds": 2,
+
+  // 单轮 failover 总时间预算（30-600 秒）。超时停止候选循环并回滚，避免大候选池
+  // 每个候选都等 gap+检查把一轮拖到十几分钟；回滚后进入 round cooldown。
+  "proxy_failover_budget_seconds": 120,
+
   // transport 连续确认轮数（1-10，默认 2）：网关报 anonymous.verdict=transport 时，
   // 需连续 N 轮仍为 transport 才刷新/切换，单轮网络抖动只观察不动作。
   // 等价于命令行 -TransportConfirmRounds；两者同时存在时「命令行显式传参」优先。

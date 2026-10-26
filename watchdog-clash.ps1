@@ -247,6 +247,33 @@ param(
   # 为空时只靠 verge-mihomo 进程路径探测（找不到则跳过本地校验），不假设安装盘符。
   [string]$MihomoExe = '',
   [string]$LogPath = '',
+  # WARP proxy 检查（Phase 1）：auto = warp.enabled 且有 warp.proxy 时进入 proxy-check 模式；
+  # off = 完全 legacy（不读 config.json 的 warp 字段、不建 SOCKS5 连接）；force = 即使
+  # warp.enabled=false，只要 warp.proxy 有值也检查。命令行显式传参优先于 watchdog.json。
+  [ValidateSet('auto', 'off', 'force')][string]$ProxyCheckMode = 'auto',
+  # WARP 模式的检查间隔（秒）：健康路径按它轮询；失败路径还要多等 proxy_check_recheck_seconds。
+  [ValidateRange(5, 300)][int]$ProxyCheckIntervalSeconds = 15,
+  # 第一次检查失败后的复检等待（秒）；0 = 跳过复检，直接确认失败（仍要等切换条件）。
+  [ValidateRange(0, 30)][int]$ProxyCheckRecheckSeconds = 5,
+  # 单次完整检查（TCP + UDP）的总预算（秒）；不是每步预算。
+  [ValidateRange(3, 30)][int]$ProxyCheckTimeoutSeconds = 8,
+  # UDP DNS 检查目标（host:port / [v6]:port）；失败后自动回退 8.8.8.8:53。
+  [string]$ProxyCheckUdpTarget = '1.1.1.1:53',
+  # 是否要求 UDP 检查也通过；false = 只测 TCP（WARP 可能仍不可用，属降级观察）。
+  [bool]$ProxyCheckRequireUdp = $true,
+  # 是否允许切 Clash 节点：auto 只在本机 Clash 的 mixed-port/socks-port 有正向证据时切；
+  # on 强制；off 只监控。详见 watchdog-warp-proxy-design.md §7.1。
+  [ValidateSet('auto', 'on', 'off')][string]$ProxyCheckFailover = 'auto',
+  # 切到候选后、验证前等待的秒数（等 Clash 收敛）。
+  [ValidateRange(0, 30)][int]$ProxySwitchGapSeconds = 2,
+  # 单轮 WARP failover 的总时间预算（秒）；超时停止候选循环并回滚，避免 120 候选择磨死。
+  [ValidateRange(30, 600)][int]$ProxyFailoverBudgetSeconds = 120,
+  # 诊断专用：覆盖 config.json 的 warp.proxy；只在 -ProxyCheckProbeOnly / -DryRun 下生效，
+  # 正常常驻循环忽略并 WARN（防止误把诊断目标当成生产切换依据）。
+  [string]$ProxyCheckEndpoint = '',
+  # 独立诊断入口：只做一次 proxy 检查、打印结果并按 0/1/2 退出；早于实例互斥与所有 Resolve-*，
+  # 因此网关看门狗常驻运行时也能执行。不切换、不写配置/状态文件（运行日志除外）。
+  [switch]$ProxyCheckProbeOnly,
   [switch]$DryRun,
   [switch]$Once
 )
@@ -300,6 +327,31 @@ $script:DeprioritizePenaltyMs = $DeprioritizePenaltyMs
 $script:TransportConfirmRounds = $TransportConfirmRounds
 $script:LogPath = $LogPath
 $script:VergeRoot = Join-Path $env:APPDATA 'io.github.clash-verge-rev.clash-verge-rev'
+# WARP proxy 检查（Phase 1）。param 绑定值起步，watchdog.json 可覆盖（命令行显式传参优先）。
+$script:ProxyCheckMode = $ProxyCheckMode
+$script:ProxyCheckIntervalSeconds = $ProxyCheckIntervalSeconds
+$script:ProxyCheckRecheckSeconds = $ProxyCheckRecheckSeconds
+$script:ProxyCheckTimeoutSeconds = $ProxyCheckTimeoutSeconds
+$script:ProxyCheckUdpTarget = $ProxyCheckUdpTarget
+$script:ProxyCheckRequireUdp = $ProxyCheckRequireUdp
+$script:ProxyCheckFailover = $ProxyCheckFailover
+$script:ProxySwitchGapSeconds = $ProxySwitchGapSeconds
+$script:ProxyFailoverBudgetSeconds = $ProxyFailoverBudgetSeconds
+$script:ProxyCheckEndpoint = $ProxyCheckEndpoint
+# 运行状态：主循环按 WarpProxyActive 选择 sleep 间隔；LastState/LastLogAt 做心跳与状态切换
+# 去重；ConfigErrSig 让同一配置错误只打一次；DirectWarned 让直连 WARP 告警只打一次。
+$script:WarpProxyActive = $false
+$script:WarpProxyLastMode = ''
+$script:WarpProxyLastState = ''
+$script:WarpProxyLastLogAt = [DateTime]::MinValue
+$script:WarpProxyConfigErrSig = ''
+$script:WarpDirectWarned = $false
+$script:ProxyCheckEndpointWarned = $false
+$script:WarpFailoverOnWarned = $false
+# config.json 的 warp 设置缓存（mtime + length）与最近一份成功解析的设置：
+# 解析失败时保留旧值并只告警一次；从未成功过才退回 legacy。
+$script:GatewayWarpCache = $null
+$script:GatewayWarpLastGood = $null
 
 $script:ExcludeExact = @('自动选择', '故障转移', 'DIRECT', 'COMPATIBLE', 'GLOBAL', 'PASS', 'REJECT', 'REJECT-DROP', 'PASS-RULE',
   # 以下两个是红框内的信息占位节点（与真实节点同服同口，靠名字区分），必须精确排除：
@@ -384,10 +436,1024 @@ function Shorten {
 }
 
 function Mask-Text {
-  # 异常文本可能原样包含请求 URI（含订阅 token）：记日志前先抹掉 http(s) URL。
+  # 异常文本可能原样包含请求 URI（含订阅 token / SOCKS5 userinfo）：记日志前先抹掉 URL。
+  # 2026-10-26 起 URL 正则扩展到 socks5/socks5h（warp.proxy 异常文本可能带 userinfo）。
   param([string]$Text)
   if ([string]::IsNullOrEmpty($Text)) { return '' }
-  return ([regex]::Replace($Text, 'https?://\S+', '(url已脱敏)'))
+  return ([regex]::Replace($Text, '(?i)(?:https?|socks5h?)://\S+', '(url已脱敏)'))
+}
+
+function Mask-Proxy {
+  # 代理相关异常文本专用：只保留非 URL 文本，URL（可能含 userinfo/路径 token）整体替换。
+  param([string]$Text)
+  if ([string]::IsNullOrEmpty($Text)) { return '' }
+  return ([regex]::Replace($Text, '(?i)\bsocks5h?://\S+', '(proxy已脱敏)'))
+}
+
+# ==== WARP proxy 检查（Phase 1）辅助函数 =====================================
+# 设计依据：watchdog-warp-proxy-design.md §5/§8。检查只证明 SOCKS5 中继的 TCP 可达与
+# UDP DNS 往返，不证明 WARP 注册/外层 UDP 2408/egress 可用；后者仍看 /healthz 与池日志。
+
+function Get-RemainingMs {
+  param([datetime]$Deadline)
+  return [int][Math]::Floor(($Deadline - (Get-Date)).TotalMilliseconds)
+}
+
+function Test-HostPortTarget {
+  # 解析无 scheme 的 host:port（UDP DNS 目标 / SOCKS5 目标用）。支持域名、IPv4、[IPv6]。
+  # 严格拒绝 scheme、userinfo、path/query/fragment、空白与非法端口。
+  param([string]$Text)
+  $res = @{ Ok = $false; Host = ''; Port = 0; Kind = ''; Error = '' }
+  if ([string]::IsNullOrWhiteSpace($Text)) { $res.Error = '目标为空'; return $res }
+  $t = $Text.Trim()
+  if ($t -match '\s') { $res.Error = '目标含空白'; return $res }
+  if ($t -match '^[A-Za-z][A-Za-z0-9+.-]*://') { $res.Error = '目标不能带 scheme'; return $res }
+  if ($t.Contains('@') -or $t.Contains('/') -or $t.Contains('?') -or $t.Contains('#')) {
+    $res.Error = '目标不能带 userinfo/path/query/fragment'; return $res
+  }
+  $hostPart = ''
+  $portPart = ''
+  if ($t.StartsWith('[')) {
+    if ($t -notmatch '^\[([^\]]+)\]:(\d+)$') { $res.Error = 'IPv6 目标格式应为 [v6]:port'; return $res }
+    $hostPart = $Matches[1]
+    $portPart = $Matches[2]
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($hostPart, [ref]$ip) -or
+      $ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+      $res.Error = '方括号内不是合法 IPv6 地址'; return $res
+    }
+    $res.Kind = 'ipv6'
+  } else {
+    if ($t -notmatch '^([^:]+):(\d+)$') { $res.Error = '目标格式应为 host:port'; return $res }
+    $hostPart = $Matches[1]
+    $portPart = $Matches[2]
+    if ($hostPart.Contains(':')) { $res.Error = 'IPv6 目标必须写成 [v6]:port'; return $res }
+    $ip = $null
+    if ([System.Net.IPAddress]::TryParse($hostPart, [ref]$ip)) {
+      if ($ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        $res.Error = '地址族不受支持'; return $res
+      }
+      $res.Kind = 'ipv4'
+    } else {
+      if ($hostPart -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$') { $res.Error = '域名非法'; return $res }
+      $res.Kind = 'domain'
+    }
+  }
+  $n = 0
+  if (-not [int]::TryParse($portPart, [ref]$n) -or $n -lt 1 -or $n -gt 65535) {
+    $res.Error = '端口必须是 1-65535'; return $res
+  }
+  $res.Ok = $true
+  $res.Host = $hostPart
+  $res.Port = $n
+  return $res
+}
+
+function Test-ProxyEndpointFormat {
+  # warp.proxy 格式校验：只收 socks5/socks5h://host:port（域名/IPv4/[IPv6]）。
+  # 拒绝 http(s)、userinfo、缺端口、path/query/fragment、非法端口。返回值里的 Host 不带方括号。
+  param([string]$Url)
+  $res = @{ Ok = $false; Scheme = ''; Host = ''; Port = 0; Kind = ''; IsLoopback = $false; Error = '' }
+  if ([string]::IsNullOrWhiteSpace($Url)) { $res.Error = '代理地址为空'; return $res }
+  $raw = $Url.Trim()
+  if ($raw -match '\s') { $res.Error = '代理地址含空白'; return $res }
+  if ($raw -notmatch '^(?i:socks5h?)://') {
+    if ($raw -match '^(?i)https?://') { $res.Error = '只支持 socks5 / socks5h scheme（http(s) 无法承载 UDP）' }
+    else { $res.Error = 'scheme 必须是 socks5 或 socks5h' }
+    return $res
+  }
+  # 设计 §5.1：只允许裸 scheme://host:port。Uri 会把无 path 的 URL 规范化成 "/"，
+  # 无法区分 "host:port" 与 "host:port/"，所以对 scheme 之后的原始文本再查一次。
+  $afterScheme = $raw.Substring($raw.IndexOf('://') + 3)
+  if ($afterScheme.Contains('/') -or $afterScheme.Contains('?') -or $afterScheme.Contains('#')) {
+    $res.Error = '不允许 path/query/fragment'; return $res
+  }
+  try { $u = [uri]$raw } catch { $res.Error = 'URL 解析失败'; return $res }
+  if (@('socks5', 'socks5h') -notcontains ([string]$u.Scheme).ToLowerInvariant()) {
+    $res.Error = 'scheme 必须是 socks5 或 socks5h'; return $res
+  }
+  if (-not [string]::IsNullOrEmpty($u.UserInfo)) { $res.Error = '不支持 userinfo（socks5Bind 只支持 no-auth）'; return $res }
+  if ($u.Query -ne '' -or $u.Fragment -ne '') { $res.Error = '不允许 path/query/fragment'; return $res }
+  if ($u.AbsolutePath -ne '' -and $u.AbsolutePath -ne '/') { $res.Error = '不允许 path/query/fragment'; return $res }
+  if ($u.IsDefaultPort -or $u.Port -lt 1 -or $u.Port -gt 65535) { $res.Error = '端口缺失或非法（应为 1-65535）'; return $res }
+  $h = [string]$u.DnsSafeHost
+  if ([string]::IsNullOrWhiteSpace($h)) { $res.Error = '主机为空'; return $res }
+  $ip = $null
+  if ([System.Net.IPAddress]::TryParse($h, [ref]$ip)) {
+    if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+      $res.Kind = 'ipv4'
+      $b = $ip.GetAddressBytes()
+      $res.IsLoopback = ($b[0] -eq 127)
+    } elseif ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+      $res.Kind = 'ipv6'
+      $res.IsLoopback = $ip.Equals([System.Net.IPAddress]::IPv6Loopback)
+    } else {
+      $res.Error = '地址族不受支持'; return $res
+    }
+  } else {
+    $res.Kind = 'domain'
+    $res.IsLoopback = ($h -ieq 'localhost')
+  }
+  $res.Ok = $true
+  $res.Scheme = ([string]$u.Scheme).ToLowerInvariant()
+  $res.Host = $h
+  $res.Port = [int]$u.Port
+  return $res
+}
+
+function Format-ProxyEndpoint {
+  # 日志统一输出 scheme://host:port（IPv6 保留方括号）；绝不输出 userinfo/path/query。
+  param([string]$Url)
+  $f = Test-ProxyEndpointFormat -Url $Url
+  if (-not $f.Ok) { return '(无效代理地址)' }
+  $hostTxt = if ($f.Kind -eq 'ipv6') { '[' + $f.Host + ']' } else { $f.Host }
+  return ($f.Scheme + '://' + $hostTxt + ':' + $f.Port)
+}
+
+function Resolve-Socks5Host {
+  # 有界域名解析：IP 字面量直接返回；域名用 GetHostAddressesAsync().Wait(remaining)。
+  # 超时只放弃本次检查，后台任务可能继续但不会阻塞调用方（设计 §5.5）。
+  param([string]$HostName, [int]$TimeoutMs)
+  $res = @{ Ok = $false; IP = $null; Error = '' }
+  if ([string]::IsNullOrWhiteSpace($HostName)) { $res.Error = '主机为空'; return $res }
+  $ip = $null
+  if ([System.Net.IPAddress]::TryParse($HostName, [ref]$ip)) { $res.Ok = $true; $res.IP = $ip; return $res }
+  if ($TimeoutMs -lt 1) { $res.Error = '域名解析预算耗尽'; return $res }
+  try {
+    $task = [System.Net.Dns]::GetHostAddressesAsync($HostName)
+    if (-not $task.Wait($TimeoutMs)) { $res.Error = '域名解析超时'; return $res }
+    $ips = @($task.Result)
+    if (@($ips).Count -eq 0) { $res.Error = '域名无解析结果'; return $res }
+    $v4 = @($ips | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork })
+    $pick = if (@($v4).Count -gt 0) { $v4[0] } else { $ips[0] }
+    $res.Ok = $true
+    $res.IP = $pick
+  } catch {
+    $res.Error = '域名解析失败'
+  }
+  return $res
+}
+
+function Read-Socks5Exact {
+  # 按绝对 deadline 读满 N 字节；每次 Read 前重算剩余，<=0 立即失败。
+  # 不能只在进入函数时设一次 ReadTimeout：对方逐字节慢发时每次 Read 都会重置超时。
+  param($Stream, [int]$Count, [int]$TimeoutMs)
+  if ($TimeoutMs -lt 1 -or $Count -lt 1) { return $null }
+  $deadline = (Get-Date).AddMilliseconds([Math]::Max(1, $TimeoutMs))
+  $buf = New-Object byte[] $Count
+  $off = 0
+  while ($off -lt $Count) {
+    $rem = Get-RemainingMs $deadline
+    if ($rem -lt 1) { return $null }
+    try { $Stream.ReadTimeout = $rem } catch { return $null }
+    try { $n = $Stream.Read($buf, $off, $Count - $off) } catch { return $null }
+    if ($n -le 0) { return $null }
+    $off += $n
+  }
+  return , $buf
+}
+
+function Write-Socks5Bytes {
+  param($Stream, [byte[]]$Bytes, [int]$TimeoutMs)
+  if ($TimeoutMs -lt 1) { return $false }
+  try {
+    $Stream.WriteTimeout = $TimeoutMs
+    $Stream.Write($Bytes, 0, $Bytes.Length)
+    $Stream.Flush()
+    return $true
+  } catch { return $false }
+}
+
+function Connect-Socks5Control {
+  # 建立 SOCKS5 TCP 控制连接并完成 no-auth greeting。05 FF = config（换节点无解）。
+  # 成功时把 Client/Stream 交给调用方释放；失败在函数内释放。
+  param($Endpoint, [int]$TimeoutMs)
+  $start = Get-Date
+  $deadline = $start.AddMilliseconds([Math]::Max(1, $TimeoutMs))
+  $res = @{ Ok = $false; Client = $null; Stream = $null; Class = 'unavailable'; Kind = 'unreachable';
+    Stage = 'tcp_connect'; Reason = ''; RemoteIP = $null; DurationMs = 0 }
+  if ($Endpoint -eq $null -or -not $Endpoint.Ok) {
+    $res.Class = 'config'; $res.Kind = 'format'; $res.Stage = 'format'
+    $res.Reason = if ($Endpoint -ne $null -and $Endpoint.Error -ne '') { [string]$Endpoint.Error } else { '代理地址非法' }
+    return $res
+  }
+  $client = $null
+  $stream = $null
+  try {
+    $resolved = Resolve-Socks5Host -HostName $Endpoint.Host -TimeoutMs (Get-RemainingMs $deadline)
+    if (-not $resolved.Ok) {
+      $res.Kind = 'timeout'; $res.Reason = [string]$resolved.Error; return $res
+    }
+    $rem = Get-RemainingMs $deadline
+    if ($rem -lt 1) { $res.Kind = 'timeout'; $res.Reason = '连接预算耗尽'; return $res }
+    $client = [System.Net.Sockets.TcpClient]::new($resolved.IP.AddressFamily)
+    $iar = $client.BeginConnect($resolved.IP, [int]$Endpoint.Port, $null, $null)
+    if (-not $iar.AsyncWaitHandle.WaitOne($rem)) {
+      $res.Kind = 'timeout'; $res.Reason = '连接 SOCKS5 入口超时'; return $res
+    }
+    try { $client.EndConnect($iar) } catch { $res.Kind = 'unreachable'; $res.Reason = '连接 SOCKS5 入口失败'; return $res }
+    $client.NoDelay = $true
+    $stream = $client.GetStream()
+    try { $res.RemoteIP = $client.Client.RemoteEndPoint.Address } catch { $res.RemoteIP = $null }
+    $rem = Get-RemainingMs $deadline
+    if (-not (Write-Socks5Bytes -Stream $stream -Bytes ([byte[]]@(5, 1, 0)) -TimeoutMs $rem)) {
+      $res.Stage = 'socks5_greeting'; $res.Kind = 'timeout'; $res.Reason = '发送 SOCKS5 greeting 超时'; return $res
+    }
+    $gr = Read-Socks5Exact -Stream $stream -Count 2 -TimeoutMs (Get-RemainingMs $deadline)
+    if ($null -eq $gr) {
+      $res.Stage = 'socks5_greeting'; $res.Kind = 'timeout'; $res.Reason = '等待 SOCKS5 greeting 回复超时'; return $res
+    }
+    if ($gr[0] -ne 5) {
+      $res.Stage = 'socks5_greeting'; $res.Kind = 'protocol'; $res.Reason = 'SOCKS5 版本异常'; return $res
+    }
+    if ($gr[1] -eq 0xFF) {
+      $res.Class = 'config'; $res.Kind = 'format'; $res.Stage = 'socks5_greeting'
+      $res.Reason = 'SOCKS5 入口要求认证（05 FF），换 Clash 节点无效'; return $res
+    }
+    if ($gr[1] -ne 0) {
+      $res.Stage = 'socks5_greeting'; $res.Kind = 'protocol'
+      $res.Reason = ('SOCKS5 不接受 no-auth（方法 0x{0:X2}）' -f $gr[1]); return $res
+    }
+    $res.Ok = $true
+    $res.Class = 'ok'
+    $res.Kind = 'ok'
+    $res.Client = $client
+    $res.Stream = $stream
+    return $res
+  } catch {
+    $res.Kind = 'unreachable'
+    $res.Reason = 'TCP 检查异常：' + (Mask-Proxy (Mask-Text $_.Exception.Message))
+    return $res
+  } finally {
+    if (-not $res.Ok) {
+      if ($stream -ne $null) { try { $stream.Dispose() } catch { } }
+      if ($client -ne $null) { try { $client.Dispose() } catch { } }
+      $res.Client = $null
+      $res.Stream = $null
+    }
+    $res.DurationMs = [int]((Get-Date) - $start).TotalMilliseconds
+  }
+}
+
+function New-Socks5ConnectRequest {
+  # 构造 SOCKS5 CONNECT 请求；按目标类型用 ATYP 0x01/0x03/0x04。
+  param($Target)
+  $ms = [System.IO.MemoryStream]::new()
+  $ms.WriteByte(5); $ms.WriteByte(1); $ms.WriteByte(0)
+  switch ($Target.Kind) {
+    'ipv4' {
+      $ms.WriteByte(1)
+      $b = ([System.Net.IPAddress]::Parse($Target.Host)).GetAddressBytes()
+      $ms.Write($b, 0, $b.Length)
+    }
+    'ipv6' {
+      $ms.WriteByte(4)
+      $b = ([System.Net.IPAddress]::Parse($Target.Host)).GetAddressBytes()
+      $ms.Write($b, 0, $b.Length)
+    }
+    'domain' {
+      $ms.WriteByte(3)
+      $nb = [System.Text.Encoding]::ASCII.GetBytes([string]$Target.Host)
+      $ms.WriteByte([byte]$nb.Length)
+      $ms.Write($nb, 0, $nb.Length)
+    }
+    default { throw '不支持的目标类型' }
+  }
+  $p = [BitConverter]::GetBytes([uint16]$Target.Port)
+  if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($p) }
+  $ms.Write($p, 0, 2)
+  $out = $ms.ToArray()
+  $ms.Dispose()
+  return , $out
+}
+
+function Read-Socks5BoundAddress {
+  # 读 UDP ASSOCIATE 回复中的 BND.ADDR/BND.PORT（ATYP 0x01/0x03/0x04 显式解析）。
+  # 使用绝对 Deadline：ATYP=3 先读长度再读域名，多段读取不得各自重置超时预算。
+  param($Stream, [int]$Atyp, [datetime]$Deadline)
+  $res = @{ Ok = $false; Address = ''; Port = 0; Kind = ''; Error = ''; ErrorKind = '' }
+  switch ($Atyp) {
+    1 {
+      $rem = Get-RemainingMs $Deadline
+      if ($rem -lt 1) { $res.Error = '读取 BND.ADDR 超时'; $res.ErrorKind = 'timeout'; return $res }
+      $b = Read-Socks5Exact -Stream $Stream -Count 6 -TimeoutMs $rem
+      if ($null -eq $b) { $res.Error = '读取 BND.ADDR 超时'; $res.ErrorKind = 'timeout'; return $res }
+      $res.Address = ([System.Net.IPAddress]::new([byte[]]@($b[0], $b[1], $b[2], $b[3]))).ToString()
+      $res.Port = ([int]$b[4] -shl 8) -bor [int]$b[5]
+      $res.Kind = 'ipv4'
+    }
+    4 {
+      $rem = Get-RemainingMs $Deadline
+      if ($rem -lt 1) { $res.Error = '读取 BND.ADDR 超时'; $res.ErrorKind = 'timeout'; return $res }
+      $b = Read-Socks5Exact -Stream $Stream -Count 18 -TimeoutMs $rem
+      if ($null -eq $b) { $res.Error = '读取 BND.ADDR 超时'; $res.ErrorKind = 'timeout'; return $res }
+      $ab = New-Object byte[] 16
+      [Array]::Copy($b, 0, $ab, 0, 16)
+      $res.Address = ([System.Net.IPAddress]::new($ab)).ToString()
+      $res.Port = ([int]$b[16] -shl 8) -bor [int]$b[17]
+      $res.Kind = 'ipv6'
+    }
+    3 {
+      $rem = Get-RemainingMs $Deadline
+      if ($rem -lt 1) { $res.Error = '读取 BND.ADDR 长度超时'; $res.ErrorKind = 'timeout'; return $res }
+      $lb = Read-Socks5Exact -Stream $Stream -Count 1 -TimeoutMs $rem
+      if ($null -eq $lb) { $res.Error = '读取 BND.ADDR 长度超时'; $res.ErrorKind = 'timeout'; return $res }
+      $len = [int]$lb[0]
+      if ($len -lt 1) { $res.Error = 'BND.ADDR 域名长度为 0'; $res.ErrorKind = 'protocol'; return $res }
+      $rem = Get-RemainingMs $Deadline
+      if ($rem -lt 1) { $res.Error = '读取 BND.ADDR 超时'; $res.ErrorKind = 'timeout'; return $res }
+      $b = Read-Socks5Exact -Stream $Stream -Count ($len + 2) -TimeoutMs $rem
+      if ($null -eq $b) { $res.Error = '读取 BND.ADDR 超时'; $res.ErrorKind = 'timeout'; return $res }
+      $res.Address = [System.Text.Encoding]::ASCII.GetString($b, 0, $len)
+      $res.Port = ([int]$b[$len] -shl 8) -bor [int]$b[$len + 1]
+      $res.Kind = 'domain'
+    }
+    default { $res.Error = 'BND.ATYP 不受支持'; $res.ErrorKind = 'protocol'; return $res }
+  }
+  if ($res.Port -lt 1 -or $res.Port -gt 65535) { $res.Error = 'BND.PORT 为 0 或非法'; $res.ErrorKind = 'protocol'; return $res }
+  $res.Ok = $true
+  return $res
+}
+
+function New-Socks5UdpPacket {
+  # 构造 SOCKS5 UDP 数据报：RSV=0000、FRAG=00、DST.ADDR/PORT、payload。
+  param($Target, [byte[]]$Payload)
+  $ms = [System.IO.MemoryStream]::new()
+  $ms.WriteByte(0); $ms.WriteByte(0); $ms.WriteByte(0)
+  switch ($Target.Kind) {
+    'ipv4' {
+      $ms.WriteByte(1)
+      $b = ([System.Net.IPAddress]::Parse($Target.Host)).GetAddressBytes()
+      $ms.Write($b, 0, $b.Length)
+    }
+    'ipv6' {
+      $ms.WriteByte(4)
+      $b = ([System.Net.IPAddress]::Parse($Target.Host)).GetAddressBytes()
+      $ms.Write($b, 0, $b.Length)
+    }
+    'domain' {
+      $ms.WriteByte(3)
+      $nb = [System.Text.Encoding]::ASCII.GetBytes([string]$Target.Host)
+      $ms.WriteByte([byte]$nb.Length)
+      $ms.Write($nb, 0, $nb.Length)
+    }
+    default { throw '不支持的目标类型' }
+  }
+  $p = [BitConverter]::GetBytes([uint16]$Target.Port)
+  if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($p) }
+  $ms.Write($p, 0, 2)
+  $ms.Write($Payload, 0, $Payload.Length)
+  $out = $ms.ToArray()
+  $ms.Dispose()
+  return , $out
+}
+
+function New-DnsQueryPayload {
+  # 标准 DNS A 查询（随机 TXID + example.com）。只用于证明 UDP 往返，不解析内容、不写日志。
+  param([int]$TxId)
+  $ms = [System.IO.MemoryStream]::new()
+  $ms.WriteByte([byte](($TxId -shr 8) -band 0xFF))
+  $ms.WriteByte([byte]($TxId -band 0xFF))
+  foreach ($b in @(1, 0, 0, 1, 0, 0, 0, 0, 0, 0)) { $ms.WriteByte([byte]$b) }
+  foreach ($label in @('example', 'com')) {
+    $nb = [System.Text.Encoding]::ASCII.GetBytes($label)
+    $ms.WriteByte([byte]$nb.Length)
+    $ms.Write($nb, 0, $nb.Length)
+  }
+  $ms.WriteByte(0)
+  foreach ($b in @(0, 1, 0, 1)) { $ms.WriteByte([byte]$b) }
+  $out = $ms.ToArray()
+  $ms.Dispose()
+  return , $out
+}
+
+function Test-Socks5TcpConnect {
+  # TCP CONNECT 检查：目标顺序由调用方给出；每个目标新建控制连接，最多 min(2s, remaining)。
+  # 只证明 TCP 可达，不证明 TLS/HTTP/注册成功。
+  param(
+    [string]$ProxyUrl,
+    [int]$TimeoutMs = 8000,
+    [string[]]$Targets = @('api.cloudflareclient.com:443', 'cloudflare.com:443', '1.1.1.1:443')
+  )
+  $start = Get-Date
+  $res = @{ Ok = $false; Class = 'unavailable'; Stage = 'tcp_connect'; Kind = 'unreachable'; Reason = ''; TcpMs = 0; DurationMs = 0 }
+  $f = Test-ProxyEndpointFormat -Url $ProxyUrl
+  if (-not $f.Ok) {
+    $res.Class = 'config'; $res.Kind = 'format'; $res.Stage = 'format'; $res.Reason = $f.Error
+    $res.DurationMs = [int]((Get-Date) - $start).TotalMilliseconds
+    return $res
+  }
+  $deadline = $start.AddMilliseconds([Math]::Max(1000, $TimeoutMs))
+  $lastReason = ''
+  $lastStage = 'tcp_connect'
+  $lastKind = 'unreachable'
+  foreach ($targetText in $Targets) {
+    $rem = Get-RemainingMs $deadline
+    if ($rem -lt 1000) {
+      $lastReason = if ($lastReason -eq '') { 'TCP 检查总预算耗尽' } else { $lastReason + '（TCP 检查总预算耗尽）' }
+      $lastStage = 'tcp_connect'
+      $lastKind = 'timeout'
+      break
+    }
+    $target = Test-HostPortTarget -Text $targetText
+    if (-not $target.Ok) { $lastReason = "内置 TCP 目标非法：$($target.Error)"; continue }
+    $per = [Math]::Min(2000, $rem)
+    $targetDeadline = (Get-Date).AddMilliseconds($per)
+    $conn = Connect-Socks5Control -Endpoint $f -TimeoutMs $per
+    if ($conn.Class -eq 'config') {
+      $res.Class = 'config'; $res.Kind = $conn.Kind; $res.Stage = $conn.Stage; $res.Reason = $conn.Reason
+      $res.DurationMs = [int]((Get-Date) - $start).TotalMilliseconds
+      $res.TcpMs = $res.DurationMs
+      return $res
+    }
+    if (-not $conn.Ok) {
+      $lastReason = "连接 SOCKS5 入口失败：$($conn.Reason)"
+      $lastStage = $conn.Stage
+      $lastKind = $conn.Kind
+      continue
+    }
+    try {
+      $req = New-Socks5ConnectRequest -Target $target
+      $wrem = [Math]::Min((Get-RemainingMs $targetDeadline), (Get-RemainingMs $deadline))
+      if (-not (Write-Socks5Bytes -Stream $conn.Stream -Bytes $req -TimeoutMs $wrem)) {
+        $lastReason = "CONNECT $targetText 发送超时"
+        $lastStage = 'tcp_connect_reply'; $lastKind = 'timeout'
+        continue
+      }
+      $rrem = [Math]::Min((Get-RemainingMs $targetDeadline), (Get-RemainingMs $deadline))
+      $cr = Read-Socks5Exact -Stream $conn.Stream -Count 4 -TimeoutMs $rrem
+      if ($null -eq $cr) {
+        $lastReason = "CONNECT $targetText 等待回复超时"
+        $lastStage = 'tcp_connect_reply'; $lastKind = 'timeout'
+        continue
+      }
+      if ($cr[0] -ne 5) {
+        $lastReason = "CONNECT $targetText 回复版本异常"
+        $lastStage = 'tcp_connect_reply'; $lastKind = 'protocol'
+        continue
+      }
+      if ($cr[1] -eq 0) {
+        $res.Ok = $true; $res.Class = 'ok'; $res.Kind = 'ok'; $res.Stage = 'tcp_connect_reply'
+        $res.Reason = "TCP CONNECT $targetText ok"
+        $res.DurationMs = [int]((Get-Date) - $start).TotalMilliseconds
+        $res.TcpMs = $res.DurationMs
+        return $res
+      }
+      $lastReason = ('CONNECT {0} 被拒（REP=0x{1:X2}）' -f $targetText, $cr[1])
+      $lastStage = 'tcp_connect_reply'; $lastKind = 'unreachable'
+    } finally {
+      if ($conn.Stream -ne $null) { try { $conn.Stream.Dispose() } catch { } }
+      if ($conn.Client -ne $null) { try { $conn.Client.Dispose() } catch { } }
+    }
+  }
+  $res.Stage = $lastStage
+  $res.Kind = $lastKind
+  $res.Reason = if ($lastReason -ne '') { $lastReason } else { '所有 TCP 目标均失败' }
+  $res.DurationMs = [int]((Get-Date) - $start).TotalMilliseconds
+  $res.TcpMs = $res.DurationMs
+  return $res
+}
+
+function Test-Socks5UdpDns {
+  # UDP ASSOCIATE + DNS 往返。只证明 SOCKS5 UDP relay；不证明 WARP 外层 UDP 2408 可用。
+  param([string]$ProxyUrl, [string]$Target, [int]$TimeoutMs = 3000)
+  $start = Get-Date
+  $res = @{ Ok = $false; Class = 'unavailable'; Stage = 'udp_associate'; Kind = 'unreachable';
+    Reason = ''; UdpMs = 0; UdpTarget = $Target; DurationMs = 0 }
+  $f = Test-ProxyEndpointFormat -Url $ProxyUrl
+  if (-not $f.Ok) {
+    $res.Class = 'config'; $res.Kind = 'format'; $res.Stage = 'format'; $res.Reason = $f.Error
+    $res.DurationMs = [int]((Get-Date) - $start).TotalMilliseconds
+    return $res
+  }
+  $tgt = Test-HostPortTarget -Text $Target
+  if (-not $tgt.Ok) {
+    $res.Class = 'config'; $res.Kind = 'format'; $res.Stage = 'format'
+    $res.Reason = 'UDP 目标非法：' + $tgt.Error
+    $res.DurationMs = [int]((Get-Date) - $start).TotalMilliseconds
+    return $res
+  }
+  $deadline = $start.AddMilliseconds([Math]::Max(1000, $TimeoutMs))
+  $conn = $null
+  $udp = $null
+  try {
+    $conn = Connect-Socks5Control -Endpoint $f -TimeoutMs ([Math]::Max(1, (Get-RemainingMs $deadline)))
+    if ($conn.Class -eq 'config') {
+      $res.Class = 'config'; $res.Kind = $conn.Kind; $res.Stage = $conn.Stage; $res.Reason = $conn.Reason
+      return $res
+    }
+    if (-not $conn.Ok) {
+      $res.Kind = $conn.Kind; $res.Stage = $conn.Stage; $res.Reason = $conn.Reason; return $res
+    }
+    $assoc = [byte[]]@(5, 3, 0, 1, 0, 0, 0, 0, 0, 0)
+    $wrem = Get-RemainingMs $deadline
+    if (-not (Write-Socks5Bytes -Stream $conn.Stream -Bytes $assoc -TimeoutMs $wrem)) {
+      $res.Kind = 'timeout'; $res.Reason = '发送 UDP ASSOCIATE 超时'; return $res
+    }
+    $hdr = Read-Socks5Exact -Stream $conn.Stream -Count 4 -TimeoutMs (Get-RemainingMs $deadline)
+    if ($null -eq $hdr) { $res.Kind = 'timeout'; $res.Reason = '等待 UDP ASSOCIATE 回复超时'; return $res }
+    if ($hdr[0] -ne 5) { $res.Kind = 'protocol'; $res.Reason = 'UDP ASSOCIATE 回复版本异常'; return $res }
+    if ($hdr[1] -ne 0) {
+      $res.Kind = 'protocol'
+      $res.Reason = ('UDP ASSOCIATE 被拒（REP=0x{0:X2}）' -f $hdr[1]); return $res
+    }
+    # ASSOCIATE 已成功：从这里起都属于 DNS 数据路径，Stage 固定 udp_dns（review M4）。
+    $res.Stage = 'udp_dns'
+    $bound = Read-Socks5BoundAddress -Stream $conn.Stream -Atyp ([int]$hdr[3]) -Deadline $deadline
+    if (-not $bound.Ok) {
+      $res.Kind = if ([string]$bound.ErrorKind -ne '') { [string]$bound.ErrorKind } else { 'protocol' }
+      $res.Reason = $bound.Error
+      return $res
+    }
+    $relayIp = $null
+    if ($bound.Kind -eq 'domain') {
+      $rr = Resolve-Socks5Host -HostName ([string]$bound.Address) -TimeoutMs ([Math]::Max(1, (Get-RemainingMs $deadline)))
+      if ($rr.Ok) { $relayIp = $rr.IP }
+    } else {
+      $relayIp = [System.Net.IPAddress]::Parse([string]$bound.Address)
+    }
+    if ($relayIp -eq $null) {
+      # ATYP=0x03 解析失败 / BND.ADDR 非数字：按设计退回控制连接远端 IP，端口仍用 BND.PORT。
+      if ($conn.RemoteIP -ne $null) { $relayIp = $conn.RemoteIP }
+      else { $res.Kind = 'protocol'; $res.Reason = '无法确定 UDP relay 地址'; return $res }
+    }
+    if ($relayIp.Equals([System.Net.IPAddress]::Any) -or $relayIp.Equals([System.Net.IPAddress]::IPv6Any)) {
+      if ($conn.RemoteIP -eq $null) { $res.Kind = 'protocol'; $res.Reason = 'BND.ADDR 为 any 且读不到控制连接远端地址'; return $res }
+      $relayIp = $conn.RemoteIP
+    }
+    $relayPort = [int]$bound.Port
+    $udp = [System.Net.Sockets.UdpClient]::new($relayIp.AddressFamily)
+    $urem = Get-RemainingMs $deadline
+    if ($urem -lt 1) { $res.Kind = 'timeout'; $res.Reason = 'UDP 预算耗尽'; return $res }
+    try { $udp.Connect($relayIp, $relayPort) } catch {
+      $res.Kind = 'unreachable'; $res.Reason = 'UDP relay 连接失败'; return $res
+    }
+    $txid = Get-Random -Minimum 0 -Maximum 65536
+    $payload = New-DnsQueryPayload -TxId $txid
+    $dgram = New-Socks5UdpPacket -Target $tgt -Payload $payload
+    $urem = Get-RemainingMs $deadline
+    try { [void]$udp.Send($dgram, $dgram.Length) } catch {
+      $res.Kind = 'unreachable'; $res.Reason = '发送 UDP 数据报失败'; return $res
+    }
+    $urem = Get-RemainingMs $deadline
+    if ($urem -lt 1) { $res.Kind = 'timeout'; $res.Reason = '等待 UDP 回复预算耗尽'; return $res }
+    try { $udp.Client.ReceiveTimeout = [int]$urem } catch { }
+    $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+    $data = $null
+    try { $data = $udp.Receive([ref]$remote) } catch {
+      $res.Kind = 'timeout'; $res.Reason = '等待 UDP 回复超时'; return $res
+    }
+    $urem = Get-RemainingMs $deadline
+    $res.UdpMs = [int]((Get-Date) - $start).TotalMilliseconds
+    $res.DurationMs = $res.UdpMs
+    if ($data -eq $null -or $data.Length -lt 10) { $res.Kind = 'protocol'; $res.Reason = 'UDP 回复过短'; return $res }
+    if ($data[0] -ne 0 -or $data[1] -ne 0) { $res.Kind = 'protocol'; $res.Reason = 'UDP RSV 非 0'; return $res }
+    if ($data[2] -ne 0) { $res.Kind = 'protocol'; $res.Reason = 'UDP FRAG 非 0'; return $res }
+    $off = 4
+    switch ([int]$data[3]) {
+      1 { $off += 4 }
+      4 { $off += 16 }
+      3 {
+        $len = [int]$data[$off]
+        $off += 1 + $len
+      }
+      default { $res.Kind = 'protocol'; $res.Reason = 'UDP 回复 ATYP 不支持'; return $res }
+    }
+    $off += 2
+    if ($off + 2 -gt $data.Length) { $res.Kind = 'protocol'; $res.Reason = 'UDP 回复地址越界'; return $res }
+    $respTx = ([int]$data[$off] -shl 8) -bor [int]$data[$off + 1]
+    if ($respTx -ne $txid) { $res.Kind = 'protocol'; $res.Reason = 'DNS TXID 不匹配'; return $res }
+    $res.Ok = $true
+    $res.Class = 'ok'
+    $res.Kind = 'ok'
+    $res.Stage = 'udp_dns'
+    $res.Reason = "UDP DNS $Target ok"
+    return $res
+  } catch {
+    $res.Kind = 'unreachable'
+    $res.Reason = 'UDP 检查异常：' + (Mask-Proxy (Mask-Text $_.Exception.Message))
+    return $res
+  } finally {
+    if ($udp -ne $null) { try { $udp.Dispose() } catch { } }
+    if ($conn -ne $null) {
+      if ($conn.Stream -ne $null) { try { $conn.Stream.Dispose() } catch { } }
+      if ($conn.Client -ne $null) { try { $conn.Client.Dispose() } catch { } }
+    }
+    $res.DurationMs = [int]((Get-Date) - $start).TotalMilliseconds
+    if ($res.UdpMs -eq 0) { $res.UdpMs = $res.DurationMs }
+  }
+}
+
+function Test-WarpProxyCheck {
+  # 一次完整检查：TCP（api.cloudflareclient.com:443 → cloudflare.com:443 → 1.1.1.1:443）
+  # 然后（require_udp 时）UDP DNS（默认 1.1.1.1:53 → 8.8.8.8:53）。总预算 TimeoutSeconds。
+  param(
+    [string]$ProxyUrl,
+    [int]$TimeoutSeconds = 8,
+    [bool]$RequireUdp = $true,
+    [string]$UdpTarget = '1.1.1.1:53'
+  )
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $res = @{ Ok = $false; Class = 'unavailable'; Kind = 'timeout'; Stage = 'format'; Reason = '';
+    DurationMs = 0; TcpMs = 0; UdpMs = 0; TcpOk = $false; UdpOk = $false; UdpTarget = $UdpTarget }
+  $f = Test-ProxyEndpointFormat -Url $ProxyUrl
+  if (-not $f.Ok) {
+    $res.Class = 'config'; $res.Kind = 'format'; $res.Stage = 'format'; $res.Reason = $f.Error
+    $res.DurationMs = [int]$sw.ElapsedMilliseconds
+    return $res
+  }
+  $ut = Test-HostPortTarget -Text $UdpTarget
+  if (-not $ut.Ok) {
+    $res.Class = 'config'; $res.Kind = 'format'; $res.Stage = 'format'
+    $res.Reason = 'UDP 目标非法：' + $ut.Error
+    $res.DurationMs = [int]$sw.ElapsedMilliseconds
+    return $res
+  }
+  $totalMs = [Math]::Max(1000, $TimeoutSeconds * 1000)
+  $tcp = Test-Socks5TcpConnect -ProxyUrl $ProxyUrl -TimeoutMs $totalMs
+  $res.TcpOk = [bool]$tcp.Ok
+  $res.TcpMs = [int]$tcp.DurationMs
+  $res.Stage = $tcp.Stage
+  $res.Kind = $tcp.Kind
+  $res.Reason = $tcp.Reason
+  if ($tcp.Class -eq 'config') {
+    $res.Class = 'config'; $res.DurationMs = [int]$sw.ElapsedMilliseconds
+    return $res
+  }
+  if (-not $tcp.Ok) {
+    $res.DurationMs = [int]$sw.ElapsedMilliseconds
+    return $res
+  }
+  if (-not $RequireUdp) {
+    $res.Ok = $true; $res.Class = 'ok'; $res.Kind = 'ok'; $res.Stage = 'ok'
+    $res.Reason = 'TCP ok（未要求 UDP）'
+    $res.DurationMs = [int]$sw.ElapsedMilliseconds
+    return $res
+  }
+  $udpTargets = @($UdpTarget)
+  if ($UdpTarget -ne '8.8.8.8:53') { $udpTargets += '8.8.8.8:53' }
+  $lastUdp = $null
+  $udpTotalMs = 0
+  foreach ($item in $udpTargets) {
+    $rem = $totalMs - [int]$sw.ElapsedMilliseconds
+    if ($rem -lt 1000) { break }
+    $per = [Math]::Min(3000, $rem)
+    $udp = Test-Socks5UdpDns -ProxyUrl $ProxyUrl -Target $item -TimeoutMs $per
+    $lastUdp = $udp
+    $udpTotalMs += [int]$udp.DurationMs
+    $res.UdpTarget = [string]$udp.UdpTarget
+    if ($udp.Class -eq 'config') {
+      $res.Class = 'config'; $res.Kind = $udp.Kind; $res.Stage = $udp.Stage; $res.Reason = $udp.Reason
+      $res.UdpMs = $udpTotalMs; $res.DurationMs = [int]$sw.ElapsedMilliseconds
+      return $res
+    }
+    if ($udp.Ok) {
+      $res.Ok = $true; $res.Class = 'ok'; $res.Kind = 'ok'; $res.Stage = 'udp_dns'
+      $res.Reason = $udp.Reason; $res.UdpOk = $true; $res.UdpMs = $udpTotalMs
+      $res.DurationMs = [int]$sw.ElapsedMilliseconds
+      return $res
+    }
+  }
+  $res.Class = 'unavailable'
+  $res.UdpMs = $udpTotalMs
+  if ($lastUdp -ne $null) {
+    $res.Kind = $lastUdp.Kind
+    $res.Stage = $lastUdp.Stage
+    $res.Reason = $lastUdp.Reason
+  } elseif ($res.Kind -eq 'ok') {
+    $res.Kind = 'timeout'; $res.Stage = 'udp_dns'; $res.Reason = 'TCP 通过后 UDP 总预算耗尽'
+  }
+  $res.DurationMs = [int]$sw.ElapsedMilliseconds
+  return $res
+}
+
+function Invoke-WarpProxyCheckWithRecheck {
+  # r1 + （recheck>0 时）sleep 后 r2。recheck=0 跳过 r2 直接确认失败。
+  # 返回值里 ConfigError/Recovered/ConfirmedDown 供状态机固定分类；日志由调用方打。
+  param(
+    [string]$ProxyUrl,
+    [int]$TimeoutSeconds = 8,
+    [bool]$RequireUdp = $true,
+    [string]$UdpTarget = '1.1.1.1:53',
+    [int]$RecheckSeconds = 5
+  )
+  $r1 = Test-WarpProxyCheck -ProxyUrl $ProxyUrl -TimeoutSeconds $TimeoutSeconds -RequireUdp $RequireUdp -UdpTarget $UdpTarget
+  $out = @{ Ok = $false; Class = 'unavailable'; Kind = $r1.Kind; Stage = $r1.Stage; Reason = $r1.Reason;
+    DurationMs = $r1.DurationMs; TcpMs = $r1.TcpMs; UdpMs = $r1.UdpMs; TcpOk = $r1.TcpOk; UdpOk = $r1.UdpOk;
+    UdpTarget = $r1.UdpTarget; R1 = $r1; R2 = $null; Rechecked = $false; Recovered = $false;
+    ConfigError = $false; ConfirmedDown = $false }
+  if ($r1.Class -eq 'config') {
+    $out.Class = 'config'; $out.ConfigError = $true
+    return $out
+  }
+  if ($r1.Ok) {
+    $out.Ok = $true; $out.Class = 'ok'
+    return $out
+  }
+  $r2 = $null
+  if ($RecheckSeconds -gt 0) {
+    if ($RecheckSeconds -gt 0) { Start-Sleep -Seconds $RecheckSeconds }
+    $r2 = Test-WarpProxyCheck -ProxyUrl $ProxyUrl -TimeoutSeconds $TimeoutSeconds -RequireUdp $RequireUdp -UdpTarget $UdpTarget
+    $out.R2 = $r2
+    $out.Rechecked = $true
+    $out.Kind = $r2.Kind; $out.Stage = $r2.Stage; $out.Reason = $r2.Reason
+    $out.DurationMs = [int]$r1.DurationMs + [int]$r2.DurationMs + ($RecheckSeconds * 1000)
+    $out.TcpOk = $r2.TcpOk; $out.UdpOk = $r2.UdpOk; $out.TcpMs = $r2.TcpMs; $out.UdpMs = $r2.UdpMs
+    $out.UdpTarget = $r2.UdpTarget
+    if ($r2.Class -eq 'config') {
+      $out.Class = 'config'; $out.ConfigError = $true
+      return $out
+    }
+    if ($r2.Ok) {
+      $out.Ok = $true; $out.Class = 'ok'; $out.Recovered = $true
+      return $out
+    }
+  }
+  $out.Class = 'unavailable'
+  $out.ConfirmedDown = $true
+  return $out
+}
+
+function Read-GatewayWarpSettings {
+  # 只读 config.json 的 warp.enabled / warp.proxy（外加日志用的 proxies/proxyfile/key 数量）。
+  # 复用 Strip-JsonComments；按 LastWriteTimeUtc + 文件长度缓存。解析失败时保留上一份成功
+  # 解析的设置（last-good）；从未成功过才让调用方退回 legacy。不写任何文件、不打印 key。
+  param([string]$Path)
+  $res = @{ Ok = $false; ConfigError = $false; ReadFailed = $false; Stale = $false; Error = '';
+    Enabled = $false; Proxy = ''; ProxyOk = $true; ProxyError = ''; ProxyCount = 0; ProxyFile = '';
+    KeyCount = 0; Path = $Path }
+  if ([string]::IsNullOrWhiteSpace($Path)) { $Path = Join-Path $PSScriptRoot 'config.json'; $res.Path = $Path }
+  $copyFrom = {
+    param($src)
+    foreach ($k in @($src.Keys)) { $res[$k] = $src[$k] }
+    $res.Path = $Path
+  }
+  if (-not (Test-Path -LiteralPath $Path)) {
+    if ($script:GatewayWarpLastGood -ne $null) {
+      & $copyFrom $script:GatewayWarpLastGood
+      $res.Stale = $true; $res.ReadFailed = $true
+      $res.Error = "找不到网关 config.json：$Path（沿用最近一份成功设置）"
+      return $res
+    }
+    $res.Error = "找不到网关 config.json：$Path"
+    return $res
+  }
+  $fi = $null
+  $mtime = 0
+  $len = 0
+  try { $fi = Get-Item -LiteralPath $Path; $mtime = $fi.LastWriteTimeUtc.Ticks; $len = $fi.Length } catch { }
+  if ($script:GatewayWarpCache -ne $null -and $script:GatewayWarpCache.Mtime -eq $mtime -and
+    $script:GatewayWarpCache.Length -eq $len -and $script:GatewayWarpCache.Result -ne $null) {
+    & $copyFrom $script:GatewayWarpCache.Result
+    return $res
+  }
+  $cfg = $null
+  try {
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+    try { $cfg = $raw | ConvertFrom-Json -Depth 20 }
+    catch { $cfg = Strip-JsonComments -Text $raw | ConvertFrom-Json -Depth 20 }
+  } catch {
+    if ($script:GatewayWarpLastGood -ne $null) {
+      & $copyFrom $script:GatewayWarpLastGood
+      $res.Stale = $true; $res.ReadFailed = $true
+      $res.Error = 'config.json 解析失败：' + (Mask-Proxy (Mask-Text $_.Exception.Message))
+      return $res
+    }
+    $res.ReadFailed = $true
+    $res.Error = 'config.json 解析失败：' + (Mask-Proxy (Mask-Text $_.Exception.Message))
+    return $res
+  }
+  if (-not (Test-JsonObjectShape $cfg)) {
+    $res.ReadFailed = $true; $res.Error = 'config.json 顶层不是 JSON 对象'; return $res
+  }
+  try {
+    $proxies = Get-Prop $cfg 'proxies'
+    if ($proxies -is [System.Array]) { $res.ProxyCount = @($proxies).Count }
+    $pf = Get-Prop $cfg 'proxyfile'
+    if ($pf -is [string]) { $res.ProxyFile = [string]$pf }
+    $keys = Get-Prop $cfg 'server_keys'
+    if ($keys -is [System.Array]) { $res.KeyCount = @($keys).Count }
+    elseif ($keys -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$keys)) { $res.KeyCount = 1 }
+  } catch { }
+  $warp = $null
+  try { $warp = Get-Prop $cfg 'warp' } catch { $warp = $null }
+  if ($warp -ne $null -and -not (Test-JsonObjectShape $warp)) {
+    $res.ConfigError = $true; $res.Error = 'config.json 的 warp 必须是对象'
+    return $res
+  }
+  if ($warp -ne $null) {
+    if (Test-HasKey $warp 'enabled') {
+      $rawEnabled = Get-Prop $warp 'enabled'
+      if (-not ($rawEnabled -is [bool])) {
+        $res.ConfigError = $true; $res.Error = 'config.json 的 warp.enabled 必须是 bool'
+        return $res
+      }
+      $res.Enabled = [bool]$rawEnabled
+    }
+    if (Test-HasKey $warp 'proxy') {
+      $rawProxy = Get-Prop $warp 'proxy'
+      if (-not ($rawProxy -is [string])) {
+        $res.ConfigError = $true; $res.Error = 'config.json 的 warp.proxy 必须是字符串'
+        return $res
+      }
+      $res.Proxy = ([string]$rawProxy).Trim()
+    }
+  }
+  if ($res.Proxy -ne '') {
+    $fmt = Test-ProxyEndpointFormat -Url $res.Proxy
+    if (-not $fmt.Ok) {
+      $res.ConfigError = $true; $res.ProxyOk = $false; $res.ProxyError = $fmt.Error
+      $res.Error = 'config.json 的 warp.proxy 非法：' + $fmt.Error
+      return $res
+    }
+  }
+  $res.Ok = $true
+  $script:GatewayWarpCache = @{ Mtime = $mtime; Length = $len; Result = $res }
+  $script:GatewayWarpLastGood = $res
+  return $res
+}
+
+function Get-ClashManagedProxyPorts {
+  # 只读 clash-verge.yaml 的 mixed-port / socks-port（正向证据）。HTTP port 不是 SOCKS5 入口，
+  # 故意不读。读不到或没有端口时 Ok=false，auto 只监控不切换。
+  $res = @{ Ok = $false; Ports = @(); MixedPort = 0; SocksPort = 0; Error = '' }
+  $p = Join-Path $script:VergeRoot 'clash-verge.yaml'
+  if (-not (Test-Path -LiteralPath $p)) { $res.Error = '找不到 clash-verge.yaml'; return $res }
+  try { $lines = Get-Content -LiteralPath $p -Encoding utf8 } catch {
+    $res.Error = '读取 clash-verge.yaml 失败'; return $res
+  }
+  foreach ($ln in @($lines)) {
+    if ($ln -match '^\s*mixed-port:\s*(\d+)\s*$') { $res.MixedPort = [int]$Matches[1] }
+    elseif ($ln -match '^\s*socks-port:\s*(\d+)\s*$') { $res.SocksPort = [int]$Matches[1] }
+  }
+  if ($res.MixedPort -gt 0) { $res.Ports += $res.MixedPort }
+  if ($res.SocksPort -gt 0) { $res.Ports += $res.SocksPort }
+  $res.Ok = @($res.Ports).Count -gt 0
+  if (-not $res.Ok) { $res.Error = 'clash-verge.yaml 未暴露 mixed-port/socks-port' }
+  return $res
+}
+
+function Test-WarpProxyCanFailover {
+  # auto：必须是 loopback 且端口命中 clash-verge.yaml 的 mixed-port/socks-port；
+  # 读不到 yaml 或端口不匹配 = 只监控。on 强制；off 只监控。HTTP port 永远不算证据。
+  param([string]$ProxyUrl)
+  if ($script:ProxyCheckFailover -eq 'off') {
+    return @{ Allowed = $false; Reason = 'proxy_check_failover=off（只监控）' }
+  }
+  if ($script:ProxyCheckFailover -eq 'on') {
+    return @{ Allowed = $true; Reason = 'proxy_check_failover=on（强制允许）' }
+  }
+  $f = Test-ProxyEndpointFormat -Url $ProxyUrl
+  if (-not $f.Ok) { return @{ Allowed = $false; Reason = '代理地址非法：' + $f.Error } }
+  $loop = [bool]$f.IsLoopback
+  if (-not $loop -and $f.Kind -eq 'domain') {
+    try {
+      $task = [System.Net.Dns]::GetHostAddressesAsync([string]$f.Host)
+      if ($task.Wait(1000)) {
+        $addrs = @($task.Result)
+        if (@($addrs).Count -gt 0) {
+          $loop = $true
+          foreach ($a in $addrs) {
+            $b = $a.GetAddressBytes()
+            $isLoop = ($a.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and $b[0] -eq 127) -or
+              $a.Equals([System.Net.IPAddress]::IPv6Loopback)
+            if (-not $isLoop) { $loop = $false; break }
+          }
+        }
+      }
+    } catch { $loop = $false }
+  }
+  if (-not $loop) {
+    return @{ Allowed = $false; Reason = 'warp.proxy 不是本机 loopback 入口（' + (Format-ProxyEndpoint $ProxyUrl) + '），auto 只监控不切换' }
+  }
+  $cm = Get-ClashManagedProxyPorts
+  if (-not $cm.Ok) {
+    return @{ Allowed = $false; Reason = '读不到 clash-verge.yaml 的 mixed-port/socks-port：' + $cm.Error + '，auto 只监控' }
+  }
+  if (@($cm.Ports) -notcontains [int]$f.Port) {
+    return @{ Allowed = $false; Reason = '端口 ' + [int]$f.Port + ' 不匹配 clash-verge.yaml 的 mixed-port/socks-port（' + (@($cm.Ports) -join '/') + '），auto 只监控' }
+  }
+  return @{ Allowed = $true; Reason = '本机 Clash 入口（端口 ' + [int]$f.Port + '）' }
+}
+
+function Resolve-ProxyCheckPlan {
+  # 决定本轮走 legacy / warp-direct / warp-proxy。off 时完全不读 config.json 的 WARP 字段。
+  # -ProxyCheckEndpoint 只在 ProbeOnly / DryRun 生效；正常循环忽略并 WARN 一次。
+  $plan = @{ Mode = 'legacy'; ConfigError = $false; ErrorLogged = $false; Reason = ''; Endpoint = ''; Source = '';
+    Enabled = $false; Stale = $false; UdpTarget = $script:ProxyCheckUdpTarget; UdpTargetError = '' }
+  # proxy_check_failover=on 只提示一次（不再每轮刷）。auto 的 loopback/端口证据只在决定切换时看。
+  $warnOnHint = {
+    if ($script:ProxyCheckFailover -eq 'on' -and -not $script:WarpFailoverOnWarned) {
+      $script:WarpFailoverOnWarned = $true
+      Write-WdLog 'proxy-check proxy_check_failover=on：被检查的 SOCKS5 入口可能不是当前 WARP 承载者（auto 才校验 loopback + mixed-port/socks-port）' 'WARN'
+    }
+  }
+  $ut = Test-HostPortTarget -Text $script:ProxyCheckUdpTarget
+  if (-not $ut.Ok) { $plan.UdpTargetError = $ut.Error }
+  if ($script:ProxyCheckMode -eq 'off') { $plan.Reason = 'proxy_check_mode=off'; return $plan }
+  $useOverride = ($script:ProxyCheckEndpoint -ne '' -and ($ProxyCheckProbeOnly -or $DryRun))
+  if ($script:ProxyCheckEndpoint -ne '' -and -not $useOverride -and -not $script:ProxyCheckEndpointWarned) {
+    $script:ProxyCheckEndpointWarned = $true
+    Write-WdLog 'proxy-check 正常循环忽略 -ProxyCheckEndpoint（该参数只在 -ProxyCheckProbeOnly / -DryRun 生效）' 'WARN'
+  }
+  if ($useOverride) {
+    $plan.Mode = 'warp-proxy'
+    $plan.Source = 'endpoint'
+    $plan.Endpoint = $script:ProxyCheckEndpoint
+    $fmt = Test-ProxyEndpointFormat -Url $script:ProxyCheckEndpoint
+    if (-not $fmt.Ok) { $plan.ConfigError = $true; $plan.Reason = $fmt.Error }
+    elseif ($plan.UdpTargetError -ne '') { $plan.ConfigError = $true; $plan.Reason = 'UDP 目标非法：' + $plan.UdpTargetError }
+    if (-not $plan.ConfigError) { & $warnOnHint }
+    return $plan
+  }
+  $settings = Read-GatewayWarpSettings -Path (Join-Path $PSScriptRoot 'config.json')
+  if ($settings.ReadFailed -and $settings.Error -ne '') {
+    $sig = 'gateway-warp|' + $settings.Error
+    if ($script:WarpProxyConfigErrSig -ne $sig) {
+      $script:WarpProxyConfigErrSig = $sig
+      Write-WdLog ('proxy-check 读取 config.json 的 WARP 设置失败：' + $settings.Error) 'WARN'
+    }
+  }
+  # 必须先处理 ConfigError：Read-GatewayWarpSettings 在类型/URL 非法时返回 Ok=false+ConfigError=true。
+  # 普通模式按设计（§8.3）退回 legacy，但错误必须留痕；ProbeOnly 由启动分支按 ConfigError exit 2。
+  if ($settings.ConfigError) {
+    $sig = 'gateway-warp-config|' + [string]$settings.Error
+    if ($script:WarpProxyConfigErrSig -ne $sig) {
+      $script:WarpProxyConfigErrSig = $sig
+      Write-WdLog ('proxy-check config error：' + (Shorten (Mask-Proxy (Mask-Text ([string]$settings.Error))) 200)) 'ERROR'
+    }
+    $plan.ErrorLogged = $true
+    $plan.Mode = 'legacy'
+    $plan.ConfigError = $true
+    $plan.Source = 'config'
+    $plan.Endpoint = [string]$settings.Proxy
+    $plan.Reason = [string]$settings.Error
+    return $plan
+  }
+  if (-not $settings.Ok) { $plan.Reason = [string]$settings.Error; return $plan }
+  $plan.Enabled = [bool]$settings.Enabled
+  $plan.Stale = [bool]$settings.Stale
+  $plan.Source = 'config'
+  if (-not $settings.ReadFailed -and $script:WarpProxyConfigErrSig -like 'gateway-warp*') {
+    $script:WarpProxyConfigErrSig = ''
+  }
+  # ProbeOnly 是独立诊断入口：只要 config.json 有合法的 warp.proxy 就检查，不受
+  # warp.enabled 影响（"无目标" 的定义是没有 warp.proxy 且没有 -ProxyCheckEndpoint）。
+  if ($ProxyCheckProbeOnly -and -not [string]::IsNullOrWhiteSpace([string]$settings.Proxy)) {
+    $plan.Mode = 'warp-proxy'
+    $plan.Endpoint = [string]$settings.Proxy
+    if ($plan.UdpTargetError -ne '') { $plan.ConfigError = $true; $plan.Reason = 'UDP 目标非法：' + $plan.UdpTargetError }
+    if (-not $plan.ConfigError) { & $warnOnHint }
+    return $plan
+  }
+  if ($script:ProxyCheckMode -eq 'force') {
+    if ([string]::IsNullOrWhiteSpace([string]$settings.Proxy)) {
+      $plan.Reason = 'proxy_check_mode=force 但 warp.proxy 为空'
+      $sig = 'force-empty|' + $plan.Reason
+      if ($script:WarpProxyConfigErrSig -ne $sig) {
+        $script:WarpProxyConfigErrSig = $sig
+        Write-WdLog ('proxy-check config error：' + $plan.Reason) 'ERROR'
+      }
+      $plan.ConfigError = $true
+      $plan.ErrorLogged = $true
+      return $plan
+    }
+    $plan.Mode = 'warp-proxy'
+    $plan.Endpoint = [string]$settings.Proxy
+  } else {
+    if (-not $settings.Enabled) { $plan.Reason = 'warp.enabled=false'; return $plan }
+    if ([string]::IsNullOrWhiteSpace([string]$settings.Proxy)) {
+      $plan.Mode = 'warp-direct'
+      $plan.Reason = 'warp.enabled=true 且 warp.proxy 为空（直连 WARP）'
+      return $plan
+    }
+    $plan.Mode = 'warp-proxy'
+    $plan.Endpoint = [string]$settings.Proxy
+  }
+  if ($plan.UdpTargetError -ne '') { $plan.ConfigError = $true; $plan.Reason = 'UDP 目标非法：' + $plan.UdpTargetError }
+  if (-not $plan.ConfigError) { & $warnOnHint }
+  return $plan
+}
+
+function Set-WarpProxyMode {
+  # 模式切换清理（§6）：清轮冷却/transport 计数/恢复签到/WARP 状态/Clash 错误签名；
+  # 不清 LastSeenNow、LastRefresh/LastSwitch、QuotaFailedAt（WARP 候选排序用 IgnoreQuotaPenalty）。
+  param([bool]$Active)
+  $target = if ($Active) { 'warp-proxy' } else { 'legacy' }
+  if ($script:WarpProxyLastMode -ne '' -and $script:WarpProxyLastMode -ne $target) {
+    $script:RoundCooldownUntil = [DateTime]::MinValue
+    $script:TransportStrikes = 0
+    $script:OkStreak = 0
+    $script:StreakStart = [DateTime]::MinValue
+    $script:LastStaleProbe = [DateTime]::MinValue
+    $script:WarpProxyLastState = ''
+    $script:WarpProxyLastLogAt = [DateTime]::MinValue
+    $script:WarpProxyConfigErrSig = ''
+    $script:LastClashErrSig = ''
+    Write-WdLog ('proxy-check 模式切换：' + $script:WarpProxyLastMode + ' -> ' + $target + '（已清理轮冷却/transport 计数等状态）')
+  }
+  $script:WarpProxyLastMode = $target
+  $script:WarpProxyActive = $Active
 }
 
 function Get-Prop {
@@ -567,10 +1633,15 @@ function Read-WatchdogConfig {
     # 未知键直接报错（与 config.json 的 DisallowUnknownFields 同口径）。键名拼错
     # （exclude-contains / penalty / 尾随空格）若静默忽略，看门狗会照常以内置默认值
     # 跑起来，用户却以为自己的排除/降权规则生效了。
+    $knownTop = @('selector', 'subscription_uid', 'max_candidates', 'exclude_contains', 'deprioritize',
+      'transport_confirm_rounds', 'proxy_check_mode', 'proxy_check_interval_seconds',
+      'proxy_check_recheck_seconds', 'proxy_check_timeout_seconds', 'proxy_check_udp_target',
+      'proxy_check_require_udp', 'proxy_check_failover', 'proxy_switch_gap_seconds',
+      'proxy_failover_budget_seconds')
     $unknownTop = @(@($cfg.PSObject.Properties | ForEach-Object { $_.Name }) |
-      Where-Object { @('selector', 'subscription_uid', 'max_candidates', 'exclude_contains', 'deprioritize', 'transport_confirm_rounds') -notcontains $_ })
+      Where-Object { $knownTop -notcontains $_ })
     if ($unknownTop.Count -gt 0) {
-      throw "看门狗配置文件 [$Path] 含未知键：$($unknownTop -join ' / ')，只支持 selector、subscription_uid、max_candidates、exclude_contains、deprioritize、transport_confirm_rounds"
+      throw "看门狗配置文件 [$Path] 含未知键：$($unknownTop -join ' / ')，只支持 $($knownTop -join '、')"
     }
   }
   if (-not $existed) { Write-WdLog "未找到看门狗配置文件 [$Path]，子串排除、地区降权与 transport 连续确认轮数均用内置默认值" 'INFO'; return }
@@ -729,6 +1800,109 @@ function Read-WatchdogConfig {
       Write-WdLog "配置生效：transport 连续确认轮数 = ${n}"
     }
   }
+  # ---- WARP proxy 检查（Phase 1）新增键：类型/范围/枚举从严，写错启动即失败 ----
+  if (Test-HasKey $cfg 'proxy_check_mode') {
+    $seen++
+    $rawMode = Get-Prop $cfg 'proxy_check_mode'
+    if (-not ($rawMode -is [string])) {
+      $tn = if ($null -eq $rawMode) { 'null' } else { $rawMode.GetType().Name }
+      throw "看门狗配置 proxy_check_mode 非法：[$rawMode]（类型 $tn；必须是 auto / off / force）"
+    }
+    $modeVal = ([string]$rawMode).Trim().ToLowerInvariant()
+    if (@('auto', 'off', 'force') -notcontains $modeVal) {
+      throw "看门狗配置 proxy_check_mode 非法：[$rawMode]（必须是 auto / off / force）"
+    }
+    if ($script:ExplicitParams -contains 'ProxyCheckMode') {
+      $covered++
+      Write-WdLog '命令行已显式传 -ProxyCheckMode，配置文件的 proxy_check_mode 不生效' 'INFO'
+    } else {
+      $script:ProxyCheckMode = $modeVal
+      $applied++
+      Write-WdLog "配置生效：proxy_check_mode = $modeVal"
+    }
+  }
+  foreach ($intKey in @(
+      @{ Key = 'proxy_check_interval_seconds'; Min = 5; Max = 300; Explicit = 'ProxyCheckIntervalSeconds'; Field = 'ProxyCheckIntervalSeconds' },
+      @{ Key = 'proxy_check_recheck_seconds'; Min = 0; Max = 30; Explicit = 'ProxyCheckRecheckSeconds'; Field = 'ProxyCheckRecheckSeconds' },
+      @{ Key = 'proxy_check_timeout_seconds'; Min = 3; Max = 30; Explicit = 'ProxyCheckTimeoutSeconds'; Field = 'ProxyCheckTimeoutSeconds' },
+      @{ Key = 'proxy_switch_gap_seconds'; Min = 0; Max = 30; Explicit = 'ProxySwitchGapSeconds'; Field = 'ProxySwitchGapSeconds' },
+      @{ Key = 'proxy_failover_budget_seconds'; Min = 30; Max = 600; Explicit = 'ProxyFailoverBudgetSeconds'; Field = 'ProxyFailoverBudgetSeconds' }
+    )) {
+    if (-not (Test-HasKey $cfg $intKey.Key)) { continue }
+    $seen++
+    $rawInt = Get-Prop $cfg $intKey.Key
+    if (-not ($rawInt -is [int] -or $rawInt -is [long])) {
+      $tn = if ($null -eq $rawInt) { 'null' } else { $rawInt.GetType().Name }
+      throw "看门狗配置 $($intKey.Key) 非法：[$rawInt]（类型 $tn；必须是 $($intKey.Min)-$($intKey.Max) 的整数，不要加引号、不要写小数）"
+    }
+    if ($rawInt -lt $intKey.Min -or $rawInt -gt $intKey.Max) {
+      throw "看门狗配置 $($intKey.Key) 越界：[$rawInt]（应为 $($intKey.Min)-$($intKey.Max)）"
+    }
+    if ($script:ExplicitParams -contains $intKey.Explicit) {
+      $covered++
+      Write-WdLog "命令行已显式传 -$($intKey.Explicit)，配置文件的 $($intKey.Key) 不生效" 'INFO'
+    } else {
+      Set-Variable -Name ('script:' + $intKey.Field) -Value ([int]$rawInt)
+      $applied++
+      Write-WdLog "配置生效：$($intKey.Key) = $([int]$rawInt)"
+    }
+  }
+  if (Test-HasKey $cfg 'proxy_check_udp_target') {
+    $seen++
+    $rawUdp = Get-Prop $cfg 'proxy_check_udp_target'
+    if (-not ($rawUdp -is [string]) -or [string]::IsNullOrWhiteSpace([string]$rawUdp)) {
+      throw "看门狗配置 proxy_check_udp_target 非法：[$rawUdp]（必须是非空字符串，如 1.1.1.1:53 或 [2606:4700:4700::1111]:53）"
+    }
+    $udpText = ([string]$rawUdp).Trim()
+    $udpParsed = Test-HostPortTarget -Text $udpText
+    if (-not $udpParsed.Ok) {
+      throw "看门狗配置 proxy_check_udp_target 非法：[$udpText]（$($udpParsed.Error)；应为 host:port 或 [IPv6]:port）"
+    }
+    if ($script:ExplicitParams -contains 'ProxyCheckUdpTarget') {
+      $covered++
+      Write-WdLog '命令行已显式传 -ProxyCheckUdpTarget，配置文件的 proxy_check_udp_target 不生效' 'INFO'
+    } else {
+      $script:ProxyCheckUdpTarget = $udpText
+      $applied++
+      Write-WdLog "配置生效：proxy_check_udp_target = $udpText"
+    }
+  }
+  if (Test-HasKey $cfg 'proxy_check_require_udp') {
+    $seen++
+    $rawReq = Get-Prop $cfg 'proxy_check_require_udp'
+    if (-not ($rawReq -is [bool])) {
+      $tn = if ($null -eq $rawReq) { 'null' } else { $rawReq.GetType().Name }
+      throw "看门狗配置 proxy_check_require_udp 非法：[$rawReq]（类型 $tn；必须是 true/false，不要加引号）"
+    }
+    if ($script:ExplicitParams -contains 'ProxyCheckRequireUdp') {
+      $covered++
+      Write-WdLog '命令行已显式传 -ProxyCheckRequireUdp，配置文件的 proxy_check_require_udp 不生效' 'INFO'
+    } else {
+      $script:ProxyCheckRequireUdp = [bool]$rawReq
+      $applied++
+      Write-WdLog "配置生效：proxy_check_require_udp = $([bool]$rawReq)"
+    }
+  }
+  if (Test-HasKey $cfg 'proxy_check_failover') {
+    $seen++
+    $rawFo = Get-Prop $cfg 'proxy_check_failover'
+    if (-not ($rawFo -is [string])) {
+      $tn = if ($null -eq $rawFo) { 'null' } else { $rawFo.GetType().Name }
+      throw "看门狗配置 proxy_check_failover 非法：[$rawFo]（类型 $tn；必须是 auto / on / off）"
+    }
+    $foVal = ([string]$rawFo).Trim().ToLowerInvariant()
+    if (@('auto', 'on', 'off') -notcontains $foVal) {
+      throw "看门狗配置 proxy_check_failover 非法：[$rawFo]（必须是 auto / on / off）"
+    }
+    if ($script:ExplicitParams -contains 'ProxyCheckFailover') {
+      $covered++
+      Write-WdLog '命令行已显式传 -ProxyCheckFailover，配置文件的 proxy_check_failover 不生效' 'INFO'
+    } else {
+      $script:ProxyCheckFailover = $foVal
+      $applied++
+      Write-WdLog "配置生效：proxy_check_failover = $foVal"
+    }
+  }
   # {} 是合法的“不改任何默认值”，但很容易是误建/误清空后的残留，单独提示一句。
   # 注意别把「键全被命令行覆盖」也说成「空对象 {}」——那与上一行的 INFO 自相矛盾。
   if ($applied -eq 0) {
@@ -867,7 +2041,9 @@ function Get-ProxyMap {
 }
 
 function Get-RankedCandidates {
-  param($ProxyMap, [string[]]$SelectorAll, [string]$ExcludeNow)
+  # -IgnoreQuotaPenalty：WARP proxy failover 用（design §7.3）。WARP 模式下 QuotaFailedAt
+  # 是 legacy 的旧降权记忆，不应继承；legacy 调用不传，默认行为完全不变。
+  param($ProxyMap, [string[]]$SelectorAll, [string]$ExcludeNow, [switch]$IgnoreQuotaPenalty)
   $cands = @()
   $dropped = @()
   if ($ProxyMap -eq $null) { return @() }
@@ -926,27 +2102,29 @@ function Get-RankedCandidates {
   # 不钳会被已死节点反超）；记忆过期自动失效（该机场同名背后会换 IP，不可永久拉黑）。
   # 顺带清理过期条目，避免哈希表随节点改名无限增长（候选池本身只有几十个，影响可忽略）。
   # 窗口为 0 表示关闭：直接跳过本块（记录点同样守卫，见 Invoke-Failover）。
-  $nowTs = Get-Date
-  $demotedNames = @()
-  foreach ($k in @($script:QuotaFailedAt.Keys)) {
-    try { if (($nowTs - $script:QuotaFailedAt[$k]).TotalMinutes -ge $script:QuotaFailMemoryMinutes) { $script:QuotaFailedAt.Remove($k) } } catch { }
-  }
-  if ($script:QuotaFailMemoryMinutes -gt 0) {
-    foreach ($c in $cands) {
-      try {
-        if ([string]::IsNullOrWhiteSpace($c.Name)) { continue }
-        if ($script:QuotaFailedAt.Contains($c.Name)) {
-          if (($nowTs - $script:QuotaFailedAt[$c.Name]).TotalMinutes -lt $script:QuotaFailMemoryMinutes) {
-            $c.DelayRank = [Math]::Min($c.DelayRank + 300000, 999998)
-            $c.Demoted = $true
-            $demotedNames += $c.Name
-          }
-        }
-      } catch { }
+  if (-not $IgnoreQuotaPenalty) {
+    $nowTs = Get-Date
+    $demotedNames = @()
+    foreach ($k in @($script:QuotaFailedAt.Keys)) {
+      try { if (($nowTs - $script:QuotaFailedAt[$k]).TotalMinutes -ge $script:QuotaFailMemoryMinutes) { $script:QuotaFailedAt.Remove($k) } } catch { }
     }
-  }
-  if (@($demotedNames).Count -gt 0) {
-    Write-WdLog "其中 $(@($demotedNames).Count) 个近期 quota 失败已降权（记忆窗口 $($script:QuotaFailMemoryMinutes) 分钟）：$(($demotedNames | Select-Object -First 8) -join ' / ')" 'INFO'
+    if ($script:QuotaFailMemoryMinutes -gt 0) {
+      foreach ($c in $cands) {
+        try {
+          if ([string]::IsNullOrWhiteSpace($c.Name)) { continue }
+          if ($script:QuotaFailedAt.Contains($c.Name)) {
+            if (($nowTs - $script:QuotaFailedAt[$c.Name]).TotalMinutes -lt $script:QuotaFailMemoryMinutes) {
+              $c.DelayRank = [Math]::Min($c.DelayRank + 300000, 999998)
+              $c.Demoted = $true
+              $demotedNames += $c.Name
+            }
+          }
+        } catch { }
+      }
+    }
+    if (@($demotedNames).Count -gt 0) {
+      Write-WdLog "其中 $(@($demotedNames).Count) 个近期 quota 失败已降权（记忆窗口 $($script:QuotaFailMemoryMinutes) 分钟）：$(($demotedNames | Select-Object -First 8) -join ' / ')" 'INFO'
+    }
   }
   # 地区降权（延迟低但不稳定，如新加坡）：命中子串的候选 DelayRank 加罚分，只降
   # 排序不排除；与 quota 降权可叠加（同钳 999998，永不反超死亡线 999999，保底仍
@@ -2051,6 +3229,220 @@ function Invoke-Failover {
   return @{ Ok = $false; Node = $null }
 }
 
+function Invoke-WarpProxyFailover {
+  # WARP proxy 专用 failover（design §7.2）：不复用 legacy 的 Test-GatewayNode /
+  # Wait-GatewayProxyReady / QuotaFailedAt 写入 / transport 计数。只用 SOCKS5 检查。
+  param(
+    [string]$ProxyUrl,
+    [string]$UdpTarget,
+    [int]$TimeoutSeconds = 8,
+    [bool]$RequireUdp = $true,
+    [string]$Uid,
+    [int]$MaxCandidates = 120,
+    [int]$SwitchGapSeconds = 2,
+    [int]$FailoverBudgetSeconds = 120
+  )
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  Write-WdLog '===== 进入 WARP proxy 故障切换 =====' 'WARN'
+  $rr = $null
+  try { $rr = Refresh-Subscription -Uid $Uid }
+  catch { $rr = @{ Ok = $false; Error = ('订阅刷新异常：' + (Mask-Proxy (Mask-Text $_.Exception.Message))) } }
+  $refreshOk = [bool](Get-Prop $rr 'Ok')
+  $adoptedUid = [string]$script:SubscriptionUid
+  if (-not [string]::IsNullOrWhiteSpace($adoptedUid) -and $adoptedUid -ne $Uid) {
+    Write-WdLog "本轮 WARP 切换的 profile uid 跟随为 $adoptedUid（配置重新导入过）"
+    $Uid = $adoptedUid
+  }
+  if ($refreshOk) {
+    Write-WdLog '订阅已刷新' 'OK'
+  } elseif (Get-Prop $rr 'Skipped') {
+    Write-WdLog "跳过订阅刷新：$((Get-Prop $rr 'Error'))（逐节点切换照常）"
+  } elseif (Get-Prop $rr 'Throttled') {
+    Write-WdLog '订阅刷新被节流，用当前列表继续'
+  } else {
+    $script:LastRefresh = (Get-Date).AddMinutes(2)
+    Write-WdLog "订阅刷新失败：$((Get-Prop $rr 'Error'))，用旧列表继续" 'ERROR'
+  }
+  if ($refreshOk) {
+    $settle = [int]$script:RefreshSettleSeconds
+    if ($settle -gt 0) { Start-Sleep -Seconds $settle }
+    $rf = Test-WarpProxyCheck -ProxyUrl $ProxyUrl -TimeoutSeconds $TimeoutSeconds -RequireUdp $RequireUdp -UdpTarget $UdpTarget
+    if ($rf.Class -eq 'config') {
+      Write-WdLog ('proxy-check config error（刷新后复检）：' + (Shorten (Mask-Proxy (Mask-Text ([string]$rf.Reason))) 200)) 'ERROR'
+      return @{ Ok = $false; Node = $null; ConfigError = $true }
+    }
+    if ($rf.Ok) {
+      $nowTxt = ''
+      try {
+        $selEnc = [uri]::EscapeDataString($script:Selector)
+        $d = Invoke-ClashGet -Path "/proxies/$selEnc"
+        $nowTxt = [string](Get-Prop $d 'now')
+      } catch { }
+      if (-not [string]::IsNullOrWhiteSpace($nowTxt)) { $script:LastSeenNow = $nowTxt }
+      Write-WdLog 'proxy-check recovered after subscription refresh；WARP egress 需自行重注册/验证，未切节点' 'OK'
+      return @{ Ok = $true; Node = $nowTxt; ConfigError = $false }
+    }
+    Write-WdLog ('proxy-check 刷新后复检仍失败：stage=' + $rf.Stage + ' reason=' + (Shorten (Mask-Proxy (Mask-Text ([string]$rf.Reason))) 200) + '，继续切换') 'WARN'
+  }
+  if ($sw.Elapsed.TotalSeconds -ge $FailoverBudgetSeconds) {
+    Write-WdLog "proxy-check failover 预算 $($FailoverBudgetSeconds)s 已耗尽（刷新阶段），停止本轮" 'WARN'
+    return @{ Ok = $false; Node = $null; ConfigError = $false }
+  }
+  $sel = [uri]::EscapeDataString($script:Selector)
+  $detail = $null
+  try { $detail = Invoke-ClashGet -Path "/proxies/$sel" }
+  catch {
+    Write-WdLog "读取 Selector [$($script:Selector)] 失败：$(Mask-Text $_.Exception.Message)（selector 名是否正确？）" 'ERROR'
+    return @{ Ok = $false; Node = $null; ConfigError = $false }
+  }
+  $original = [string](Get-Prop $detail 'now')
+  Write-WdLog "WARP 切换前 Selector=$($script:Selector) now=$original"
+  $rawAll = Get-Prop $detail 'all'
+  $all = @($rawAll | Where-Object { $_ -ne $null -and $_ -ne '' })
+  if (@($all).Count -eq 0) {
+    Write-WdLog "Selector [$($script:Selector)] 无 all 列表（非 Selector 或名字写错），放弃本轮" 'ERROR'
+    return @{ Ok = $false; Node = $null; ConfigError = $false }
+  }
+  $map = Get-ProxyMap
+  $cands = Get-RankedCandidates -ProxyMap $map -SelectorAll $all -ExcludeNow $original -IgnoreQuotaPenalty
+  Write-WdLog "WARP 候选池：符合条件 $(@($cands).Count) 个（已忽略 legacy quota 降权）"
+  if (@($cands).Count -eq 0) {
+    Write-WdLog 'WARP 候选池为空（过滤后无可用节点），不做无效切换' 'ERROR'
+    return @{ Ok = $false; Node = $null; ConfigError = $false }
+  }
+  $pick = @($cands | Select-Object -First $MaxCandidates)
+  $tried = @()
+  foreach ($c in $pick) {
+    if ($sw.Elapsed.TotalSeconds -ge $FailoverBudgetSeconds) {
+      Write-WdLog "proxy-check failover 预算 $($FailoverBudgetSeconds)s 已耗尽，停止候选循环" 'WARN'
+      break
+    }
+    Write-WdLog "proxy-check 尝试候选 [$($c.Name)]（延迟 $($c.Delay)ms，alive=$($c.Alive)）..."
+    try {
+      if (-not (Switch-ClashNode -Name $c.Name -Uid $Uid)) { $tried += $c.Name; continue }
+    } catch {
+      Write-WdLog "WARP 切换失败：$(Mask-Text $_.Exception.Message)" 'WARN'
+      $tried += $c.Name
+      continue
+    }
+    $script:LastSwitch = Get-Date
+    if ($SwitchGapSeconds -gt 0) { Start-Sleep -Seconds $SwitchGapSeconds }
+    $v = Test-WarpProxyCheck -ProxyUrl $ProxyUrl -TimeoutSeconds $TimeoutSeconds -RequireUdp $RequireUdp -UdpTarget $UdpTarget
+    $tried += $c.Name
+    if ($v.Class -eq 'config') {
+      $script:LastSeenNow = $c.Name
+      Write-WdLog ('proxy-check config error（候选 ' + $c.Name + '）：' + (Shorten (Mask-Proxy (Mask-Text ([string]$v.Reason))) 200) + '，停止候选循环（不回滚、不冷却）') 'ERROR'
+      return @{ Ok = $false; Node = $c.Name; ConfigError = $true }
+    }
+    if ($v.Ok) {
+      $script:LastSeenNow = $c.Name
+      Write-WdLog "proxy-check candidate [$($c.Name)] ok，已切换" 'OK'
+      return @{ Ok = $true; Node = $c.Name; ConfigError = $false }
+    }
+    Write-WdLog "proxy-check candidate [$($c.Name)] failed：stage=$($v.Stage) reason=$(Shorten (Mask-Proxy (Mask-Text ([string]$v.Reason))) 200)" 'WARN'
+  }
+  Write-WdLog "proxy-check all candidates failed（已试：$($tried -join ' / ')），rollback $original，冷却 $RoundCooldownMinutes 分钟" 'ERROR'
+  if ([string]::IsNullOrWhiteSpace($original)) {
+    Write-WdLog '原节点名为空，跳过回滚' 'WARN'
+  } else {
+    try {
+      if (Switch-ClashNode -Name $original -Uid $Uid) { $script:LastSeenNow = $original }
+      else { Write-WdLog "回滚到 $original 返回失败（实际仍停在最后候选），下轮以实际 now 为准" 'WARN' }
+    } catch { Write-WdLog "回滚到 $original 失败：$(Mask-Text $_.Exception.Message)" 'ERROR' }
+  }
+  return @{ Ok = $false; Node = $null; ConfigError = $false }
+}
+
+function Invoke-WarpProxyIteration {
+  # WARP proxy 状态机（design §6）。返回 @{Acted;ConfigError;ConfirmedDown}，供 -Once 固定退出码。
+  param($Plan)
+  if ($Plan -eq $null -or $Plan.Mode -ne 'warp-proxy') {
+    return @{ Acted = $false; ConfigError = $false; ConfirmedDown = $false }
+  }
+  if ($Plan.ConfigError) {
+    $sig = 'plan|' + [string]$Plan.Reason
+    if ($script:WarpProxyConfigErrSig -ne $sig) {
+      $script:WarpProxyConfigErrSig = $sig
+      Write-WdLog ('proxy-check config error：' + (Shorten (Mask-Proxy (Mask-Text ([string]$Plan.Reason))) 200)) 'ERROR'
+    }
+    $script:WarpProxyLastState = 'config'
+    return @{ Acted = $false; ConfigError = $true; ConfirmedDown = $false }
+  }
+  $target = Format-ProxyEndpoint -Url $Plan.Endpoint
+  $r = Invoke-WarpProxyCheckWithRecheck -ProxyUrl $Plan.Endpoint -TimeoutSeconds $script:ProxyCheckTimeoutSeconds -RequireUdp $script:ProxyCheckRequireUdp -UdpTarget $script:ProxyCheckUdpTarget -RecheckSeconds $script:ProxyCheckRecheckSeconds
+  if ($r.ConfigError) {
+    $sig = 'check|' + [string]$r.Stage + '|' + [string]$r.Reason
+    if ($script:WarpProxyConfigErrSig -ne $sig) {
+      $script:WarpProxyConfigErrSig = $sig
+      Write-WdLog ('proxy-check config error：' + (Shorten (Mask-Proxy (Mask-Text ([string]$r.Reason))) 200)) 'ERROR'
+    }
+    $script:WarpProxyLastState = 'config'
+    return @{ Acted = $false; ConfigError = $true; ConfirmedDown = $false }
+  }
+  if ($r.Recovered) {
+    $script:WarpProxyConfigErrSig = ''
+    if ($script:RoundCooldownUntil -gt (Get-Date)) {
+      $script:RoundCooldownUntil = [DateTime]::MinValue
+      Write-WdLog 'proxy-check jitter recovered，不切换（已清除 round cooldown）' 'OK'
+    } else {
+      Write-WdLog 'proxy-check jitter recovered，不切换' 'OK'
+    }
+    $script:WarpProxyLastState = 'ok'
+    $script:WarpProxyLastLogAt = Get-Date
+    return @{ Acted = $false; ConfigError = $false; ConfirmedDown = $false }
+  }
+  if ($r.Ok) {
+    $script:WarpProxyConfigErrSig = ''
+    $wasCooling = $script:RoundCooldownUntil -gt (Get-Date)
+    if ($wasCooling) { $script:RoundCooldownUntil = [DateTime]::MinValue }
+    $now = Get-Date
+    $stateChanged = ($script:WarpProxyLastState -ne 'ok')
+    $due = $stateChanged -or $script:WarpProxyLastLogAt -eq [DateTime]::MinValue -or
+      (($now - $script:WarpProxyLastLogAt).TotalMinutes -ge $NormalLogMinutes)
+    if ($due) {
+      Write-WdLog "proxy-check ok target=$target tcp=$($r.TcpMs)ms udp=$($r.UdpMs)ms$(if ($wasCooling) { '（冷却已清除）' } else { '' })"
+      $script:WarpProxyLastLogAt = $now
+    }
+    $script:WarpProxyLastState = 'ok'
+    return @{ Acted = $false; ConfigError = $false; ConfirmedDown = $false }
+  }
+  $failTxt = 'stage=' + $r.Stage + ' kind=' + $r.Kind + ' reason=' + (Shorten (Mask-Proxy (Mask-Text ([string]$r.Reason))) 200)
+  if ($r.Rechecked) {
+    Write-WdLog "proxy-check failed $failTxt，$($script:ProxyCheckRecheckSeconds)s 后复检仍失败（已确认不可用）" 'WARN'
+  } else {
+    Write-WdLog "proxy-check failed $failTxt，proxy_check_recheck_seconds=0（直接确认不可用，超时预算 $($script:ProxyCheckTimeoutSeconds)s）" 'WARN'
+  }
+  $script:WarpProxyLastState = 'down'
+  $can = Test-WarpProxyCanFailover -ProxyUrl $Plan.Endpoint
+  if (-not $can.Allowed) {
+    Write-WdLog ('proxy-check 确认不可用但未切换：' + $can.Reason) 'ERROR'
+    return @{ Acted = $false; ConfigError = $false; ConfirmedDown = $true }
+  }
+  if ((Get-Date) -lt $script:RoundCooldownUntil) {
+    Write-WdLog "proxy-check 确认不可用，但上一轮失败后的冷却中（$($script:RoundCooldownUntil.ToString('HH:mm:ss')) 后恢复），本轮不切换"
+    return @{ Acted = $false; ConfigError = $false; ConfirmedDown = $true }
+  }
+  $fr = Invoke-WarpProxyFailover -ProxyUrl $Plan.Endpoint -UdpTarget $script:ProxyCheckUdpTarget -TimeoutSeconds $script:ProxyCheckTimeoutSeconds -RequireUdp $script:ProxyCheckRequireUdp -Uid $script:SubscriptionUid -MaxCandidates $script:MaxCandidates -SwitchGapSeconds $script:ProxySwitchGapSeconds -FailoverBudgetSeconds $script:ProxyFailoverBudgetSeconds
+  if (Get-Prop $fr 'ConfigError') {
+    $sig = 'failover|' + [string](Get-Prop $fr 'Node')
+    if ($script:WarpProxyConfigErrSig -ne $sig) {
+      $script:WarpProxyConfigErrSig = $sig
+      Write-WdLog 'proxy-check config error（failover 中），已停止候选循环' 'ERROR'
+    }
+    $script:WarpProxyLastState = 'config'
+    return @{ Acted = $true; ConfigError = $true; ConfirmedDown = $true }
+  }
+  if (-not (Get-Prop $fr 'Ok')) {
+    $script:RoundCooldownUntil = (Get-Date).AddMinutes($RoundCooldownMinutes)
+    Write-WdLog "proxy-check failover 失败，round cooldown $RoundCooldownMinutes 分钟" 'ERROR'
+    return @{ Acted = $true; ConfigError = $false; ConfirmedDown = $true }
+  }
+  $script:WarpProxyConfigErrSig = ''
+  $script:WarpProxyLastState = 'ok'
+  $script:WarpProxyLastLogAt = Get-Date
+  return @{ Acted = $true; ConfigError = $false; ConfirmedDown = $true }
+}
+
 function Invoke-WatchIteration {
   param(
     [int]$MaxCandidates,
@@ -2059,6 +3451,17 @@ function Invoke-WatchIteration {
     [int]$NormalLogMinutes = 20, [int]$RefreshSettleSeconds = 3,
     [ValidateRange(1, 10)][int]$TransportConfirmRounds = 2
   )
+  # 每轮按当前 config.json 重算模式：warp-proxy 走独立状态机，其余保持 legacy 原样。
+  $plan = Resolve-ProxyCheckPlan
+  if ($plan.Mode -eq 'warp-proxy') {
+    Set-WarpProxyMode -Active $true
+    return Invoke-WarpProxyIteration -Plan $plan
+  }
+  Set-WarpProxyMode -Active $false
+  if ($plan.Mode -eq 'warp-direct' -and -not $script:WarpDirectWarned) {
+    $script:WarpDirectWarned = $true
+    Write-WdLog 'proxy-check 检测到直连 WARP（warp.enabled=true 且 warp.proxy 为空）：仍走 legacy 巡检；legacy 可能因 proxies.all_down/节点失效切换 Clash 并 DELETE /connections，与 WARP 流量无关（已知风险）' 'WARN'
+  }
   $wd = $null
   try { $wd = Get-WatchdogStatus }
   catch {
@@ -2357,6 +3760,25 @@ function Invoke-WatchIteration {
 function Invoke-DryRun {
   param([string]$Uid)
   Write-WdLog '===== 只读试运行（零配置写入，运行日志除外；零切换；零网关配额消耗） ====='
+  # WARP proxy 检查预览：只做一次 SOCKS5 检查（不复检、不切换、不写状态）。
+  $dryPlan = Resolve-ProxyCheckPlan
+  $dryTarget = if ($dryPlan.Endpoint -ne '') { Format-ProxyEndpoint -Url $dryPlan.Endpoint } else { '(无)' }
+  Write-WdLog "proxy-check 设置：模式=$($dryPlan.Mode) target=$dryTarget source=$($dryPlan.Source) 间隔=$($script:ProxyCheckIntervalSeconds)s 复检=$($script:ProxyCheckRecheckSeconds)s 超时=$($script:ProxyCheckTimeoutSeconds)s failover=$($script:ProxyCheckFailover) 预算=$($script:ProxyFailoverBudgetSeconds)s udp=$($script:ProxyCheckUdpTarget) require_udp=$($script:ProxyCheckRequireUdp) stale=$($dryPlan.Stale)"
+  if ($dryPlan.ConfigError) {
+    if (-not $dryPlan.ErrorLogged) {
+      Write-WdLog ('proxy-check config error：' + (Shorten (Mask-Proxy (Mask-Text ([string]$dryPlan.Reason))) 200)) 'ERROR'
+    }
+    Write-WdLog 'proxy-check 因配置错误回退 legacy（DryRun 不做 WARP 检查）' 'WARN'
+  } elseif ($dryPlan.Mode -eq 'warp-proxy') {
+    $dryResult = Test-WarpProxyCheck -ProxyUrl $dryPlan.Endpoint -TimeoutSeconds $script:ProxyCheckTimeoutSeconds -RequireUdp $script:ProxyCheckRequireUdp -UdpTarget $script:ProxyCheckUdpTarget
+    Write-WdLog ('proxy-check dry-run target=' + $dryTarget + ' class=' + $dryResult.Class + ' ok=' + $dryResult.Ok +
+      ' tcp=' + $dryResult.TcpOk + ' udp=' + $dryResult.UdpOk + ' kind=' + $dryResult.Kind + ' stage=' + $dryResult.Stage +
+      ' duration=' + $dryResult.DurationMs + 'ms reason=' + (Shorten (Mask-Proxy (Mask-Text ([string]$dryResult.Reason))) 200))
+  } elseif ($dryPlan.Mode -eq 'warp-direct') {
+    Write-WdLog 'proxy-check 直连 WARP（warp.proxy 为空）：不做 SOCKS5 检查；legacy 巡检仍可能切换 Clash 节点（已知风险）' 'WARN'
+  } else {
+    Write-WdLog 'proxy-check 未启用（legacy 巡检）'
+  }
   $wd = Get-WatchdogStatus
   $prox = Get-Prop $wd 'proxies'
   $anon = Get-Prop $wd 'anonymous'
@@ -2473,6 +3895,41 @@ $script:StreakStart = [DateTime]::MinValue
 $script:LastStaleProbe = [DateTime]::MinValue
 
 try {
+  # watchdog.json 只读且不依赖 Clash/网关：必须在实例互斥与所有 Resolve-* 之前读取，
+  # 这样 -ProxyCheckProbeOnly 能在常驻看门狗运行时执行（design §0.1/M1）。
+  try { Read-WatchdogConfig -Path $script:WatchdogConfigPath }
+  catch {
+    if ($ProxyCheckProbeOnly) {
+      Write-WdLog ('proxy-check config error：' + (Mask-Proxy (Mask-Text $_.Exception.Message))) 'ERROR'
+      exit 2
+    }
+    throw
+  }
+  if ($ProxyCheckProbeOnly) {
+    # 独立诊断入口：只依赖 watchdog.json + config.json 的 warp.proxy（或 -ProxyCheckEndpoint），
+    # 不读 Clash API/secret/profile，不获取网关 key，不申请互斥，不切换、不写配置/状态。
+    $probePlan = Resolve-ProxyCheckPlan
+    if ($probePlan.ConfigError) {
+      if (-not $probePlan.ErrorLogged) {
+        Write-WdLog ('proxy-check config error：' + (Shorten (Mask-Proxy (Mask-Text ([string]$probePlan.Reason))) 200)) 'ERROR'
+      }
+      exit 2
+    }
+    if ($probePlan.Mode -ne 'warp-proxy') {
+      if (-not $probePlan.ErrorLogged) {
+        Write-WdLog ('proxy-check config error：没有检查目标（mode=' + $probePlan.Mode + '，reason=' + $probePlan.Reason + '）；请设置 config.json 的 warp.proxy 或传 -ProxyCheckEndpoint') 'ERROR'
+      }
+      exit 2
+    }
+    $probeResult = Test-WarpProxyCheck -ProxyUrl $probePlan.Endpoint -TimeoutSeconds $script:ProxyCheckTimeoutSeconds -RequireUdp $script:ProxyCheckRequireUdp -UdpTarget $script:ProxyCheckUdpTarget
+    Write-WdLog ('proxy-check probe-only target=' + (Format-ProxyEndpoint -Url $probePlan.Endpoint) +
+      ' class=' + $probeResult.Class + ' ok=' + $probeResult.Ok + ' tcp=' + $probeResult.TcpOk +
+      ' udp=' + $probeResult.UdpOk + ' kind=' + $probeResult.Kind + ' stage=' + $probeResult.Stage +
+      ' duration=' + $probeResult.DurationMs + 'ms reason=' + (Shorten (Mask-Proxy (Mask-Text ([string]$probeResult.Reason))) 200))
+    if ($probeResult.Class -eq 'config') { exit 2 }
+    if ($probeResult.Ok) { exit 0 }
+    exit 1
+  }
   # 全局命名互斥保证单实例：start.ps1 常驻 + 手动再起一个会并发写三文件、互覆
   # 节流窗口并重复切换，拿到锁才往下走，拿不到直接退出（-Once 手动检查也一样，
   # 避免与常驻实例互相干扰）。Global 命名空间需提权，普通用户建不出来时降级
@@ -2498,8 +3955,6 @@ try {
     exit 1
   }
   Resolve-ClashSecret | Out-Null
-  # 必须早于下面这行启动横幅与任何候选排序：横幅要如实打印生效的地区降权配置。
-  Read-WatchdogConfig -Path $script:WatchdogConfigPath
   # profile uid 为空 = 跟随 profiles.yaml 的 current:（重新导入本地 yaml 会换 uid）。
   # 解析失败**不中止启动**：uid 只影响「订阅刷新 + selected.now 书签」，逐节点切换、
   # 探针、回滚全都不需要它。用 bookkeeping 的依赖否决核心功能是反的——真解析不出来时
@@ -2540,11 +3995,21 @@ try {
   if ($script:DeprioritizePenaltyMs -gt 0 -and @($regionKeysForLog).Count -gt 0) { $regionCfg = "$($regionKeysForLog -join '/')+$($script:DeprioritizePenaltyMs)ms" }
   $excludeCfg = if (@($script:ExcludeContains).Count -gt 0) { @($script:ExcludeContains) -join '/' } else { '已关闭' }
   Write-WdLog "看门狗启动：selector=$($script:Selector) uid=$($script:SubscriptionUid) 候选上限=$($script:MaxCandidates) 网关=$($script:GatewayBase) 模型=$VerifyModel 轮询=${PollSeconds}s 正常心跳=${NormalLogMinutes}分钟 quota记忆=${QuotaFailMemoryMinutes}分钟 transport连续确认=${script:TransportConfirmRounds}轮 探针通道=$(if ($script:ProbeSupported) { 'watchdog-probe' } else { 'legacy' }) 闸门等待=${ProxyReadySeconds}s 刷新等待=${RefreshSettleSeconds}s 地区降权=${regionCfg} 子串排除=${excludeCfg}"
+  $bannerPlan = Resolve-ProxyCheckPlan
+  $bannerTarget = if ($bannerPlan.Endpoint -ne '') { Format-ProxyEndpoint -Url $bannerPlan.Endpoint } else { '(无)' }
+  Write-WdLog "proxy-check 模式=$($bannerPlan.Mode) target=$bannerTarget source=$($bannerPlan.Source) 间隔=$($script:ProxyCheckIntervalSeconds)s 复检=$($script:ProxyCheckRecheckSeconds)s 超时=$($script:ProxyCheckTimeoutSeconds)s failover=$($script:ProxyCheckFailover) 预算=$($script:ProxyFailoverBudgetSeconds)s udp=$($script:ProxyCheckUdpTarget) require_udp=$($script:ProxyCheckRequireUdp)"
   if ($DryRun) {
     Invoke-DryRun -Uid $script:SubscriptionUid
     exit 0
   }
   if ($Once) {
+    # -Once 是显式诊断入口：配置错误必须 exit 2（§0.9 #5/§11.3），不能像常驻循环那样回退 legacy。
+    if ($bannerPlan.ConfigError) {
+      if (-not $bannerPlan.ErrorLogged) {
+        Write-WdLog ('proxy-check config error：' + (Shorten (Mask-Proxy (Mask-Text ([string]$bannerPlan.Reason))) 200)) 'ERROR'
+      }
+      exit 2
+    }
     # -Once 只有一轮攒不出连续计数：传 1 保留单轮即动作的老语义（仍受内部二次确认门控）；
     # 常驻循环仍用 TransportConfirmRounds 轮防抖。
     if ($script:TransportConfirmRounds -ne 1) {
@@ -2554,7 +4019,11 @@ try {
       -MaxCandidates $script:MaxCandidates -SwitchGapSeconds 0 -VerifyTimeoutSeconds $VerifyTimeoutSeconds `
       -Uid $script:SubscriptionUid -RoundCooldownMinutes $RoundCooldownMinutes -NormalLogMinutes $NormalLogMinutes -RefreshSettleSeconds $RefreshSettleSeconds `
       -TransportConfirmRounds 1
-    # Invoke-WatchIteration 永远返回 @{Acted}（$null 输入时 Get-Prop 守卫回 $null 走 false），点访问恒安全。
+    # legacy 返回 @{Acted}；WARP 模式额外带 ConfigError/ConfirmedDown。固定退出码：
+    # 2=config；1=确认 down 但未切（failover 关闭/非本机 auto/cooldown）或 failover 失败；
+    # 0=无动作/健康/抖动恢复/切换成功。legacy 的 0/1 语义不变。
+    if ((Get-Prop $onceResult 'ConfigError')) { exit 2 }
+    if ((Get-Prop $onceResult 'ConfirmedDown') -and -not (Get-Prop $onceResult 'Acted')) { exit 1 }
     if ($onceResult -ne $null -and $onceResult.Acted -and (Get-Date) -lt $script:RoundCooldownUntil) { exit 1 }
     exit 0
   }
@@ -2567,7 +4036,9 @@ try {
     } catch {
       Write-WdLog "本轮异常：$($_.Exception.Message)" 'WARN'
     }
-    Start-Sleep -Seconds $PollSeconds
+    # WARP proxy 模式用 proxy_check_interval_seconds；每轮都按当轮重算的 WarpProxyActive 选择。
+    if ($script:WarpProxyActive) { Start-Sleep -Seconds $script:ProxyCheckIntervalSeconds }
+    else { Start-Sleep -Seconds $PollSeconds }
   }
 } catch {
   Write-WdLog "启动失败：$($_.Exception.Message)" 'ERROR'
