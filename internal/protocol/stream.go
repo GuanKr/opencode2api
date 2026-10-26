@@ -26,6 +26,12 @@ var errStreamNormalTermination = errors.New("upstream stream terminated normally
 // errSSEUnexpectedEOF reports a stream that ended without a terminal event.
 var errSSEUnexpectedEOF = errors.New("unexpected end of SSE stream")
 
+// ErrStreamIdleTimeout reports that a committed upstream stream stayed silent
+// past the configured bound. It is returned to the caller without a synthetic
+// downstream error event: the client already holds a partial response and is
+// expected to retry.
+var ErrStreamIdleTimeout = errors.New("upstream stream idle timeout")
+
 // streamTermination records how a transcoded stream ended, so the code after
 // readSSE can tell a normal terminal event from an upstream error.
 type streamTermination uint8
@@ -116,6 +122,9 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		if errors.Is(readErr, errStreamNormalTermination) {
 			return emitter.usage, emitter.usageReported, nil
 		}
+		if errors.Is(readErr, ErrStreamIdleTimeout) {
+			return emitter.usage, emitter.usageReported, readErr
+		}
 		if ClientCanceled(ctx, readErr) {
 			return emitter.usage, emitter.usageReported, readErr
 		}
@@ -198,6 +207,9 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 	observer := streamUsageObserver(protocol)
 	_, copyErr := io.Copy(&sseFlushWriter{writer: w, flusher: flusher}, io.TeeReader(reader, observer))
 	usage := observer.Finish()
+	if errors.Is(copyErr, ErrStreamIdleTimeout) {
+		return usage, observer.Reported(), copyErr
+	}
 	if observer.ErrorTermination() {
 		if copyErr != nil {
 			return usage, observer.Reported(), copyErr

@@ -385,6 +385,8 @@ const DICTIONARY = {
       "config.performance.attemptTimeout": "Attempt timeout (seconds)",
       "config.performance.attemptTimeoutHint": "0 = follow the request timeout",
       "config.performance.firstEvent": "First SSE event timeout (seconds, 0 disables)",
+      "config.performance.streamIdle": "Mid-stream idle timeout (seconds)",
+      "config.performance.streamIdleHint": "0 = use the built-in 60-second bound",
       "config.performance.level": "Log level",
       "config.performance.ring": "Log ring size",
       "config.performance.dump":
@@ -1032,6 +1034,8 @@ const DICTIONARY = {
       "config.performance.attemptTimeoutHint": "0 = theo timeout của request",
       "config.performance.firstEvent":
         "Timeout sự kiện SSE đầu tiên (giây, 0 để tắt)",
+      "config.performance.streamIdle": "Timeout nhàn rỗi giữa stream (giây)",
+      "config.performance.streamIdleHint": "0 = dùng mức mặc định 60 giây",
       "config.performance.level": "Mức log",
       "config.performance.ring": "Kích thước ring log",
       "config.performance.dump":
@@ -1606,6 +1610,8 @@ const DICTIONARY = {
       "config.performance.attemptTimeout": "Timeout del tentativo (secondi)",
       "config.performance.attemptTimeoutHint": "0 = segui il timeout della richiesta",
       "config.performance.firstEvent": "Timeout del primo evento SSE (secondi, 0 disabilita)",
+      "config.performance.streamIdle": "Timeout di inattività a metà stream (secondi)",
+      "config.performance.streamIdleHint": "0 = usa il limite predefinito di 60 secondi",
       "config.performance.level": "Livello di log",
       "config.performance.ring": "Dimensione ring di log",
       "config.performance.dump":

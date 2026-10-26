@@ -52,6 +52,31 @@ func TestPreserveUnrenderedSettingsKeepsConsoleOmissions(t *testing.T) {
 	}
 }
 
+// The console form now renders the committed-stream idle bound, so zero is an
+// explicit "use the built-in default" and must not be backfilled from current.
+func TestPreserveUnrenderedSettingsDoesNotBackfillStreamIdleTimeout(t *testing.T) {
+	current := config.Config{Performance: config.PerformanceConfig{StreamIdleTimeoutSeconds: 300}}
+
+	got := preserveUnrenderedSettings(current, ConfigUpdate{})
+	if got.Performance.StreamIdleTimeoutSeconds != 0 {
+		t.Fatalf("zero must survive so Normalize can apply the default: %+v", got.Performance)
+	}
+
+	got = preserveUnrenderedSettings(current, ConfigUpdate{
+		Performance: config.PerformanceConfig{StreamIdleTimeoutSeconds: 0},
+	})
+	if got.Performance.StreamIdleTimeoutSeconds != 0 {
+		t.Fatalf("an explicit zero must survive: %+v", got.Performance)
+	}
+
+	got = preserveUnrenderedSettings(current, ConfigUpdate{
+		Performance: config.PerformanceConfig{StreamIdleTimeoutSeconds: 120},
+	})
+	if got.Performance.StreamIdleTimeoutSeconds != 120 {
+		t.Fatalf("an explicit stream idle bound must win: %+v", got.Performance)
+	}
+}
+
 // An explicit value in the update still wins, so an operator editing config.json
 // and reloading is not fought by the backfill.
 func TestPreserveUnrenderedSettingsPrefersExplicitValues(t *testing.T) {

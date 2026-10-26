@@ -226,6 +226,8 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 每个 Tier 使用自己的原生协议编码请求。启用 `performance.first_event_timeout_seconds` 后，会先等待完整的 SSE data 事件再向客户端交付响应；注释心跳不算首事件。首事件前超时或断开会沿用现有 Key / 代理重试预算，交付后不再重放。默认 `0` 关闭，可对接受请求后无事件的上游尝试设置为 `15` 秒。它限制首事件而非首个文本 token，不适用于 System One；轮转别名使用独立的 `rotation.first_output_seconds`。
 
+流交付给客户端后，`performance.stream_idle_timeout_seconds`（默认 `60`）限制上游相邻数据块之间可以静默多久。超时会关闭该流而不合成 error 事件，并淘汰承载它的 WARP 出口；客户端应自行重试。设为 `0` 使用默认值；负数或大于 `86400` 会被拒绝。
+
 只有匿名通道可用时，`/v1/models` 仅展示符合匿名条件的模型。
 
 免费模型不需要 Zen Key：启用 `anonymous: true` 后由匿名通道提供，已配置的 Key 只作为回退。如果想保留 Key 但只暴露免费模型，设置 `models.free_only: true`：付费模型不再出现在 `/v1/models`，直接请求会被拒绝，轮转别名只保留免费成员；免费模型仍可回退到已配置的 Key。
@@ -376,6 +378,7 @@ pool+http://127.0.0.1:7891
 | `retry.max_attempts`                    | `3`    | 每个认证 Tier 的尝试次数，包含首次请求。         |
 | `retry.timeout_seconds`                 | `300`  | 推理请求总超时，包含流式响应读取。               |
 | `performance.attempt_timeout_seconds`   | `0`    | 单次尝试的总超时；0 表示使用请求总超时。         |
+| `performance.stream_idle_timeout_seconds` | `60`  | 已提交 SSE 流的读取中途空闲上限。               |
 | `performance.max_anonymous_exits`       | `8`    | 每个匿名请求最多尝试的静态代理出口数。           |
 | `performance.free_tier_block_seconds`   | `900`  | 被免费层标记的出口冷却时长。                     |
 | `performance.connect_timeout_seconds`   | `5`    | 建立连接的超时。                                 |

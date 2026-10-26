@@ -78,6 +78,7 @@ function fillConfig(value) {
   $("#c-cooldown").value = value.performance.failure_cooldown_seconds;
   $("#c-attempt-timeout").value = value.performance.attempt_timeout_seconds;
   $("#c-first-event-timeout").value = value.performance.first_event_timeout_seconds || 0;
+  $("#c-stream-idle-timeout").value = value.performance.stream_idle_timeout_seconds ?? 60;
   $("#c-level").value = value.logging.level;
   $("#c-ring").value = value.logging.ring_size;
   $("#c-dump-bodies").checked = !!value.logging.dump_request_bodies;
@@ -126,6 +127,7 @@ async function save(event) {
         failure_cooldown_seconds: numberValue("#c-cooldown"),
         attempt_timeout_seconds: numberValue("#c-attempt-timeout"),
         first_event_timeout_seconds: numberValue("#c-first-event-timeout"),
+        stream_idle_timeout_seconds: numberValue("#c-stream-idle-timeout"),
       },
       logging: {
         level: $("#c-level").value,

@@ -100,6 +100,9 @@ type Gateway struct {
 	// the header wait. Zero arms no per-attempt deadline: each attempt is then
 	// bounded only by the request-level budget.
 	attemptTimeout time.Duration
+	// streamIdleTimeout bounds silence inside a committed SSE stream. Zero
+	// disables the wrapper; the request-level timeout is then the only bound.
+	streamIdleTimeout time.Duration
 	// lastProxyKick throttles on-demand proxy re-probes (see
 	// kickProxyRecheck): without it an all-down spike would spawn one
 	// short-lived probe goroutine per request while the per-proxy CAS only
@@ -143,19 +146,20 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics, war
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	catalog.SetFreeOnly(cfg.Models.FreeOnly)
 	return &Gateway{
-		cfg:            cfg,
-		rotation:       rotationManager,
-		logger:         logger,
-		transports:     transports,
-		zenNodes:       zenNodes,
-		goNodes:        goNodes,
-		anonymous:      anonymousPool(cfg.Anonymous, transports, cooldown, anonymousBackoffFromConfig(cfg.Models.AnonymousBackoff)),
-		warp:           warpPool,
-		catalog:        catalog,
-		monitor:        monitor,
-		attemptTimeout: attemptDeadline(cfg),
-		freeTierBlock:  time.Duration(cfg.Performance.FreeTierBlockSeconds) * time.Second,
-		sessions:       newSessionGenerations(),
+		cfg:               cfg,
+		rotation:          rotationManager,
+		logger:            logger,
+		transports:        transports,
+		zenNodes:          zenNodes,
+		goNodes:           goNodes,
+		anonymous:         anonymousPool(cfg.Anonymous, transports, cooldown, anonymousBackoffFromConfig(cfg.Models.AnonymousBackoff)),
+		warp:              warpPool,
+		catalog:           catalog,
+		monitor:           monitor,
+		attemptTimeout:    attemptDeadline(cfg),
+		streamIdleTimeout: cfg.Performance.StreamIdleTimeout(),
+		freeTierBlock:     time.Duration(cfg.Performance.FreeTierBlockSeconds) * time.Second,
+		sessions:          newSessionGenerations(),
 	}, nil
 }
 
@@ -446,7 +450,9 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}
-		defer resp.Body.Close()
+		// Evaluate resp.Body at return time: a committed stream replaces it with
+		// the idle wrapper below, and this closure must close the replacement.
+		defer func() { _ = resp.Body.Close() }()
 		if meta != nil {
 			meta.Tier = string(upstreamRoute.Tier)
 			meta.Protocol = upstreamRoute.Protocol
@@ -455,6 +461,11 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		if resp.StatusCode/100 != 2 {
 			copyErrorResponse(w, external, resp, ids.Request)
 			return
+		}
+		if stream && g.streamIdleTimeout > 0 {
+			// Only a committed 2xx SSE stream gets the idle bound. Error bodies
+			// are read by copyErrorResponse and must not be cut short.
+			resp.Body = newStreamIdleBody(resp.Body, g.streamIdleTimeout)
 		}
 		shape := requestShapeFrom(r.Context())
 		toolRenames := shape.renames
@@ -482,10 +493,18 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				meta.Usage, meta.UsageReported = usage, usageReported
 				if err != nil {
 					meta.Outcome = "stream_error"
-					if wire.ClientCanceled(r.Context(), err) {
+					if !errors.Is(err, wire.ErrStreamIdleTimeout) && wire.ClientCanceled(r.Context(), err) {
 						meta.Outcome = "client_canceled"
 					}
 				}
+			}
+			if errors.Is(err, wire.ErrStreamIdleTimeout) {
+				proxy := ""
+				if meta != nil {
+					proxy = meta.Proxy
+				}
+				g.logger.Warn("upstream stream idle timeout", "component", "stream", "event", "stream_idle_timeout", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "proxy", proxy, "timeout_ms", g.streamIdleTimeout.Milliseconds())
+				return
 			}
 			if err != nil && !errors.Is(err, context.Canceled) {
 				g.logger.Warn("downstream stream ended with an error", "component", "stream", "event", "stream_failed", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "error", err)

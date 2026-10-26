@@ -49,13 +49,19 @@ func (g *Gateway) warpUsesBun(baseURL, model string) bool {
 	return g.catalog.IsFreeModel(model) && (models.IsV1Upstream(baseURL) || strings.HasSuffix(lane, "/inference"))
 }
 
+// warpFailureSink retires an exit that cannot carry traffic. *warp.Pool is the
+// production implementation; tests substitute a recorder.
+type warpFailureSink interface {
+	Fail(lease *warp.Lease, reason string)
+}
+
 // warpLease is one acquired WARP exit together with the HTTP clients that dial
 // through it. Every client is per-attempt: the exit is released as soon as the
 // response body is closed, so pooled connections must be closed at the same
 // time.
 type warpLease struct {
 	lease   *warp.Lease
-	pool    *warp.Pool
+	pool    warpFailureSink
 	regular *http.Client
 	bun     *http.Client
 	useBun  bool
@@ -138,7 +144,7 @@ type warpBody struct {
 func (b *warpBody) Read(data []byte) (int, error) {
 	n, err := b.ReadCloser.Read(data)
 	if err != nil && err != io.EOF && !b.diagnostic && !errors.Is(err, context.Canceled) {
-		b.lease.pool.Fail(b.lease.lease, "stream read error")
+		b.fail("stream read error")
 	}
 	return n, err
 }
@@ -147,6 +153,15 @@ func (b *warpBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.lease.close()
 	return err
+}
+
+// fail retires the exit behind this body. Missing state is a no-op; Pool.Fail
+// already handles a nil lease and is idempotent.
+func (b *warpBody) fail(reason string) {
+	if b == nil || b.lease == nil || b.lease.pool == nil || b.diagnostic {
+		return
+	}
+	b.lease.pool.Fail(b.lease.lease, reason)
 }
 
 // warpFailReason names the condition that should retire an exit. A stalled

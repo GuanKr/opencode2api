@@ -254,6 +254,10 @@ func NormalizeLaneOrder(raw []string) ([]string, error) {
 const (
 	DefaultMaxAnonymousExits    = 8
 	DefaultFreeTierBlockSeconds = 900
+	// DefaultStreamIdleTimeoutSeconds bounds silence between reads of a
+	// committed SSE stream. A committed stream cannot be replayed, so the
+	// gateway closes it instead of waiting for the request-level timeout.
+	DefaultStreamIdleTimeoutSeconds = 60
 )
 
 // RetryConfig bounds the upstream retries. MaxAttempts caps the attempts of a
@@ -347,9 +351,11 @@ type WebUIConfig struct {
 // the dial timeout, the base cooldown after an upstream key or anonymous
 // proxy fails, and the per-attempt and first-event timeouts.
 // AttemptTimeoutSeconds 0 leaves only the request-level timeout in place,
-// FirstEventTimeoutSeconds 0 disables the first-event wait, MaxAnonymousExits
-// 0 uses the built-in cap, and FreeTierBlockSeconds 0 uses the built-in
-// cool-down for an exit the free tier flagged.
+// FirstEventTimeoutSeconds 0 disables the first-event wait,
+// StreamIdleTimeoutSeconds 0 uses the built-in bound on silence inside a
+// committed stream, MaxAnonymousExits 0 uses the built-in cap, and
+// FreeTierBlockSeconds 0 uses the built-in cool-down for an exit the free tier
+// flagged.
 type PerformanceConfig struct {
 	MaxIdleConns             int `json:"max_idle_conns"`
 	MaxIdleConnsPerHost      int `json:"max_idle_conns_per_host"`
@@ -359,6 +365,10 @@ type PerformanceConfig struct {
 	FailureCooldownSeconds   int `json:"failure_cooldown_seconds"`
 	AttemptTimeoutSeconds    int `json:"attempt_timeout_seconds"`
 	FirstEventTimeoutSeconds int `json:"first_event_timeout_seconds"`
+	// StreamIdleTimeoutSeconds bounds how long an established SSE stream may
+	// stay silent between reads before the gateway closes it. 0 uses the
+	// built-in default; a committed stream is never replayed.
+	StreamIdleTimeoutSeconds int `json:"stream_idle_timeout_seconds"`
 	// MaxAnonymousExits bounds how many distinct static proxy exits one
 	// anonymous request may walk. Each exit still walks every base in
 	// upstream.anonymous_lane_order (one by default), so the upstream request
@@ -397,6 +407,16 @@ func (cfg PerformanceConfig) AttemptTimeout(requestTimeout time.Duration) time.D
 	return requestTimeout
 }
 
+// StreamIdleTimeout returns the bound between reads of an established SSE
+// stream. Zero or negative means no bound; Normalize prevents that for loaded
+// configurations by filling the default first.
+func (cfg PerformanceConfig) StreamIdleTimeout() time.Duration {
+	if cfg.StreamIdleTimeoutSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(cfg.StreamIdleTimeoutSeconds) * time.Second
+}
+
 // Load reads the config file at path, strips its // and /* */ comments, and
 // decodes it over the built-in defaults. Decoding is strict: unknown fields
 // and anything after the first JSON value are errors. The result is then
@@ -416,7 +436,7 @@ func Load(path string) (Config, error) {
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go", Anonymous: "https://opencode.ai/inference"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, StreamIdleTimeoutSeconds: DefaultStreamIdleTimeoutSeconds},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
@@ -505,21 +525,27 @@ func Normalize(path string, cfg Config) (Config, error) {
 	if cfg.Performance.FirstEventTimeoutSeconds < 0 || cfg.Performance.FirstEventTimeoutSeconds > 86400 {
 		return Config{}, errors.New("performance.first_event_timeout_seconds must be between 0 and 86400 (0 disables the first-event timeout)")
 	}
+	if cfg.Performance.StreamIdleTimeoutSeconds < 0 || cfg.Performance.StreamIdleTimeoutSeconds > 86400 {
+		return Config{}, errors.New("performance.stream_idle_timeout_seconds must be between 0 and 86400 (0 uses the built-in 60-second bound)")
+	}
 	if cfg.Performance.MaxAnonymousExits < 0 {
 		return Config{}, errors.New("performance.max_anonymous_exits must not be negative (0 uses the built-in cap)")
 	}
 	if cfg.Performance.FreeTierBlockSeconds < 0 {
 		return Config{}, errors.New("performance.free_tier_block_seconds must not be negative (0 uses the built-in cool-down)")
 	}
-	// Fill the two anonymous-lane bounds in rather than leaving them at the
-	// usage-site fallbacks: every other performance field is concrete after
-	// Normalize, and the console form renders what GET /api/config returns. A
-	// zero here reached the UI as "0" next to a README that says 8 and 900.
+	// Fill the bounds in rather than leaving them at the usage-site fallbacks:
+	// every other performance field is concrete after Normalize, and the
+	// console form renders what GET /api/config returns. A zero here reached
+	// the UI as "0" next to a README that describes the built-in value.
 	if cfg.Performance.MaxAnonymousExits == 0 {
 		cfg.Performance.MaxAnonymousExits = DefaultMaxAnonymousExits
 	}
 	if cfg.Performance.FreeTierBlockSeconds == 0 {
 		cfg.Performance.FreeTierBlockSeconds = DefaultFreeTierBlockSeconds
+	}
+	if cfg.Performance.StreamIdleTimeoutSeconds == 0 {
+		cfg.Performance.StreamIdleTimeoutSeconds = DefaultStreamIdleTimeoutSeconds
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
