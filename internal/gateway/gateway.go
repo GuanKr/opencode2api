@@ -188,6 +188,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/systemone", g.authenticate(g.handleSystemOne))
 	mux.HandleFunc("GET /v1/watchdog/status", g.authenticate(g.handleWatchdogStatus))
 	mux.HandleFunc("POST /v1/watchdog/probe", g.authenticate(g.handleWatchdogProbe))
+	mux.HandleFunc("POST /v1/watchdog/warp/reset", g.authenticate(g.handleWatchdogWarpReset))
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	return telemetry.Recover(g.logger, mux)
 }
@@ -504,6 +505,18 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 					proxy = meta.Proxy
 				}
 				g.logger.Warn("upstream stream idle timeout", "component", "stream", "event", "stream_idle_timeout", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "proxy", proxy, "timeout_ms", g.streamIdleTimeout.Milliseconds())
+				return
+			}
+			if errors.Is(err, wire.ErrStreamAborted) {
+				// The exit carrying this stream was rotated. The response is
+				// already committed, so there is no error event to send and no
+				// client cancellation to report; the retry belongs to the next
+				// request.
+				proxy := ""
+				if meta != nil {
+					proxy = meta.Proxy
+				}
+				g.logger.Warn("upstream stream aborted by exit rotation", "component", "stream", "event", "stream_aborted", "request_id", ids.Request, "model", model, "tier", upstreamRoute.Tier, "proxy", proxy)
 				return
 			}
 			if err != nil && !errors.Is(err, context.Canceled) {

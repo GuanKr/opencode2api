@@ -51,12 +51,19 @@ type healthProxies struct {
 // healthWarp reports the state of the userspace WARP pool. It is omitted when
 // the switch is off so existing readiness consumers see the same document.
 type healthWarp struct {
-	Status  string `json:"status"`
-	Stack   string `json:"stack"`
-	Size    int    `json:"size"`
-	Active  int    `json:"active"`
-	Standby int    `json:"standby"`
-	Cooling int    `json:"cooling"`
+	Status              string     `json:"status"`
+	Stack               string     `json:"stack"`
+	Size                int        `json:"size"`
+	Active              int        `json:"active"`
+	Standby             int        `json:"standby"`
+	Cooling             int        `json:"cooling"`
+	StartedAt           time.Time  `json:"started_at"`
+	FailuresTotal       uint64     `json:"failures_total"`
+	FailureStreak       int        `json:"failure_streak"`
+	CreateFailuresTotal uint64     `json:"create_failures_total"`
+	LastFailureAt       *time.Time `json:"last_failure_at,omitempty"`
+	LastFailureKind     string     `json:"last_failure_kind"`
+	LastSuccessAt       *time.Time `json:"last_success_at,omitempty"`
 }
 
 // handleHealth reports readiness. It answers 503 while the model catalog is
@@ -76,12 +83,25 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		snapshot := g.warp.Snapshot()
 		warpActive = snapshot.Active
 		warpStatus = &healthWarp{
-			Status:  "unavailable",
-			Stack:   snapshot.Stack,
-			Size:    snapshot.Size,
-			Active:  snapshot.Active,
-			Standby: snapshot.Standby,
-			Cooling: snapshot.Cooling,
+			Status:              "unavailable",
+			Stack:               snapshot.Stack,
+			Size:                snapshot.Size,
+			Active:              snapshot.Active,
+			Standby:             snapshot.Standby,
+			Cooling:             snapshot.Cooling,
+			StartedAt:           snapshot.StartedAt.UTC(),
+			FailuresTotal:       snapshot.FailuresTotal,
+			FailureStreak:       snapshot.FailureStreak,
+			CreateFailuresTotal: snapshot.CreateFailuresTotal,
+			LastFailureKind:     snapshot.LastFailureKind,
+		}
+		if !snapshot.LastFailureAt.IsZero() {
+			lastFailure := snapshot.LastFailureAt.UTC()
+			warpStatus.LastFailureAt = &lastFailure
+		}
+		if !snapshot.LastSuccessAt.IsZero() {
+			lastSuccess := snapshot.LastSuccessAt.UTC()
+			warpStatus.LastSuccessAt = &lastSuccess
 		}
 		if snapshot.Active > 0 {
 			warpStatus.Status = "ready"

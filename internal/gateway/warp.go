@@ -139,18 +139,27 @@ type warpBody struct {
 	io.ReadCloser
 	lease      *warpLease
 	diagnostic bool
+	cancel     context.CancelFunc
 }
 
 func (b *warpBody) Read(data []byte) (int, error) {
 	n, err := b.ReadCloser.Read(data)
-	if err != nil && err != io.EOF && !b.diagnostic && !errors.Is(err, context.Canceled) {
-		b.fail("stream read error")
+	if err != nil && err != io.EOF {
+		if b.lease != nil && b.lease.lease != nil && b.lease.lease.Aborted() {
+			return n, wire.ErrStreamAborted
+		}
+		if !b.diagnostic && !errors.Is(err, context.Canceled) {
+			b.fail("stream read error")
+		}
 	}
 	return n, err
 }
 
 func (b *warpBody) Close() error {
 	err := b.ReadCloser.Close()
+	if b.cancel != nil {
+		b.cancel()
+	}
 	b.lease.close()
 	return err
 }
@@ -190,8 +199,14 @@ func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL,
 		}
 		return nil, "", fmt.Errorf("%w: %v", errWARPUnavailable, err)
 	}
+	// The attempt context ends with either the caller's request or the lease,
+	// so a rotation interrupts an in-flight request immediately. It stays live
+	// until the response body is closed: canceling it would abort the stream.
+	attemptCtx, stopAttempt := lease.RequestContext(ctx)
+	req = req.Clone(attemptCtx)
 	owned, err := g.newWarpLease(lease, g.warpUsesBun(baseURL, model))
 	if err != nil {
+		stopAttempt()
 		lease.Release()
 		return nil, "", fmt.Errorf("%w: %v", errWARPUnavailable, err)
 	}
@@ -200,10 +215,19 @@ func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL,
 	diagnostic := isDiagnosticRequest(ctx)
 	resp, err := doInferenceAttempt(owned.client(), req, firstEventTimeout, g.attemptTimeout)
 	if err != nil {
+		if lease.Aborted() {
+			// The exit was rotated under this attempt. That is a retryable
+			// transport failure, not a client cancellation, and the pool has
+			// already retired the exit.
+			owned.close()
+			stopAttempt()
+			return nil, label, fmt.Errorf("%w: %v", warp.ErrExitRotated, err)
+		}
 		if ctx.Err() == nil && !diagnostic {
 			g.warp.Fail(lease, warpFailReason(err))
 		}
 		owned.close()
+		stopAttempt()
 		return nil, label, err
 	}
 	if !diagnostic {
@@ -213,7 +237,7 @@ func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL,
 		}
 		g.warp.Report(lease, resp.StatusCode, body)
 	}
-	resp.Body = &warpBody{ReadCloser: resp.Body, lease: owned, diagnostic: diagnostic}
+	resp.Body = &warpBody{ReadCloser: resp.Body, lease: owned, diagnostic: diagnostic, cancel: stopAttempt}
 	return resp, label, nil
 }
 

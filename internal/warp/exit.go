@@ -68,6 +68,7 @@ type exit struct {
 	network   *netstack.Net
 	mu        sync.Mutex
 	refs      int
+	leases    map[*Lease]struct{}
 	retired   bool
 	closed    bool
 	penalized bool
@@ -183,7 +184,7 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 		<-wg.Wait()
 		return nil, fmt.Errorf("start WARP device: %w", err)
 	}
-	e := &exit{id: reg.ID, stack: stack, device: wg, network: network}
+	e := &exit{id: reg.ID, stack: stack, device: wg, network: network, leases: make(map[*Lease]struct{})}
 	egress, err := e.probe(ctx, wg, peerKey, endpoints)
 	if err != nil {
 		e.close()
@@ -432,25 +433,51 @@ func parseTrace(body io.Reader) (netip.Addr, error) {
 	return addr, nil
 }
 
-func (e *exit) addRef() bool {
+func (e *exit) addRef(lease *Lease) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.retired || e.closed {
 		return false
 	}
 	e.refs++
+	if lease != nil {
+		if e.leases == nil {
+			e.leases = make(map[*Lease]struct{})
+		}
+		e.leases[lease] = struct{}{}
+	}
 	return true
 }
 
-func (e *exit) release() {
+func (e *exit) release(lease *Lease) {
 	e.mu.Lock()
 	if e.refs > 0 {
 		e.refs--
+	}
+	if lease != nil {
+		delete(e.leases, lease)
 	}
 	closeNow := e.refs == 0 && e.retired && !e.closed
 	e.mu.Unlock()
 	if closeNow {
 		e.close()
+	}
+}
+
+// abortLeases cancels every lease currently holding this exit except exclude.
+// The set is snapshotted under the lock and canceled outside it, so a lease's
+// cancellation cannot re-enter the exit lock.
+func (e *exit) abortLeases(exclude *Lease, cause error) {
+	e.mu.Lock()
+	leases := make([]*Lease, 0, len(e.leases))
+	for lease := range e.leases {
+		if lease != exclude {
+			leases = append(leases, lease)
+		}
+	}
+	e.mu.Unlock()
+	for _, lease := range leases {
+		lease.Abort(cause)
 	}
 }
 

@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +33,17 @@ const scaleDownDelay = 60 * time.Second
 // ErrClosed is returned when a pool is used after Close. Callers use it to
 // tell a retiring pool apart from a temporary capacity wait.
 var ErrClosed = errors.New("WARP pool is closed")
+
+// ErrExitRotated is the cancellation cause of every lease that was holding an
+// exit when that exit left the rotation. A request interrupted this way is
+// retryable on another exit; it is not a client cancellation.
+var ErrExitRotated = errors.New("WARP exit rotated")
+
+var (
+	errLeaseReleased = errors.New("WARP lease released")
+	errLeaseAborted  = errors.New("WARP lease aborted")
+	errPoolReset     = errors.New("WARP pool reset")
+)
 
 type logger interface {
 	Debugf(string, ...interface{})
@@ -77,6 +90,7 @@ type Pool struct {
 	newExit func(context.Context) (*exit, error)
 
 	mu        sync.Mutex
+	startedAt time.Time
 	active    []*exit
 	inflight  int
 	waiting   int
@@ -89,12 +103,24 @@ type Pool struct {
 	scaling   bool
 	wait      sync.WaitGroup
 	createMu  sync.Mutex
+
+	failuresTotal       uint64
+	failureStreak       int
+	createFailuresTotal uint64
+	lastFailureAt       time.Time
+	lastFailureKind     string
+	lastSuccessAt       time.Time
 }
 
 type Lease struct {
-	pool *Pool
-	exit *exit
-	once sync.Once
+	pool   *Pool
+	exit   *exit
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	once   sync.Once
+	// aborted is set before the lease context is canceled, so a reader that
+	// sees the cancellation can tell a rotation from an ordinary release.
+	aborted atomic.Bool
 }
 
 // Snapshot is a point-in-time view of a pool for health and admin reporting.
@@ -108,6 +134,17 @@ type Snapshot struct {
 	Standby int
 	Cooling int
 	Egress  []string
+	// Health counters: failures_total is monotonic and covers penalized exits
+	// plus failed exit creations; create_failures_total is the creation subset.
+	// failure_streak advances on every counted failure and is cleared only by a
+	// successful upstream response, never by a successful registration.
+	StartedAt           time.Time
+	FailuresTotal       uint64
+	FailureStreak       int
+	CreateFailuresTotal uint64
+	LastFailureAt       time.Time
+	LastFailureKind     string
+	LastSuccessAt       time.Time
 }
 
 // Options configure a WARP pool.
@@ -218,14 +255,15 @@ func newPool(ctx context.Context, log logger, size int, create func(context.Cont
 	// leaving the pool stuck on its first egress forever.
 	poolCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	p := &Pool{
-		ctx:      poolCtx,
-		cancel:   cancel,
-		logger:   log,
-		size:     size,
-		newExit:  create,
-		reserved: make(map[string]bool),
-		cooling:  make(map[string]time.Time),
-		changed:  make(chan struct{}),
+		ctx:       poolCtx,
+		cancel:    cancel,
+		logger:    log,
+		size:      size,
+		newExit:   create,
+		startedAt: time.Now(),
+		reserved:  make(map[string]bool),
+		cooling:   make(map[string]time.Time),
+		changed:   make(chan struct{}),
 	}
 	first, err := p.createExit(ctx)
 	if err != nil {
@@ -266,13 +304,16 @@ func (p *Pool) Acquire(ctx context.Context) (*Lease, error) {
 			index := p.next % len(p.active)
 			p.next = (p.next + 1) % len(p.active)
 			active := p.active[index]
-			if active.addRef() {
+			leaseCtx, leaseCancel := context.WithCancelCause(p.ctx)
+			lease := &Lease{pool: p, exit: active, ctx: leaseCtx, cancel: leaseCancel}
+			if active.addRef(lease) {
 				p.inflight++
 				p.mu.Unlock()
 				// Demand just rose: grow the ring toward it in the background.
 				p.startRefill()
-				return &Lease{pool: p, exit: active}, nil
+				return lease, nil
 			}
+			leaseCancel(errLeaseReleased)
 		}
 		p.waiting++
 		changed := p.changed
@@ -305,9 +346,12 @@ func (p *Pool) Report(lease *Lease, status int, body []byte) {
 	}
 	rotate, reason := lease.exit.observe(status, body)
 	if !rotate {
+		if status/100 == 2 {
+			p.noteSuccess(lease.exit)
+		}
 		return
 	}
-	p.penalize(lease.exit, reason)
+	p.penalize(lease.exit, lease, reason)
 }
 
 // Fail drops an exit that cannot carry traffic even though the upstream never
@@ -317,7 +361,7 @@ func (p *Pool) Fail(lease *Lease, reason string) {
 	if lease == nil || lease.exit == nil || reason == "" {
 		return
 	}
-	p.penalize(lease.exit, reason)
+	p.penalize(lease.exit, lease, reason)
 }
 
 func (p *Pool) Size() int { return p.size }
@@ -327,7 +371,19 @@ func (p *Pool) Size() int { return p.size }
 func (p *Pool) Snapshot() Snapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	snapshot := Snapshot{Stack: string(p.stack), Size: p.size, Active: len(p.active), Cooling: len(p.cooling)}
+	snapshot := Snapshot{
+		Stack:               string(p.stack),
+		Size:                p.size,
+		Active:              len(p.active),
+		Cooling:             len(p.cooling),
+		StartedAt:           p.startedAt,
+		FailuresTotal:       p.failuresTotal,
+		FailureStreak:       p.failureStreak,
+		CreateFailuresTotal: p.createFailuresTotal,
+		LastFailureAt:       p.lastFailureAt,
+		LastFailureKind:     p.lastFailureKind,
+		LastSuccessAt:       p.lastSuccessAt,
+	}
 	for _, active := range p.active {
 		if active.idle() {
 			snapshot.Standby++
@@ -339,7 +395,59 @@ func (p *Pool) Snapshot() Snapshot {
 	return snapshot
 }
 
-func (p *Pool) penalize(bad *exit, reason string) {
+// noteSuccess clears the failure streak and records the last proof that an
+// exit actually carried a WARP response. A response from an exit that has
+// already left the rotation proves nothing and is ignored.
+func (p *Pool) noteSuccess(e *exit) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.activeIndexLocked(e) < 0 {
+		return
+	}
+	p.failureStreak = 0
+	p.lastSuccessAt = time.Now()
+}
+
+func (p *Pool) noteFailureLocked(kind string) {
+	p.failuresTotal++
+	p.failureStreak++
+	p.lastFailureAt = time.Now()
+	p.lastFailureKind = kind
+}
+
+func (p *Pool) noteCreateFailure() {
+	p.mu.Lock()
+	p.createFailuresTotal++
+	p.noteFailureLocked("create")
+	p.mu.Unlock()
+}
+
+// failureKind maps a penalize reason to the bounded label the health feed
+// exposes. Raw error text never reaches that feed.
+func failureKind(reason string) string {
+	switch {
+	case strings.HasPrefix(reason, "HTTP 429"):
+		return "http_429"
+	case strings.HasPrefix(reason, "HTTP 403"):
+		return "http_403"
+	case reason == "transport error":
+		return "transport"
+	case reason == "first event timeout":
+		return "first_event_timeout"
+	case reason == "attempt timeout":
+		return "attempt_timeout"
+	case reason == "stream idle timeout":
+		return "stream_idle"
+	case reason == "stream read error":
+		return "stream_read"
+	case reason == "create":
+		return "create"
+	default:
+		return "other"
+	}
+}
+
+func (p *Pool) penalize(bad *exit, exclude *Lease, reason string) {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -354,6 +462,7 @@ func (p *Pool) penalize(bad *exit, reason string) {
 		p.mu.Unlock()
 		return
 	}
+	p.noteFailureLocked(failureKind(reason))
 	if key := bad.egressKey(); key != "" {
 		p.cooling[key] = time.Now().Add(egressCooldown)
 		delete(p.reserved, key)
@@ -365,6 +474,11 @@ func (p *Pool) penalize(bad *exit, reason string) {
 	p.notifyLocked()
 	p.wait.Add(1)
 	p.mu.Unlock()
+
+	// Abort every other request on this exit now instead of letting it wait
+	// for the replacement and the device close. The reporting lease is kept
+	// alive so its 429/403 body can still be drained.
+	bad.abortLeases(exclude, ErrExitRotated)
 
 	if p.logger != nil {
 		p.logger.Warnf("Rotating OpenCode WARP egress %s (%s)", bad.id, reason)
@@ -554,6 +668,43 @@ func (p *Pool) scaleDown() {
 	}
 }
 
+// Reset takes every active exit out of rotation and aborts its leases, then
+// refills the pool. It is the explicit rotation the watchdog uses after a
+// network switch: each in-flight request on a retired exit fails now instead of
+// waiting for a device close, and the exits close as soon as their leases are
+// released. Reset reports how many exits it removed and is a no-op on a closed
+// pool.
+func (p *Pool) Reset(cause error) int {
+	if cause == nil {
+		cause = errPoolReset
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return 0
+	}
+	active := p.active
+	p.active = nil
+	p.next = 0
+	for _, item := range active {
+		if key := item.egressKey(); key != "" {
+			delete(p.reserved, key)
+		}
+	}
+	p.notifyLocked()
+	p.mu.Unlock()
+
+	for _, item := range active {
+		item.abortLeases(nil, cause)
+		item.retire()
+	}
+	if len(active) > 0 && p.logger != nil {
+		p.logger.Warnf("Resetting OpenCode WARP pool (%d exits): %v", len(active), cause)
+	}
+	p.startRefill()
+	return len(active)
+}
+
 // after runs fn once delay has elapsed, unless the pool closes first.
 func (p *Pool) after(delay time.Duration, fn func()) {
 	p.wait.Add(1)
@@ -582,6 +733,9 @@ func (p *Pool) createExit(ctx context.Context) (*exit, error) {
 		}
 		candidate, err := p.newExit(ctx)
 		if err != nil {
+			if !errors.Is(err, ErrClosed) {
+				p.noteCreateFailure()
+			}
 			return nil, err
 		}
 		key := candidate.egressKey()
@@ -609,6 +763,7 @@ func (p *Pool) createExit(ctx context.Context) (*exit, error) {
 		}
 		candidate.close()
 	}
+	p.noteCreateFailure()
 	return nil, lastErr
 }
 
@@ -655,12 +810,66 @@ func (p *Pool) Close() {
 	p.notifyLocked()
 	p.mu.Unlock()
 
+	// Abort before canceling the pool context so these leases report the
+	// close, not a bare parent cancellation.
+	for _, item := range active {
+		item.abortLeases(nil, ErrClosed)
+	}
 	p.cancel()
 	for _, item := range active {
 		p.releaseReservation(item)
 		item.retire()
 	}
 	p.wait.Wait()
+}
+
+// Done is closed when the lease is aborted or released.
+func (l *Lease) Done() <-chan struct{} {
+	if l == nil || l.ctx == nil {
+		return nil
+	}
+	return l.ctx.Done()
+}
+
+// Aborted reports whether the lease was canceled because its exit left the
+// rotation, rather than released normally.
+func (l *Lease) Aborted() bool {
+	return l != nil && l.aborted.Load()
+}
+
+// Abort cancels the lease with cause and marks it aborted.
+func (l *Lease) Abort(cause error) {
+	if l == nil {
+		return
+	}
+	if cause == nil {
+		cause = errLeaseAborted
+	}
+	l.aborted.Store(true)
+	if l.cancel != nil {
+		l.cancel(cause)
+	}
+}
+
+// RequestContext derives an attempt context from parent that is canceled when
+// either parent ends or the lease is aborted or released. The stop function
+// detaches the lease watcher, cancels the derived context, and must be called
+// when the attempt ends.
+func (l *Lease) RequestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if l == nil || l.ctx == nil {
+		return parent, func() {}
+	}
+	ctx, cancel := context.WithCancelCause(parent)
+	stop := context.AfterFunc(l.ctx, func() {
+		cancel(context.Cause(l.ctx))
+	})
+	return ctx, func() {
+		stop()
+		cancel(nil)
+	}
 }
 
 func (l *Lease) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -675,8 +884,11 @@ func (l *Lease) Release() {
 		return
 	}
 	l.once.Do(func() {
+		if l.cancel != nil {
+			l.cancel(errLeaseReleased)
+		}
 		if l.exit != nil {
-			l.exit.release()
+			l.exit.release(l)
 		}
 		if l.pool != nil {
 			l.pool.released()

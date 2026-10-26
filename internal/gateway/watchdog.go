@@ -264,6 +264,30 @@ func (g *Gateway) handleWatchdogProbe(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, result)
 }
 
+// watchdogWarpResetResponse is the result of a forced WARP pool rotation. Active
+// is the number of exits the reset removed; the pool refills in the background.
+type watchdogWarpResetResponse struct {
+	Status string `json:"status"`
+	Active int    `json:"active"`
+}
+
+// handleWatchdogWarpReset serves POST /v1/watchdog/warp/reset (server-key auth,
+// like the rest of the watchdog feed). It retires every active WARP exit and
+// aborts the requests they carry, then starts a refill; the watchdog calls it
+// after switching the host's underlying network node so in-flight requests fail
+// immediately instead of waiting for a device close. A gateway without WARP is
+// a configuration state, not a reset: 409 tells the script to keep its old
+// behaviour.
+func (g *Gateway) handleWatchdogWarpReset(w http.ResponseWriter, _ *http.Request) {
+	if g.warp == nil {
+		httpx.WriteJSON(w, http.StatusConflict, watchdogWarpResetResponse{Status: "unavailable"})
+		return
+	}
+	active := g.warp.Reset(errors.New("watchdog node switch"))
+	g.logger.Info("watchdog reset WARP exits", "component", "warp", "event", "warp_pool_reset", "reason", "watchdog node switch", "active", active)
+	httpx.WriteJSON(w, http.StatusOK, watchdogWarpResetResponse{Status: "reset", Active: active})
+}
+
 // runWatchdogProbe sends exactly one request down the anonymous lane, ignoring
 // the transport-health gate and every cooldown (anonymousCursor.NextProbe), and
 // classifies the answer with the status feed's own vocabulary, so the two can

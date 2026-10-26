@@ -32,6 +32,13 @@ var errSSEUnexpectedEOF = errors.New("unexpected end of SSE stream")
 // expected to retry.
 var ErrStreamIdleTimeout = errors.New("upstream stream idle timeout")
 
+// ErrStreamAborted reports that a committed upstream stream was cut short
+// because the exit carrying it left the rotation. It is returned to the caller
+// without a synthetic downstream error event, like ErrStreamIdleTimeout: the
+// client already holds a partial response and the gateway retries the request
+// on another exit.
+var ErrStreamAborted = errors.New("upstream stream aborted")
+
 // streamTermination records how a transcoded stream ended, so the code after
 // readSSE can tell a normal terminal event from an upstream error.
 type streamTermination uint8
@@ -122,7 +129,7 @@ func TranscodeStream(ctx context.Context, w http.ResponseWriter, reader io.Reade
 		if errors.Is(readErr, errStreamNormalTermination) {
 			return emitter.usage, emitter.usageReported, nil
 		}
-		if errors.Is(readErr, ErrStreamIdleTimeout) {
+		if errors.Is(readErr, ErrStreamIdleTimeout) || errors.Is(readErr, ErrStreamAborted) {
 			return emitter.usage, emitter.usageReported, readErr
 		}
 		if ClientCanceled(ctx, readErr) {
@@ -207,7 +214,7 @@ func ForwardStream(ctx context.Context, w http.ResponseWriter, reader io.Reader,
 	observer := streamUsageObserver(protocol)
 	_, copyErr := io.Copy(&sseFlushWriter{writer: w, flusher: flusher}, io.TeeReader(reader, observer))
 	usage := observer.Finish()
-	if errors.Is(copyErr, ErrStreamIdleTimeout) {
+	if errors.Is(copyErr, ErrStreamIdleTimeout) || errors.Is(copyErr, ErrStreamAborted) {
 		return usage, observer.Reported(), copyErr
 	}
 	if observer.ErrorTermination() {
