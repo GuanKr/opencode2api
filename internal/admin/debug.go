@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"opencode2api/internal/config"
 	"opencode2api/internal/gateway"
 	"opencode2api/internal/httpx"
+	"opencode2api/internal/identity"
 	"opencode2api/internal/jsonutil"
 	modelcatalog "opencode2api/internal/models"
 	"opencode2api/internal/protocol"
@@ -65,6 +67,34 @@ func (a *Server) handleDebugModels(w http.ResponseWriter, _ *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": models, "keys": keys, "metadata": metadata, "catalog": catalog, "last_inference": last})
 }
 
+func setPlaygroundSession(header http.Header) {
+	header.Set("x-opencode-session", identity.RandomID("playground", 16))
+}
+
+func stripPlaygroundParent(payload map[string]any) {
+	metadata, ok := payload["metadata"].(map[string]any)
+	if !ok {
+		return
+	}
+	delete(metadata, "parent_session_id")
+}
+
+func newPlaygroundRequest(ctx context.Context, path string, payload []byte, trace *telemetry.RequestMeta, serverKey string, selectedKey *gateway.DebugKeyView) (*http.Request, error) {
+	ctx = telemetry.WithRequestMeta(gateway.WithWARPPoolReporting(gateway.WithDiagnosticRequest(ctx)), trace)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://gateway.local"+path, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+serverKey)
+	setPlaygroundSession(request.Header)
+	if selectedKey != nil {
+		request = request.WithContext(gateway.WithDebugKeyOverride(request.Context(), gateway.DebugKeyOverride{Tier: selectedKey.Tier, KeyID: selectedKey.ID}))
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	return request, nil
+}
+
 // handleDebugInference runs a request through the gateway itself, in process
 // and always non-streaming, and reports what happened. Auto mode follows
 // normal routing; selected mode pins one upstream key and disables failover,
@@ -91,6 +121,7 @@ func (a *Server) handleDebugInference(w http.ResponseWriter, r *http.Request) {
 	}
 	payload := jsonutil.CloneMap(input.Request)
 	payload["stream"] = false
+	stripPlaygroundParent(payload)
 	model := jsonutil.StringAt(payload, "model")
 	if model == "" {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", "request.model is required")
@@ -127,23 +158,16 @@ func (a *Server) handleDebugInference(w http.ResponseWriter, r *http.Request) {
 	}
 	path := protocol.Path(input.Protocol)
 	trace := &telemetry.RequestMeta{}
-	ctx := telemetry.WithRequestMeta(gateway.WithDiagnosticRequest(r.Context()), trace)
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://gateway.local"+path, bytes.NewReader(encoded))
-	if err != nil {
-		writeAdminError(w, http.StatusInternalServerError, "debug_request_failed", "could not construct Gateway request")
-		return
-	}
 	cfg := a.manager.Config()
 	if cfg.FirstEnabledServerKey() == "" {
 		writeAdminError(w, http.StatusServiceUnavailable, "debug_unavailable", "no local server key is configured")
 		return
 	}
-	request.Header.Set("Authorization", "Bearer "+cfg.FirstEnabledServerKey())
-	if selectedKey != nil {
-		request = request.WithContext(gateway.WithDebugKeyOverride(request.Context(), gateway.DebugKeyOverride{Tier: selectedKey.Tier, KeyID: selectedKey.ID}))
+	request, err := newPlaygroundRequest(r.Context(), path, encoded, trace, cfg.FirstEnabledServerKey(), selectedKey)
+	if err != nil {
+		writeAdminError(w, http.StatusInternalServerError, "debug_request_failed", "could not construct Gateway request")
+		return
 	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json")
 	recorder := debugResponseRecorder()
 	started := time.Now()
 	a.manager.Handler().ServeHTTP(recorder, request)

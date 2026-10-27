@@ -210,7 +210,7 @@ func TestWarpStreamFailureRetiresExit(t *testing.T) {
 	diagnostic := &warpBody{
 		ReadCloser: io.NopCloser(strings.NewReader("")),
 		lease:      &warpLease{lease: lease, pool: sink},
-		diagnostic: true,
+		readOnly:   true,
 	}
 	diagnostic.fail("ignored")
 	if calls, _, _ := sink.snapshot(); calls != 2 {

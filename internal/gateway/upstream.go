@@ -46,6 +46,21 @@ func isDiagnosticRequest(ctx context.Context) bool {
 	return diagnostic
 }
 
+type warpReportingContextKey struct{}
+
+func WithWARPPoolReporting(ctx context.Context) context.Context {
+	return context.WithValue(ctx, warpReportingContextKey{}, true)
+}
+
+func WARPPoolReportingEnabled(ctx context.Context) bool {
+	enabled, _ := ctx.Value(warpReportingContextKey{}).(bool)
+	return enabled
+}
+
+func warpReadOnly(ctx context.Context) bool {
+	return isDiagnosticRequest(ctx) && !WARPPoolReportingEnabled(ctx)
+}
+
 func WithDebugKeyOverride(ctx context.Context, override DebugKeyOverride) context.Context {
 	return context.WithValue(WithDiagnosticRequest(ctx), debugKeyOverrideContextKey{}, override)
 }
@@ -828,10 +843,11 @@ func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier
 }
 
 // key. It performs no failover at all — no anonymous lane, no other key and no
-// other tier — so the outcome describes that one key. It also leaves pool state
-// untouched on purpose: a diagnostic request must never cool a production key or
-// evict a proxy, which is exactly what made a bad Playground request degrade
-// live traffic before.
+// other tier — so the outcome describes that one key. It also leaves key and
+// proxy pool state untouched on purpose: a diagnostic request must never cool a
+// production key or evict a proxy, which is exactly what made a bad Playground
+// request degrade live traffic before. WARP exits are the exception: a Playground
+// attempt reports to the WARP pool like production traffic.
 func (g *Gateway) doSelectedKeyUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, override DebugKeyOverride, attemptOffset int) (*http.Response, error, int) {
 	nodes := g.zenNodes
 	baseURL := g.cfg.Upstream.Zen

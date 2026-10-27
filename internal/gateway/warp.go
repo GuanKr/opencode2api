@@ -56,6 +56,11 @@ type warpFailureSink interface {
 	Fail(lease *warp.Lease, reason string)
 }
 
+type warpReportSink interface {
+	warpFailureSink
+	Report(lease *warp.Lease, status int, body []byte)
+}
+
 // warpLease is one acquired WARP exit together with the HTTP clients that dial
 // through it. Every client is per-attempt: the exit is released as soon as the
 // response body is closed, so pooled connections must be closed at the same
@@ -139,7 +144,7 @@ func (l *warpLease) close() {
 type warpBody struct {
 	io.ReadCloser
 	lease       *warpLease
-	diagnostic  bool
+	readOnly    bool
 	cancel      context.CancelFunc
 	idleTimeout atomic.Bool
 }
@@ -162,7 +167,7 @@ func (b *warpBody) Read(data []byte) (int, error) {
 		if err != io.EOF && b.Aborted() {
 			return n, wire.ErrStreamAborted
 		}
-		if err != io.EOF && !b.diagnostic && !b.idleTimeout.Load() && !errors.Is(err, context.Canceled) {
+		if err != io.EOF && !b.readOnly && !b.idleTimeout.Load() && !errors.Is(err, context.Canceled) {
 			b.fail("stream read error")
 		}
 	}
@@ -192,7 +197,7 @@ func (b *warpBody) Close() error {
 // ignores a lease that was already aborted or reported its failure, so a late
 // stream failure cannot penalize a restored exit a second time.
 func (b *warpBody) fail(reason string) {
-	if b == nil || b.lease == nil || b.lease.pool == nil || b.diagnostic {
+	if b == nil || b.lease == nil || b.lease.pool == nil || b.readOnly {
 		return
 	}
 	if b.lease.lease != nil && (b.lease.lease.Aborted() || b.lease.lease.Reported()) {
@@ -213,6 +218,24 @@ func warpFailReason(err error) string {
 	default:
 		return "transport error"
 	}
+}
+
+func reportWARPAttempt(ctx context.Context, sink warpReportSink, lease *warp.Lease, resp *http.Response, err error) bool {
+	readOnly := warpReadOnly(ctx)
+	if err != nil {
+		if ctx.Err() == nil && !readOnly {
+			sink.Fail(lease, warpFailReason(err))
+		}
+		return readOnly
+	}
+	if !readOnly {
+		var body []byte
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+			body = peekResponseBody(resp)
+		}
+		sink.Report(lease, resp.StatusCode, body)
+	}
+	return readOnly
 }
 
 // doWARPAttempt sends one prepared request through an acquired WARP exit,
@@ -240,7 +263,6 @@ func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL,
 	}
 	label := "warp:" + lease.EgressKey()
 	setWarpEgress(ctx, label)
-	diagnostic := isDiagnosticRequest(ctx)
 	resp, err := doInferenceAttempt(owned.client(), req, firstEventTimeout, g.attemptTimeout)
 	if err != nil {
 		if lease.Aborted() {
@@ -251,21 +273,13 @@ func (g *Gateway) doWARPAttempt(ctx context.Context, req *http.Request, baseURL,
 			stopAttempt()
 			return nil, label, fmt.Errorf("%w: %v", warp.ErrExitRotated, err)
 		}
-		if ctx.Err() == nil && !diagnostic {
-			g.warp.Fail(lease, warpFailReason(err))
-		}
+		reportWARPAttempt(ctx, g.warp, lease, nil, err)
 		owned.close()
 		stopAttempt()
 		return nil, label, err
 	}
-	if !diagnostic {
-		var body []byte
-		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-			body = peekResponseBody(resp)
-		}
-		g.warp.Report(lease, resp.StatusCode, body)
-	}
-	resp.Body = &warpBody{ReadCloser: resp.Body, lease: owned, diagnostic: diagnostic, cancel: stopAttempt}
+	readOnly := reportWARPAttempt(ctx, g.warp, lease, resp, nil)
+	resp.Body = &warpBody{ReadCloser: resp.Body, lease: owned, readOnly: readOnly, cancel: stopAttempt}
 	return resp, label, nil
 }
 
