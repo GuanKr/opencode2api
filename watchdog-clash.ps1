@@ -122,7 +122,9 @@
   连击需再涨 threshold 才会重复触发；连击连续归零 reset_rounds（1-10，默认 2）轮才
   清除基线。动作后的前 reset_rounds 轮不累计“出口池不可用”本地计数，给 WARP 重新
   注册留时间。网关重启（started_at 变化）、last_success_at 前进、或检测到任何节点切换
-  （$script:LastSwitch 变化，含中继 failover）都会清零基线与冷却。此触发只挂在 WARP
+  （$script:LastSwitch 变化，含中继 failover）都会清零基线与冷却。last_success_at
+  成功日志默认每 5 分钟最多一条；若本次成功实际清掉了连击基线、冷却或本地不可用计数
+  则立即记录，便于确认恢复。成功时间本身仍每轮更新。此触发只挂在 WARP
   中继检查通过的分支，不影响中继失败路径，也不会调用 legacy Invoke-Failover（其探针
   在 WARP 下无意义）。阈值/连续轮数只靠常驻循环推进：-Once 单轮不做本地累计，只按
   网关当前 failure_streak 判断（已达标仍会动作，返回 Acted/ActionFailed 供退出码使用）。
@@ -3692,6 +3694,7 @@ function Invoke-WarpExitFailureTrigger {
     Reset-WarpExitTriggerState -ClearCooldown
     $script:WarpExitLastObservedStreak = [int64]0
     $script:WarpExitLastSuccessAt = ''
+    $script:WarpExitLastSuccessLogAt = [DateTime]::MinValue
     $script:WarpExitStartedAt = ''
     $script:WarpExitNoCountersWarned = $false
     $script:WarpExitFirstObservation = $true
@@ -3729,7 +3732,21 @@ function Invoke-WarpExitFailureTrigger {
   # 2) 新的真实 WARP 成功（last_success_at 变化/前进）：可用出口已出现，清零触发状态。
   if ($lastSuccess -ne '' -and $script:WarpExitLastSuccessAt -ne '' -and $lastSuccess -ne $script:WarpExitLastSuccessAt) {
     if (-not $didReset) {
-      Write-WdLog "WARP 出口失败触发：检测到新的 WARP 成功（last_success_at=$lastSuccess），清零连击基线与冷却" 'OK'
+      # 成功日志节流：正常成功每 5 分钟一条；实际清掉失败状态时立即记录。
+      $hadWarpFailureState = (
+        ($script:WarpExitBaselineStreak -gt 0) -or
+        ($script:WarpExitLastObservedStreak -gt 0) -or
+        ($script:WarpExitCooldownUntil -gt $now) -or
+        ($script:WarpExitLocalStrikes -gt 0)
+      )
+      $successLogDue = (
+        ($script:WarpExitLastSuccessLogAt -eq [DateTime]::MinValue) -or
+        (($now - $script:WarpExitLastSuccessLogAt).TotalMinutes -ge $script:WarpExitSuccessLogIntervalMinutes)
+      )
+      if ($hadWarpFailureState -or $successLogDue) {
+        Write-WdLog "WARP 出口失败触发：检测到新的 WARP 成功（last_success_at=$lastSuccess），清零连击基线与冷却" 'OK'
+        $script:WarpExitLastSuccessLogAt = $now
+      }
     }
     Reset-WarpExitTriggerState -ClearCooldown
     $script:WarpExitLastObservedStreak = [int64]0
@@ -4554,6 +4571,8 @@ $script:StreakStart = [DateTime]::MinValue
 $script:LastStaleProbe = [DateTime]::MinValue
 # WARP 出口失败触发状态（进程内存，重启清零）：
 #   StartedAt/LastSuccessAt  网关 /healthz 的 warp 字段，用于识别重启与真实成功
+#   LastSuccessLogAt         最近一次成功日志时间；成功日志节流用
+#   SuccessLogIntervalMinutes 无失败状态时成功日志的最小间隔（默认 5 分钟）
 #   LastSwitchSeen           $script:LastSwitch 的上次观察值（任何切换都清零基线）
 #   BaselineStreak           动作/切换后的连击基线，需再涨 threshold 才重复触发
 #   ZeroRounds               连击连续归零的轮数（达 reset_rounds 才清基线）
@@ -4567,6 +4586,8 @@ $script:WarpExitNoCountersWarned = $false
 $script:WarpExitFirstObservation = $true
 $script:WarpExitStartedAt = ''
 $script:WarpExitLastSuccessAt = ''
+$script:WarpExitLastSuccessLogAt = [DateTime]::MinValue
+$script:WarpExitSuccessLogIntervalMinutes = 5
 $script:WarpExitLastSwitchSeen = $null
 $script:WarpExitBaselineStreak = [int64]0
 $script:WarpExitZeroRounds = 0
