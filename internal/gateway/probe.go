@@ -263,7 +263,12 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 // warp_unavailable, ...) and whether the upstream rejected the reasoning effort.
 func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, baseURL, key, model, sessionStem string, protocol wire.Protocol, effort string, overWARP bool) probeResult {
 	session, nonce := probeSession(sessionStem)
-	ids := identity.RequestIDs{Session: session, Project: "opencode2api:default-project", Request: identity.RandomID("req", 16)}
+	// The free tier ledges quota per (project id, egress) as well as per
+	// session id, so a fixed synthetic project is one shared bucket: once a
+	// popular exit burns it, every probe there answers quota on a healthy lane.
+	// A fresh 40-hex project per attempt matches what DeriveRequestIDs now
+	// mints for a client that names none.
+	ids := identity.RequestIDs{Session: session, Project: identity.RandomProjectID(), Request: identity.RandomID("req", 16)}
 	b, err := probePayload(model, protocol, effort, models.IsV1Upstream(baseURL), nonce)
 	if err != nil {
 		return probeResult{reason: "request_conversion_error"}

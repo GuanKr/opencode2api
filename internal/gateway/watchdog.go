@@ -395,9 +395,11 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 	// id to a fresh exit burns that exit's allowance too. Reusing one id would
 	// make every later probe answer quota on a perfectly healthy node and send
 	// the watchdog switching in a circle.
+	// A fixed project id would be a shared quota bucket (see probeAttempt):
+	// the free tier ledges allowance per project id and egress together.
 	ids := identity.RequestIDs{
 		Session: session,
-		Project: "opencode2api:default-project",
+		Project: identity.RandomProjectID(),
 		Request: identity.RandomID("probe", 16),
 	}
 	ctx, cancel := context.WithTimeout(ctx, watchdogProbeTimeout)

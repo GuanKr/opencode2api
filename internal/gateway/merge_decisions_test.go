@@ -408,6 +408,10 @@ func TestTwoLaneRenameCountReflectsTheWinningAttempt(t *testing.T) {
 		`"parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]}`)
 	meta := &telemetry.RequestMeta{}
 	ctx := telemetry.WithRequestMeta(context.Background(), meta)
+	// handleInference installs the shape state; without it setRequestShape has
+	// nowhere to record the winning attempt and this case would only prove the
+	// nil-receiver fallback.
+	ctx = context.WithValue(ctx, requestShapeContextKey{}, &requestShape{})
 
 	resp, _, _, err := g.doUpstreamTiers(ctx, chatDumpRoute(),
 		map[config.Tier][]byte{config.TierZen: client}, identity.RequestIDs{Request: "req-rename"}, 0, "")

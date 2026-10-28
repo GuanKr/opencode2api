@@ -72,8 +72,8 @@ func TestToolRenamesStaysInvertible(t *testing.T) {
 	if !nilRenames.Empty() || nilRenames.Count() != 0 {
 		t.Fatal("a nil rename set must be empty")
 	}
-	if got := nilRenames.Restore("clint_x"); got != "x" {
-		t.Fatalf("a nil rename set must still strip the prefix, got %q", got)
+	if got := nilRenames.Restore("clint_x"); got != "clint_x" {
+		t.Fatalf("a nil rename set has no table to restore from, got %q", got)
 	}
 	if _, ok := nilRenames.Wire("x"); ok {
 		t.Fatal("a nil rename set must report no mapping")
@@ -199,12 +199,38 @@ func TestRenameResponseToolFastPaths(t *testing.T) {
 		t.Fatalf("a nil rename set must return the body unchanged: %s", out)
 	}
 	unknown := []byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"clint_unknown"}}]}}]}`)
-	if out := RenameResponseTool(unknown, Chat, newTestRenames()); !bytes.Equal(out, unknown) {
-		t.Fatalf("an unmapped clint_ name must be left alone: %s", out)
+	if out := RenameResponseTool(unknown, Chat, newTestRenames()); !strings.Contains(string(out), `"name":"unknown"`) {
+		t.Fatalf("an unmapped clint_ name must fall back to its stripped client name: %s", out)
 	}
 	broken := []byte(`{"choices":[{"function":{"name":"clint_read_file"}`)
 	if out := RenameResponseTool(broken, Chat, newTestRenames()); !bytes.Equal(out, broken) {
 		t.Fatalf("unparseable bytes must be returned unchanged: %s", out)
+	}
+}
+
+// TestRenameResponseToolFoldsAnUnprefixedName pins the response-side fold added
+// upstream on 2026-10-26: a model that names an official tool without the clint_
+// prefix is restored onto the declared client tool when exactly one folds to it.
+func TestRenameResponseToolFoldsAnUnprefixedName(t *testing.T) {
+	renames := NewToolRenames()
+	renames.Add("todo_write", "clint_todo_write")
+	for _, sent := range []string{"todowrite", "TODO-WRITE", "todo.write"} {
+		body := []byte(`{"choices":[{"message":{"tool_calls":[{"function":{"name":"` + sent + `"}}]}}]}`)
+		out := RenameResponseTool(body, Chat, renames)
+		if !strings.Contains(string(out), `"name":"todo_write"`) {
+			t.Fatalf("%q was not folded onto the declared tool: %s", sent, out)
+		}
+	}
+}
+
+// TestResolveNeverGuessesAnAmbiguousFold: two declared tools folding to one key
+// must leave the upstream's spelling alone rather than pick one.
+func TestResolveNeverGuessesAnAmbiguousFold(t *testing.T) {
+	renames := NewToolRenames()
+	renames.Add("todo_write", "clint_todo_write")
+	renames.Add("todo-write", "clint_todo-write")
+	if got, changed := renames.Resolve("todowrite"); changed || got != "todowrite" {
+		t.Fatalf("an ambiguous fold must be left alone, got %q (changed=%v)", got, changed)
 	}
 }
 
@@ -242,16 +268,16 @@ func TestRenameStreamReaderReassemblesASplitChatName(t *testing.T) {
 }
 
 // TestRenameStreamReaderPassesAnUnmappedNameThrough: a clint_ name the map does
-// not know (an upstream-invented tool) must be forwarded as is rather than
-// swallowed by the hold-back logic.
+// not know (an upstream-invented tool) must be forwarded rather than swallowed
+// by the hold-back logic; the prefix is stripped as a best-effort recovery.
 func TestRenameStreamReaderPassesAnUnmappedNameThrough(t *testing.T) {
 	stream := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"clint_other\"}}]}}]}\n\n"
 	out, err := io.ReadAll(RenameStreamReader(strings.NewReader(stream), Chat, newTestRenames()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(out), `"name":"clint_other"`) {
-		t.Fatalf("an unmapped name must be written out verbatim: %s", out)
+	if !strings.Contains(string(out), `"name":"other"`) {
+		t.Fatalf("an unmapped clint_ name must fall back to its stripped client name: %s", out)
 	}
 }
 

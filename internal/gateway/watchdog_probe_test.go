@@ -158,7 +158,7 @@ func TestWatchdogProbeReachesUpstreamThroughClosedGates(t *testing.T) {
 // or the official-prompt injection turns this red.
 func TestWatchdogProbeSendsAFreshSessionAndPromptEveryTime(t *testing.T) {
 	type captured struct {
-		session, child, body string
+		session, child, project, body string
 	}
 	var mu sync.Mutex
 	var seen []captured
@@ -168,6 +168,7 @@ func TestWatchdogProbeSendsAFreshSessionAndPromptEveryTime(t *testing.T) {
 		seen = append(seen, captured{
 			session: r.Header.Get("x-opencode-session"),
 			child:   r.Header.Get("x-opencode-session-id"),
+			project: r.Header.Get("x-opencode-project"),
 			body:    string(body),
 		})
 		mu.Unlock()
@@ -187,12 +188,16 @@ func TestWatchdogProbeSendsAFreshSessionAndPromptEveryTime(t *testing.T) {
 	}
 
 	number := regexp.MustCompile(`Repeat this number: (\d+)`)
+	projectID := regexp.MustCompile(`^[0-9a-f]{40}$`)
 	for i, got := range seen {
 		if !strings.HasPrefix(got.session, "ses_") || len(got.session) != 30 {
 			t.Fatalf("probe %d sent a non-canonical session id %q", i, got.session)
 		}
 		if got.child != got.session {
 			t.Fatalf("probe %d child session %q must follow the top-level session %q", i, got.child, got.session)
+		}
+		if !projectID.MatchString(got.project) {
+			t.Fatalf("probe %d sent a non-official project id %q", i, got.project)
 		}
 		var payload map[string]any
 		if err := json.Unmarshal([]byte(got.body), &payload); err != nil {
@@ -223,6 +228,9 @@ func TestWatchdogProbeSendsAFreshSessionAndPromptEveryTime(t *testing.T) {
 
 	if seen[0].session == seen[1].session {
 		t.Fatalf("both probes reused the session id %q; an exhausted id would poison every later exit", seen[0].session)
+	}
+	if seen[0].project == seen[1].project {
+		t.Fatalf("both probes reused the project id %q; a burned project bucket would poison every later exit", seen[0].project)
 	}
 	if seen[0].body == seen[1].body {
 		t.Fatalf("both probes sent a byte-identical body; the nonce is not in the request")
