@@ -98,7 +98,8 @@
       "transport_confirm_rounds": 2,
       "warp_exit_failure": {
         "enabled": true, "threshold": 9, "cooldown_minutes": 15,
-        "reset_rounds": 2, "action": "refresh_then_switch"
+        "reset_rounds": 2, "action": "refresh_then_switch",
+        "window_minutes": 10, "window_failures": 10, "window_create_failures": 6
       }
     }
   语义：exclude_contains / deprioritize.contains 是整体替换内置默认值（不是追加），
@@ -134,6 +135,19 @@
   失败才会动作，基线之后的增量失败仍会触发。若 active=0/unavailable 则照常动作。
   F1 注意：旧网关 /healthz 没有 failure_streak/failures_total 时只打一次兼容警告并禁用
   主信号，保留 active=0/unavailable 副信号；升级并重启网关后恢复主信号。
+  失败滑窗（2026-10-28，warp_exit_failure 的三个可选键）：window_minutes（1-120，默认 10）、
+  window_failures（1-1000，默认 10）、window_create_failures（0-1000，默认 6；0 = 关闭
+  create 子信号）。滑窗只看 /healthz 的 failures_total/create_failures_total 累计增量，
+  与 failure_streak 快路径并列：窗口内 failures_total 增量 >= window_failures，或
+  create_failures_total 增量 >= window_create_failures（>0 时）即触发 cause=failure_window。
+  每次采样读两个累计计数并算增量；首次观察只建基线、不触发；计数器回退（网关重启/
+  started_at 变化/数值变小）清空窗口并重建基线，不拿历史计数触发。普通成功
+  （last_success_at 变化）绝不清窗，所以失败与成功交替时窗口仍能累计（这正是它要解决的
+  failure_streak 被成功清零、threshold 永远到不了的问题）。动作成功（切换或 refresh_only
+  刷新成功）后清窗，并把基线设为动作时的累计计数；cooldown/LastSwitch/连击基线/
+  reset_rounds 逻辑不变。日志事件名是「WARP 出口失败窗口」；/healthz 有
+  soft_failures_total 时只附在日志里，不参与触发。-Once 单轮只有一次采样，窗口首次观察
+  不会触发；窗口信号靠常驻循环推进。
   优先级：显式命令行参数 > 配置文件 > 内置默认值——所以临时 -DeprioritizeContains
   试一把仍然压过文件，不必先改文件。exclude_contains 没有对应的命令行参数，
   它写错了只能改文件或把 -WatchdogConfig 指向别的路径。
@@ -248,6 +262,11 @@
   POST /v1/watchdog/warp/reset 让网关退役旧出口。等价于 watchdog.json 的
   warp_exit_failure.action。
 
+.PARAMETER WarpExitFailureWindowSelfTest
+  隐藏诊断开关：用纯内存合成序列验证失败滑窗（交替成功不清窗、窗口内失败触发、
+  窗口外旧失败不触发、create 子信号阈值/关闭、计数器回退清窗）。不读 watchdog.json、
+  不联网、不切换、不写状态文件（也不写运行日志）；输出 PASS/FAIL 并以 0/1 退出。
+
 .EXAMPLE
   pwsh -NoProfile -ExecutionPolicy Bypass -File watchdog-clash.ps1 -DryRun
   pwsh -NoProfile -ExecutionPolicy Bypass -File watchdog-clash.ps1
@@ -351,6 +370,10 @@ param(
   # 独立诊断入口：只做一次 proxy 检查、打印结果并按 0/1/2 退出；早于实例互斥与所有 Resolve-*，
   # 因此网关看门狗常驻运行时也能执行。不切换、不写配置/状态文件（运行日志除外）。
   [switch]$ProxyCheckProbeOnly,
+  # 隐藏诊断入口：纯内存合成序列验证 WARP 出口失败滑窗；不读 watchdog.json、不联网、
+  # 不切换、不写状态文件，输出 PASS/FAIL 并以 0/1 退出。必须早于 Read-WatchdogConfig、
+  # 实例互斥与所有 Resolve-*/网络路径（见脚本末尾入口）。
+  [switch]$WarpExitFailureWindowSelfTest,
   [switch]$DryRun,
   [switch]$Once
 )
@@ -422,6 +445,11 @@ $script:WarpExitFailureThreshold = $WarpExitFailureThreshold
 $script:WarpExitFailureCooldownMinutes = $WarpExitFailureCooldownMinutes
 $script:WarpExitFailureResetRounds = $WarpExitFailureResetRounds
 $script:WarpExitFailureAction = $WarpExitFailureAction
+# 失败滑窗（2026-10-28）：只有 watchdog.json 键，没有对应命令行参数；缺省值即生效。
+# 窗口按 /healthz 累计计数增量判定，普通成功不清窗（与 failure_streak 的语义刻意不同）。
+$script:WarpExitFailureWindowMinutes = 10
+$script:WarpExitFailureWindowFailures = 10
+$script:WarpExitFailureWindowCreateFailures = 6
 # 运行状态：主循环按 WarpProxyActive 选择 sleep 间隔；LastState/LastLogAt 做心跳与状态切换
 # 去重；ConfigErrSig 让同一配置错误只打一次；DirectWarned 让直连 WARP 告警只打一次。
 $script:WarpProxyActive = $false
@@ -1688,6 +1716,10 @@ function Read-WatchdogConfig {
   #   deprioritize.penalty_ms       降权罚分毫秒（0 = 关闭降权）
   #   transport_confirm_rounds      transport 连续确认轮数（1-10，默认 2；等价命令行
   #                                 -TransportConfirmRounds，命令行显式传参时以命令行为准）
+  #   warp_exit_failure.window_minutes        失败滑窗分钟数（1-120，默认 10）
+  #   warp_exit_failure.window_failures       窗口内 failures_total 增量阈值（1-1000，默认 10）
+  #   warp_exit_failure.window_create_failures 窗口内 create_failures_total 增量阈值
+  #                                 （0-1000，默认 6；0 = 关闭该子信号）
   # 优先级：显式命令行参数 > 配置文件 > 内置默认值。配置文件只接管没在命令行显式传过的项，
   # 所以临时 -DeprioritizeContains 试一把仍然压过文件，改完不用先改文件。
   # 解析失败一律抛错中止启动，绝不静默回退默认值：悄悄丢掉排除规则的后果是
@@ -1993,9 +2025,10 @@ function Read-WatchdogConfig {
   if (Test-HasKey $cfg 'warp_exit_failure') {
     $wef = Get-Prop $cfg 'warp_exit_failure'
     if (-not (Test-JsonObjectShape $wef)) {
-      throw ('看门狗配置 warp_exit_failure 必须是对象（{"enabled": true, "threshold": 9, "cooldown_minutes": 15, "reset_rounds": 2, "action": "refresh_then_switch"}），实际是 ' + (Get-ShapeName $wef))
+      throw ('看门狗配置 warp_exit_failure 必须是对象（{"enabled": true, "threshold": 9, "cooldown_minutes": 15, "reset_rounds": 2, "action": "refresh_then_switch", "window_minutes": 10, "window_failures": 10, "window_create_failures": 6}），实际是 ' + (Get-ShapeName $wef))
     }
-    $knownWef = @('enabled', 'threshold', 'cooldown_minutes', 'reset_rounds', 'action')
+    $knownWef = @('enabled', 'threshold', 'cooldown_minutes', 'reset_rounds', 'action',
+      'window_minutes', 'window_failures', 'window_create_failures')
     $unknownWef = @(@($wef.PSObject.Properties | ForEach-Object { $_.Name }) |
       Where-Object { $knownWef -notcontains $_ })
     if ($unknownWef.Count -gt 0) {
@@ -2040,6 +2073,27 @@ function Read-WatchdogConfig {
         $applied++
         Write-WdLog "配置生效：warp_exit_failure.$($wefInt.Key) = $([int]$rawWefInt)"
       }
+    }
+    # 失败滑窗三个键：只有 watchdog.json 入口，没有对应命令行参数；省略即用内置默认值。
+    # 与上面的 wefInt 同一口径：只收 JSON 整数，字符串 "10"、小数 10.0、指数 1e1 一律拒。
+    foreach ($wefWindow in @(
+        @{ Key = 'window_minutes'; Min = 1; Max = 120; Field = 'WarpExitFailureWindowMinutes' },
+        @{ Key = 'window_failures'; Min = 1; Max = 1000; Field = 'WarpExitFailureWindowFailures' },
+        @{ Key = 'window_create_failures'; Min = 0; Max = 1000; Field = 'WarpExitFailureWindowCreateFailures' }
+      )) {
+      if (-not (Test-HasKey $wef $wefWindow.Key)) { continue }
+      $seen++
+      $rawWin = Get-Prop $wef $wefWindow.Key
+      if (-not ($rawWin -is [int] -or $rawWin -is [long])) {
+        $tn = if ($null -eq $rawWin) { 'null' } else { $rawWin.GetType().Name }
+        throw "看门狗配置 warp_exit_failure.$($wefWindow.Key) 非法：[$rawWin]（类型 $tn；必须是 $($wefWindow.Min)-$($wefWindow.Max) 的整数，不要加引号、不要写小数）"
+      }
+      if ($rawWin -lt $wefWindow.Min -or $rawWin -gt $wefWindow.Max) {
+        throw "看门狗配置 warp_exit_failure.$($wefWindow.Key) 越界：[$rawWin]（应为 $($wefWindow.Min)-$($wefWindow.Max)）"
+      }
+      Set-Variable -Name ('script:' + $wefWindow.Field) -Value ([int]$rawWin)
+      $applied++
+      Write-WdLog "配置生效：warp_exit_failure.$($wefWindow.Key) = $([int]$rawWin)"
     }
     if (Test-HasKey $wef 'action') {
       $seen++
@@ -2274,7 +2328,9 @@ function Get-GatewayHealthz {
     Ok = $true; Skipped = $false; Status = $status; HasWarp = $hasWarp; Warp = $warp; Error = ''
     StartedAt = ''; LastSuccessAt = ''; LastFailureAt = ''; LastFailureKind = ''
     FailureStreak = [int64]0; FailuresTotal = [int64]0; CreateFailuresTotal = [int64]0
-    HasFailureStreak = $false; WarpStatus = ''; WarpActive = [int64]0
+    SoftFailuresTotal = [int64]0
+    HasFailureStreak = $false; HasFailuresTotal = $false; HasCreateFailuresTotal = $false
+    HasSoftFailuresTotal = $false; WarpStatus = ''; WarpActive = [int64]0
     WarpStandby = [int64]0; WarpSize = [int64]0; WarpCooling = [int64]0
   }
   if ($hasWarp) {
@@ -2283,9 +2339,15 @@ function Get-GatewayHealthz {
     $out.LastFailureAt = ConvertTo-WarpExitTimestamp (Get-Prop $warp 'last_failure_at')
     $out.LastFailureKind = [string](Get-Prop $warp 'last_failure_kind')
     $out.HasFailureStreak = Test-HasKey $warp 'failure_streak'
+    $out.HasFailuresTotal = Test-HasKey $warp 'failures_total'
+    $out.HasCreateFailuresTotal = Test-HasKey $warp 'create_failures_total'
+    # soft_failures_total 是 failures_total 的子集，只用于日志；旧网关没有该字段时
+    # HasSoftFailuresTotal=false，日志不附，触发判定完全不受影响。
+    $out.HasSoftFailuresTotal = Test-HasKey $warp 'soft_failures_total'
     $out.FailureStreak = ConvertTo-WarpExitCounter (Get-Prop $warp 'failure_streak')
     $out.FailuresTotal = ConvertTo-WarpExitCounter (Get-Prop $warp 'failures_total')
     $out.CreateFailuresTotal = ConvertTo-WarpExitCounter (Get-Prop $warp 'create_failures_total')
+    $out.SoftFailuresTotal = ConvertTo-WarpExitCounter (Get-Prop $warp 'soft_failures_total')
     $out.WarpStatus = [string](Get-Prop $warp 'status')
     $out.WarpActive = ConvertTo-WarpExitCounter (Get-Prop $warp 'active')
     $out.WarpStandby = ConvertTo-WarpExitCounter (Get-Prop $warp 'standby')
@@ -3641,6 +3703,254 @@ function Invoke-WarpProxyFailover {
   return @{ Ok = $false; Node = $null; ConfigError = $false }
 }
 
+function New-WarpExitWindowState {
+  # WARP 出口失败滑窗状态（进程内存，重启清零）。Samples 每项是
+  # @{ At=[datetime]; Failures=[int64]; Create=[int64] }；HasBaseline=false 表示尚未采样，
+  # 首次观察只建基线、不触发。CreateBaselineValid 在 create_failures_total 缺失时置 false，
+  # 重新出现时先重建基线，避免跨缺口把历史增量算进来。
+  return @{
+    HasBaseline = $false
+    LastFailuresTotal = [int64]0
+    LastCreateFailuresTotal = [int64]0
+    CreateBaselineValid = $false
+    LastStartedAt = ''
+    LastSuccessAt = ''
+    Samples = @()
+  }
+}
+
+function Reset-WarpExitWindowState {
+  # 清空滑窗并把累计计数设为新基线。只允许三个调用点：网关重启（started_at 变化）、
+  # 计数器回退、动作成功（切换或 refresh_only 刷新成功）。普通成功（last_success_at
+  # 变化）绝不能调用这里——失败与成功交替时窗口必须继续累计。
+  param(
+    $State,
+    [int64]$FailuresTotal = 0,
+    [int64]$CreateFailuresTotal = 0,
+    [bool]$HasCreateCounter = $false,
+    [string]$StartedAt = '',
+    [string]$LastSuccessAt = ''
+  )
+  if ($State -eq $null) { return }
+  $State.HasBaseline = $true
+  $State.LastFailuresTotal = [int64]$FailuresTotal
+  $State.LastCreateFailuresTotal = [int64]$CreateFailuresTotal
+  $State.CreateBaselineValid = [bool]$HasCreateCounter
+  $State.Samples = @()
+  if ($StartedAt -ne '') { $State.LastStartedAt = $StartedAt }
+  if ($LastSuccessAt -ne '') { $State.LastSuccessAt = $LastSuccessAt }
+}
+
+function Update-WarpExitFailureWindow {
+  # 纯函数：不读时钟、不联网、不写日志/文件，只按传入采样推进滑窗，便于
+  # -WarpExitFailureWindowSelfTest 用合成序列验证。窗口只看 /healthz 的累计计数增量：
+  #   failures_total 增量 >= WindowFailures，或 create_failures_total 增量 >=
+  #   WindowCreateFailures（>0 且该计数存在时）→ Triggered。
+  # last_success_at 只记录、绝不参与清窗；清窗只发生在 started_at 变化、计数器回退
+  # （调用方动作成功后另行 Reset-WarpExitWindowState）。
+  param(
+    $State,
+    [datetime]$Now,
+    [int64]$FailuresTotal = 0,
+    [int64]$CreateFailuresTotal = 0,
+    [bool]$HasFailuresTotal = $true,
+    [bool]$HasCreateCounter = $false,
+    [string]$StartedAt = '',
+    [string]$LastSuccessAt = '',
+    [int]$WindowMinutes = 10,
+    [int]$WindowFailures = 10,
+    [int]$WindowCreateFailures = 6
+  )
+  $res = @{
+    Enabled = $false; FirstObservation = $false; Regression = $false
+    FailuresDelta = [int64]0; CreateDelta = [int64]0
+    WindowFailures = [int64]0; WindowCreate = [int64]0
+    FailuresHit = $false; CreateHit = $false; Triggered = $false
+  }
+  if ($State -eq $null) { return $res }
+  if (-not $HasFailuresTotal) {
+    # 旧网关没有 failures_total：滑窗信号禁用；等计数器出现时重新建基线。
+    $State.HasBaseline = $false
+    return $res
+  }
+  $res.Enabled = $true
+  if ($StartedAt -ne '' -and $State.LastStartedAt -ne '' -and $StartedAt -ne $State.LastStartedAt) {
+    Reset-WarpExitWindowState -State $State -FailuresTotal $FailuresTotal -CreateFailuresTotal $CreateFailuresTotal -HasCreateCounter $HasCreateCounter -StartedAt $StartedAt -LastSuccessAt $LastSuccessAt
+    $res.Regression = $true
+    return $res
+  }
+  if ($StartedAt -ne '') { $State.LastStartedAt = $StartedAt }
+  if ($LastSuccessAt -ne '' -and $State.LastSuccessAt -ne '' -and $LastSuccessAt -ne $State.LastSuccessAt) {
+    # 普通成功（last_success_at 变化）：只记录，绝不清窗。失败与成功交替时窗口必须
+    # 继续累计——这是 failure_window 相对 failure_streak 的核心差异。自检会喂交替成功
+    # 的序列；若这里误加 Reset-WarpExitWindowState，自检第 2 项立刻变红。
+  }
+  if ($LastSuccessAt -ne '') { $State.LastSuccessAt = $LastSuccessAt }
+  if (-not $State.HasBaseline) {
+    # 首次观察只建基线：即使网关历史计数已经很大也不触发。
+    $State.HasBaseline = $true
+    $State.LastFailuresTotal = [int64]$FailuresTotal
+    $State.LastCreateFailuresTotal = [int64]$CreateFailuresTotal
+    $State.CreateBaselineValid = [bool]$HasCreateCounter
+    $State.Samples = @()
+    $res.FirstObservation = $true
+    return $res
+  }
+  if ($FailuresTotal -lt $State.LastFailuresTotal -or
+    ($HasCreateCounter -and $State.CreateBaselineValid -and $CreateFailuresTotal -lt $State.LastCreateFailuresTotal)) {
+    # 计数器回退（网关重启/清零/字段重置）：清空窗口并重建基线，不拿历史计数触发。
+    Reset-WarpExitWindowState -State $State -FailuresTotal $FailuresTotal -CreateFailuresTotal $CreateFailuresTotal -HasCreateCounter $HasCreateCounter -StartedAt $StartedAt -LastSuccessAt $LastSuccessAt
+    $res.Regression = $true
+    return $res
+  }
+  $res.FailuresDelta = [int64]($FailuresTotal - $State.LastFailuresTotal)
+  if ($HasCreateCounter) {
+    if ($State.CreateBaselineValid) {
+      $res.CreateDelta = [int64]($CreateFailuresTotal - $State.LastCreateFailuresTotal)
+    }
+    $State.LastCreateFailuresTotal = [int64]$CreateFailuresTotal
+    $State.CreateBaselineValid = $true
+  } else {
+    $State.CreateBaselineValid = $false
+  }
+  $State.LastFailuresTotal = [int64]$FailuresTotal
+  $State.Samples = @($State.Samples) + @(@{ At = $Now; Failures = [int64]$res.FailuresDelta; Create = [int64]$res.CreateDelta })
+  $cutoff = $Now.AddMinutes(-1 * [int]$WindowMinutes)
+  $State.Samples = @($State.Samples | Where-Object { $_.At -ge $cutoff })
+  $sumFailures = [int64]0
+  $sumCreate = [int64]0
+  foreach ($s in @($State.Samples)) {
+    $sumFailures += [int64]$s.Failures
+    $sumCreate += [int64]$s.Create
+  }
+  $res.WindowFailures = $sumFailures
+  $res.WindowCreate = $sumCreate
+  $res.FailuresHit = ($sumFailures -ge [int64]$WindowFailures)
+  $res.CreateHit = (([int]$WindowCreateFailures -gt 0) -and $HasCreateCounter -and ($sumCreate -ge [int64]$WindowCreateFailures))
+  $res.Triggered = ($res.FailuresHit -or $res.CreateHit)
+  return $res
+}
+
+function Invoke-WarpExitFailureWindowSelfTest {
+  # -WarpExitFailureWindowSelfTest 的实现：全部是纯内存合成序列，不读 watchdog.json、
+  # 不联网、不切换、不写状态/日志文件。输出 PASS/FAIL，返回 $true/$false 供入口映射 exit 0/1。
+  $fail = 0
+  $total = 0
+  $t0 = [datetime]'2026-10-28T10:55:00'
+
+  # 1) 首次观察只建基线：即使历史计数已经很大也不触发。
+  $total++
+  $st = New-WarpExitWindowState
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0 -FailuresTotal 100 -CreateFailuresTotal 50 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  if ([bool](Get-Prop $r 'FirstObservation') -and -not [bool](Get-Prop $r 'Triggered') -and [int64](Get-Prop $r 'WindowFailures') -eq 0) {
+    Write-Host 'PASS 1/6 首次观察只建基线、不触发'
+  } else {
+    Write-Host 'FAIL 1/6 首次观察应只建基线且不触发'
+    $fail++
+  }
+
+  # 2) 成功与失败交替：last_success_at 每轮都变，窗口不得被清空；10 次失败（窗口内）触发。
+  $total++
+  $st = New-WarpExitWindowState
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0 -FailuresTotal 0 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -LastSuccessAt 's0' -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  $ok = [bool](Get-Prop $r 'FirstObservation')
+  $triggeredAt = 0
+  for ($i = 1; $i -le 10; $i++) {
+    $at = $t0.AddSeconds(30 * $i)
+    $r = Update-WarpExitFailureWindow -State $st -Now $at -FailuresTotal $i -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -LastSuccessAt ('s' + $i) -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+    if ($i -lt 10 -and [bool](Get-Prop $r 'Triggered')) { $ok = $false }
+    if ($i -eq 10 -and [bool](Get-Prop $r 'Triggered')) { $triggeredAt = $i }
+  }
+  if ($ok -and $triggeredAt -eq 10 -and [int64](Get-Prop $r 'WindowFailures') -eq 10) {
+    Write-Host 'PASS 2/6 交替成功不清窗，窗口内 10 次失败触发'
+  } else {
+    Write-Host "FAIL 2/6 交替成功/10 次失败触发（triggeredAt=$triggeredAt windowFailures=$([int64](Get-Prop $r 'WindowFailures'))）"
+    $fail++
+  }
+
+  # 3) 窗口外旧失败不触发：10 次失败发生在 25 分钟前，当前窗口内增量为 0。
+  $total++
+  $st = New-WarpExitWindowState
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0 -FailuresTotal 0 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  for ($i = 1; $i -le 10; $i++) {
+    $r = Update-WarpExitFailureWindow -State $st -Now $t0.AddMinutes($i) -FailuresTotal $i -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  }
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0.AddMinutes(25) -FailuresTotal 10 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  $oldOk = (-not [bool](Get-Prop $r 'Triggered')) -and ([int64](Get-Prop $r 'WindowFailures') -eq 0)
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0.AddMinutes(26) -FailuresTotal 11 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  $newOk = (-not [bool](Get-Prop $r 'Triggered')) -and ([int64](Get-Prop $r 'WindowFailures') -eq 1)
+  if ($oldOk -and $newOk) {
+    Write-Host 'PASS 3/6 窗口外旧失败被剪掉、不触发'
+  } else {
+    Write-Host 'FAIL 3/6 窗口外旧失败仍被累计'
+    $fail++
+  }
+
+  # 4) create 子信号：6 次 create 增量触发；阈值 0 时关闭。
+  $total++
+  $st = New-WarpExitWindowState
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0 -FailuresTotal 0 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  for ($i = 1; $i -le 6; $i++) {
+    $r = Update-WarpExitFailureWindow -State $st -Now $t0.AddSeconds(30 * $i) -FailuresTotal 0 -CreateFailuresTotal $i -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  }
+  $createOn = ([bool](Get-Prop $r 'Triggered')) -and ([bool](Get-Prop $r 'CreateHit')) -and (-not [bool](Get-Prop $r 'FailuresHit'))
+  $st2 = New-WarpExitWindowState
+  $r = Update-WarpExitFailureWindow -State $st2 -Now $t0 -FailuresTotal 0 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 0
+  for ($i = 1; $i -le 6; $i++) {
+    $r = Update-WarpExitFailureWindow -State $st2 -Now $t0.AddSeconds(30 * $i) -FailuresTotal 0 -CreateFailuresTotal $i -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 0
+  }
+  $createOff = -not [bool](Get-Prop $r 'Triggered')
+  if ($createOn -and $createOff) {
+    Write-Host 'PASS 4/6 create 增量达阈值触发，阈值 0 时关闭'
+  } else {
+    Write-Host "FAIL 4/6 create 子信号（on=$createOn off=$createOff）"
+    $fail++
+  }
+
+  # 5) 计数器回退：清空窗口并重建基线，历史 9 次失败不得在回退后继续累计。
+  $total++
+  $st = New-WarpExitWindowState
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0 -FailuresTotal 0 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  for ($i = 1; $i -le 9; $i++) {
+    $r = Update-WarpExitFailureWindow -State $st -Now $t0.AddSeconds(30 * $i) -FailuresTotal $i -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  }
+  $beforeRegression = ([int64](Get-Prop $r 'WindowFailures') -eq 9) -and (-not [bool](Get-Prop $r 'Triggered'))
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0.AddSeconds(300) -FailuresTotal 0 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  $regressionOk = ([bool](Get-Prop $r 'Regression')) -and (-not [bool](Get-Prop $r 'Triggered')) -and ([int64](Get-Prop $r 'WindowFailures') -eq 0)
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0.AddSeconds(330) -FailuresTotal 1 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  $afterRegression = ([int64](Get-Prop $r 'WindowFailures') -eq 1) -and (-not [bool](Get-Prop $r 'Triggered'))
+  if ($beforeRegression -and $regressionOk -and $afterRegression) {
+    Write-Host 'PASS 5/6 计数器回退清空窗口并重建基线'
+  } else {
+    Write-Host "FAIL 5/6 计数器回退（before=$beforeRegression regression=$regressionOk after=$afterRegression）"
+    $fail++
+  }
+
+  # 6) 动作成功后的 Reset-WarpExitWindowState：清窗并把累计计数设为新基线。
+  $total++
+  $st = New-WarpExitWindowState
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0 -FailuresTotal 0 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  for ($i = 1; $i -le 9; $i++) {
+    $r = Update-WarpExitFailureWindow -State $st -Now $t0.AddSeconds(30 * $i) -FailuresTotal $i -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  }
+  Reset-WarpExitWindowState -State $st -FailuresTotal 9 -CreateFailuresTotal 0 -HasCreateCounter $true -StartedAt '' -LastSuccessAt ''
+  $r = Update-WarpExitFailureWindow -State $st -Now $t0.AddSeconds(330) -FailuresTotal 10 -CreateFailuresTotal 0 -HasFailuresTotal $true -HasCreateCounter $true -WindowMinutes 10 -WindowFailures 10 -WindowCreateFailures 6
+  $actionOk = ([int64](Get-Prop $r 'WindowFailures') -eq 1) -and (-not [bool](Get-Prop $r 'Triggered'))
+  if ($actionOk) {
+    Write-Host 'PASS 6/6 动作成功后的重置清窗并重建基线'
+  } else {
+    Write-Host 'FAIL 6/6 动作成功后的重置'
+    $fail++
+  }
+
+  if ($fail -eq 0) {
+    Write-Host "PASS WARP 出口失败窗口自检（$total/$total）"
+    return $true
+  }
+  Write-Host "FAIL WARP 出口失败窗口自检（失败 $fail/$total）"
+  return $false
+}
+
 function Reset-WarpExitTriggerState {
   # 清零 WARP 出口失败触发状态。BaselineStreak > 0 表示刚动作/刚切换：连击需再涨
   # threshold 才会重复触发；GraceRounds 是动作后不累计“出口池不可用”本地计数的轮数。
@@ -3692,6 +4002,8 @@ function Invoke-WarpExitFailureTrigger {
   if (-not [bool](Get-Prop $Health 'HasWarp')) {
     $hadState = ($script:WarpExitBaselineStreak -gt 0) -or ($script:WarpExitLocalStrikes -gt 0) -or ($script:WarpExitLastObservedStreak -gt 0)
     Reset-WarpExitTriggerState -ClearCooldown
+    # WARP 未启用时信号不可用：清掉滑窗，等 WARP 重新启用后的首次采样重新建基线。
+    $script:WarpExitWindow = New-WarpExitWindowState
     $script:WarpExitLastObservedStreak = [int64]0
     $script:WarpExitLastSuccessAt = ''
     $script:WarpExitLastSuccessLogAt = [DateTime]::MinValue
@@ -3714,14 +4026,21 @@ function Invoke-WarpExitFailureTrigger {
   $startedAt = [string](Get-Prop $Health 'StartedAt')
   $lastSuccess = [string](Get-Prop $Health 'LastSuccessAt')
   $kind = [string](Get-Prop $Health 'LastFailureKind')
+  $warpCooling = [int64](Get-Prop $Health 'WarpCooling')
   $failuresTotal = [int64](Get-Prop $Health 'FailuresTotal')
   $createFailures = [int64](Get-Prop $Health 'CreateFailuresTotal')
+  $softFailures = [int64](Get-Prop $Health 'SoftFailuresTotal')
+  $hasFailuresTotal = [bool](Get-Prop $Health 'HasFailuresTotal')
+  $hasCreateFailuresTotal = [bool](Get-Prop $Health 'HasCreateFailuresTotal')
+  $hasSoftFailures = [bool](Get-Prop $Health 'HasSoftFailuresTotal')
   $didReset = $false
 
   # 1) 网关重启（started_at 变化）= 新纪元：旧连击/基线/冷却全部作废。
   if ($startedAt -ne '' -and $script:WarpExitStartedAt -ne '' -and $startedAt -ne $script:WarpExitStartedAt) {
-    Write-WdLog "WARP 出口失败触发：网关已重启（started_at $($script:WarpExitStartedAt) → $startedAt），清零连击基线与冷却" 'INFO'
+    Write-WdLog "WARP 出口失败触发：网关已重启（started_at $($script:WarpExitStartedAt) → $startedAt），清零连击基线、失败窗口与冷却" 'INFO'
     Reset-WarpExitTriggerState -ClearCooldown -GraceRounds $script:WarpExitFailureResetRounds
+    # 网关重启 = 新纪元：滑窗清空并以当前累计计数为新基线，不拿历史计数触发。
+    Reset-WarpExitWindowState -State $script:WarpExitWindow -FailuresTotal $failuresTotal -CreateFailuresTotal $createFailures -HasCreateCounter $hasCreateFailuresTotal -StartedAt $startedAt -LastSuccessAt $lastSuccess
     $script:WarpExitLastObservedStreak = [int64]0
     $script:WarpExitNoCountersWarned = $false
     $script:WarpExitFirstObservation = $true
@@ -3744,11 +4063,13 @@ function Invoke-WarpExitFailureTrigger {
         (($now - $script:WarpExitLastSuccessLogAt).TotalMinutes -ge $script:WarpExitSuccessLogIntervalMinutes)
       )
       if ($hadWarpFailureState -or $successLogDue) {
-        Write-WdLog "WARP 出口失败触发：检测到新的 WARP 成功（last_success_at=$lastSuccess），清零连击基线与冷却" 'OK'
+        Write-WdLog "WARP 出口失败触发：检测到新的 WARP 成功（last_success_at=$lastSuccess），清零连击基线与冷却（失败窗口保留，继续按累计增量判定）" 'OK'
         $script:WarpExitLastSuccessLogAt = $now
       }
     }
     Reset-WarpExitTriggerState -ClearCooldown
+    # 注意：这里绝不能清空 $script:WarpExitWindow。失败与成功交替时 failure_streak 会被
+    # 每次成功清零，而滑窗按累计计数增量继续累计——这正是窗口信号存在的理由。
     $script:WarpExitLastObservedStreak = [int64]0
     $script:WarpExitFirstObservation = $false
     $didReset = $true
@@ -3776,13 +4097,34 @@ function Invoke-WarpExitFailureTrigger {
     $script:WarpExitLastObservedStreak = $streak
     $script:WarpExitFirstObservation = $false
     $didReset = $true
+    # 节点切换（含中继 failover）不是 WARP 动作成功：按契约不清空失败窗口。
   }
 
-  # F1：旧网关 /healthz 没有 failure_streak/failures_total。主信号禁用，只保留
-  # active=0/unavailable 副信号；兼容警告每次网关世代只打一次，升级/重启后重报。
-  if (-not [bool](Get-Prop $Health 'HasFailureStreak')) {
+  # 失败滑窗（failure_window）：只看 failures_total/create_failures_total 的累计增量。
+  # 每次采样都推进窗口；普通成功（last_success_at 变化）只记录、绝不清窗。
+  # 清窗只发生在 started_at 变化/计数器回退（本函数）与动作成功（下面动作块）。
+  $winRes = Update-WarpExitFailureWindow -State $script:WarpExitWindow -Now $now `
+    -FailuresTotal $failuresTotal -CreateFailuresTotal $createFailures `
+    -HasFailuresTotal $hasFailuresTotal -HasCreateCounter $hasCreateFailuresTotal `
+    -StartedAt $startedAt -LastSuccessAt $lastSuccess `
+    -WindowMinutes ([int]$script:WarpExitFailureWindowMinutes) `
+    -WindowFailures ([int]$script:WarpExitFailureWindowFailures) `
+    -WindowCreateFailures ([int]$script:WarpExitFailureWindowCreateFailures)
+  if ([bool](Get-Prop $winRes 'Regression')) {
+    Write-WdLog "WARP 出口失败窗口：计数器回退（failures_total=$failuresTotal，create_failures_total=$createFailures），已清空窗口并重建基线（窗口 $($script:WarpExitFailureWindowMinutes) 分钟）" 'WARN'
+  } elseif ([bool](Get-Prop $winRes 'FirstObservation')) {
+    Write-WdLog "WARP 出口失败窗口：首次观察，仅建立基线（failures_total=$failuresTotal，create_failures_total=$createFailures，窗口 $($script:WarpExitFailureWindowMinutes) 分钟）" 'INFO'
+  }
+
+  # F1：旧网关 /healthz 没有 failure_streak/failures_total。主信号与失败窗口禁用，
+  # 只保留 active=0/unavailable 副信号；兼容警告每次网关世代只打一次，升级/重启后重报。
+  if (-not [bool](Get-Prop $Health 'HasFailureStreak') -or -not $hasFailuresTotal) {
     if (-not $script:WarpExitNoCountersWarned) {
-      Write-WdLog 'WARP 出口失败触发：网关 /healthz 的 warp 段没有 failure_streak/failures_total（旧网关），主信号 failure_streak 禁用，仅保留 active=0/unavailable 副信号；请升级并重启网关' 'WARN'
+      $missingCounters = @()
+      $disabledSignals = @()
+      if (-not [bool](Get-Prop $Health 'HasFailureStreak')) { $missingCounters += 'failure_streak'; $disabledSignals += '主信号 failure_streak' }
+      if (-not $hasFailuresTotal) { $missingCounters += 'failures_total'; $disabledSignals += '失败窗口' }
+      Write-WdLog "WARP 出口失败触发：网关 /healthz 的 warp 段缺少 $($missingCounters -join '/')（旧网关），$($disabledSignals -join '与') 禁用；保留 active=0/unavailable 副信号；请升级并重启网关" 'WARN'
       $script:WarpExitNoCountersWarned = $true
     }
   } else {
@@ -3855,8 +4197,20 @@ function Invoke-WarpExitFailureTrigger {
   $cause = ''
   $causeDetail = ''
   if ($streak -ge $primaryTarget) {
+    # 快路径保留：failure_streak 仍然优先，语义不变。
     $cause = 'failure_streak'
     $causeDetail = "failure_streak=$streak 达阈值 $primaryTarget（kind=$kind，累计 $failuresTotal 次，创建失败 $createFailures 次）"
+  } elseif ([bool](Get-Prop $winRes 'Triggered')) {
+    # 失败窗口与 unavailable_rounds 并列；两者同时满足时窗口优先，日志用 cause 区分。
+    $cause = 'failure_window'
+    $winFailures = [int64](Get-Prop $winRes 'WindowFailures')
+    $winCreate = [int64](Get-Prop $winRes 'WindowCreate')
+    $winCreateTxt = if ([int]$script:WarpExitFailureWindowCreateFailures -gt 0) {
+      "，create_failures_total 增量 $winCreate/$($script:WarpExitFailureWindowCreateFailures)"
+    } else {
+      '，create 子信号已关闭'
+    }
+    $causeDetail = "窗口 $($script:WarpExitFailureWindowMinutes) 分钟内 failures_total 增量 $winFailures/$($script:WarpExitFailureWindowFailures)$winCreateTxt（kind=$kind，status=$warpStatus active=$warpActive cooling=$warpCooling）"
   } elseif ($script:WarpExitLocalStrikes -ge $script:WarpExitFailureThreshold) {
     $cause = 'unavailable_rounds'
     $causeDetail = "出口池连续不可用 $($script:WarpExitLocalStrikes) 轮达阈值 $($script:WarpExitFailureThreshold)（failure_streak=$streak，status=$warpStatus active=$warpActive）"
@@ -3882,7 +4236,13 @@ function Invoke-WarpExitFailureTrigger {
     return $res
   }
 
-  Write-WdLog "WARP 出口失败触发：$causeDetail，action=$($script:WarpExitFailureAction)（cooldown $($script:WarpExitFailureCooldownMinutes) 分钟）" 'WARN'
+  if ($cause -eq 'failure_window') {
+    # 事件名固定为「WARP 出口失败窗口」；soft_failures_total 只附日志，不参与触发。
+    $softTxt = if ($hasSoftFailures) { "，soft_failures_total=$softFailures（仅记录，不参与触发）" } else { '' }
+    Write-WdLog "WARP 出口失败窗口：$causeDetail$softTxt，action=$($script:WarpExitFailureAction)（cooldown $($script:WarpExitFailureCooldownMinutes) 分钟）" 'WARN'
+  } else {
+    Write-WdLog "WARP 出口失败触发：$causeDetail，action=$($script:WarpExitFailureAction)（cooldown $($script:WarpExitFailureCooldownMinutes) 分钟）" 'WARN'
+  }
   $action = $script:WarpExitFailureAction
   $refreshed = $false
   $refreshFailed = $false
@@ -3966,6 +4326,11 @@ function Invoke-WarpExitFailureTrigger {
   #     冷却结束后同一 failure_streak 可重试，不会被旧基线卡住（verifier F1）。
   if ($switched -or ($action -eq 'refresh_only' -and $refreshed)) {
     $script:WarpExitBaselineStreak = [int64]$streak
+    # 动作成功：清空失败窗口，并把 last failures/create 设为动作时的累计值。
+    # 动作期间新增的失败会在下一轮按增量重新累计（不会丢）；动作失败时保留窗口，
+    # 冷却结束后若窗口内仍有失败可再次触发（与 baseline=0 的重试语义一致）。
+    Reset-WarpExitWindowState -State $script:WarpExitWindow -FailuresTotal $failuresTotal -CreateFailuresTotal $createFailures -HasCreateCounter $hasCreateFailuresTotal -StartedAt $startedAt -LastSuccessAt $lastSuccess
+    Write-WdLog "WARP 出口失败窗口：动作成功后清空窗口并重建基线（failures_total=$failuresTotal，create_failures_total=$createFailures）" 'INFO'
   } else {
     $script:WarpExitBaselineStreak = [int64]0
   }
@@ -4445,7 +4810,7 @@ function Invoke-DryRun {
     $hzDry = Get-GatewayHealthz -Force
     if ([bool](Get-Prop $hzDry 'Ok')) {
       if ([bool](Get-Prop $hzDry 'HasWarp')) {
-        Write-WdLog ("WARP 出口失败触发（DryRun 只读，不动作）：enabled=true threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction) healthz=$(Get-Prop $hzDry 'Status') status=$(Get-Prop $hzDry 'WarpStatus') active=$(Get-Prop $hzDry 'WarpActive') standby=$(Get-Prop $hzDry 'WarpStandby') cooling=$(Get-Prop $hzDry 'WarpCooling') failure_streak=$(Get-Prop $hzDry 'FailureStreak') failures_total=$(Get-Prop $hzDry 'FailuresTotal') create_failures=$(Get-Prop $hzDry 'CreateFailuresTotal') last_failure_kind=$(Get-Prop $hzDry 'LastFailureKind') started_at=$(Get-Prop $hzDry 'StartedAt') last_success_at=$(Get-Prop $hzDry 'LastSuccessAt')")
+        Write-WdLog ("WARP 出口失败触发（DryRun 只读，不动作）：enabled=true threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction) window=$($script:WarpExitFailureWindowMinutes)分钟/$($script:WarpExitFailureWindowFailures)次 create=$($script:WarpExitFailureWindowCreateFailures)次 healthz=$(Get-Prop $hzDry 'Status') status=$(Get-Prop $hzDry 'WarpStatus') active=$(Get-Prop $hzDry 'WarpActive') standby=$(Get-Prop $hzDry 'WarpStandby') cooling=$(Get-Prop $hzDry 'WarpCooling') failure_streak=$(Get-Prop $hzDry 'FailureStreak') failures_total=$(Get-Prop $hzDry 'FailuresTotal') create_failures=$(Get-Prop $hzDry 'CreateFailuresTotal') soft_failures_total=$(Get-Prop $hzDry 'SoftFailuresTotal') has_soft=$([bool](Get-Prop $hzDry 'HasSoftFailuresTotal')) last_failure_kind=$(Get-Prop $hzDry 'LastFailureKind') started_at=$(Get-Prop $hzDry 'StartedAt') last_success_at=$(Get-Prop $hzDry 'LastSuccessAt')")
       } else {
         Write-WdLog 'WARP 出口失败触发（DryRun 只读）：/healthz 无 warp 段（WARP 未启用），不会触发'
       }
@@ -4582,6 +4947,9 @@ $script:LastStaleProbe = [DateTime]::MinValue
 #   HealthBackoffUntil        /healthz 失败后的 60s 退避
 #   NoCountersWarned         旧网关缺 failure_streak 的兼容警告只打一次（F1）
 #   FirstObservation         进程/网关重启后的首次有效观察，用于历史连击基线（F2）
+#   Window                   失败滑窗状态（New-WarpExitWindowState）：累计计数基线、样本、
+#                            create 基线有效性；普通成功不清窗，只有重启/回退/动作成功清窗
+$script:WarpExitWindow = New-WarpExitWindowState
 $script:WarpExitNoCountersWarned = $false
 $script:WarpExitFirstObservation = $true
 $script:WarpExitStartedAt = ''
@@ -4601,6 +4969,19 @@ $script:WarpExitHealthBackoffUntil = [DateTime]::MinValue
 $script:WarpExitHealthErrSig = ''
 $script:WarpExitHealthErrLogAt = [DateTime]::MinValue
 $script:WarpExitTriggerErrSig = ''
+
+# 隐藏诊断入口：必须早于 Read-WatchdogConfig（本自检不读 watchdog.json）、实例互斥与
+# 所有 Resolve-*/网络路径；纯内存合成序列，不切换、不写状态/日志文件。
+if ($WarpExitFailureWindowSelfTest) {
+  $selfTestOk = $false
+  try { $selfTestOk = Invoke-WarpExitFailureWindowSelfTest }
+  catch {
+    Write-Host ('FAIL WARP 出口失败窗口自检异常：' + $_.Exception.Message)
+    $selfTestOk = $false
+  }
+  if ($selfTestOk) { exit 0 }
+  exit 1
+}
 
 try {
   # watchdog.json 只读且不依赖 Clash/网关：必须在实例互斥与所有 Resolve-* 之前读取，
@@ -4707,9 +5088,9 @@ try {
   $bannerTarget = if ($bannerPlan.Endpoint -ne '') { Format-ProxyEndpoint -Url $bannerPlan.Endpoint } else { '(无)' }
   Write-WdLog "proxy-check 模式=$($bannerPlan.Mode) target=$bannerTarget source=$($bannerPlan.Source) 间隔=$($script:ProxyCheckIntervalSeconds)s 复检=$($script:ProxyCheckRecheckSeconds)s 超时=$($script:ProxyCheckTimeoutSeconds)s failover=$($script:ProxyCheckFailover) 预算=$($script:ProxyFailoverBudgetSeconds)s udp=$($script:ProxyCheckUdpTarget) require_udp=$($script:ProxyCheckRequireUdp)"
   $wefBanner = if ($script:WarpExitFailureEnabled) {
-    "enabled threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction)"
+    "enabled threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction) window=$($script:WarpExitFailureWindowMinutes)分钟/$($script:WarpExitFailureWindowFailures)次 create=$($script:WarpExitFailureWindowCreateFailures)次"
   } else { 'disabled' }
-  Write-WdLog "WARP 出口失败触发=$wefBanner（中继健康时只读 /healthz；副信号本地连续轮数仅常驻循环推进）"
+  Write-WdLog "WARP 出口失败触发=$wefBanner（中继健康时只读 /healthz；失败窗口按累计计数增量判定，成功不清窗；副信号本地连续轮数仅常驻循环推进）"
   if ($DryRun) {
     Invoke-DryRun -Uid $script:SubscriptionUid
     exit 0

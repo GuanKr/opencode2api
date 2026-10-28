@@ -19,11 +19,16 @@ import (
 )
 
 type warpFailRecorder struct {
-	reasons []string
+	reasons     []string
+	softReasons []string
 }
 
 func (r *warpFailRecorder) Fail(_ *warp.Lease, reason string) {
 	r.reasons = append(r.reasons, reason)
+}
+
+func (r *warpFailRecorder) FailSoft(_ *warp.Lease, reason string) {
+	r.softReasons = append(r.softReasons, reason)
 }
 
 type readError struct{}
@@ -41,12 +46,12 @@ func TestWarpBodyAbortedReadSkipsFail(t *testing.T) {
 	if _, err := body.Read(make([]byte, 8)); !errors.Is(err, wire.ErrStreamAborted) {
 		t.Fatalf("Read error = %v, want ErrStreamAborted", err)
 	}
-	if len(sink.reasons) != 0 {
-		t.Fatalf("an aborted lease must not penalize its exit, got %v", sink.reasons)
+	if len(sink.reasons) != 0 || len(sink.softReasons) != 0 {
+		t.Fatalf("an aborted lease must not report its exit, hard=%v soft=%v", sink.reasons, sink.softReasons)
 	}
 }
 
-func TestWarpBodyLiveReadStillPenalizes(t *testing.T) {
+func TestWarpBodyLiveReadDrainsSoftly(t *testing.T) {
 	lease := &warp.Lease{}
 	sink := &warpFailRecorder{}
 	body := &warpBody{
@@ -56,8 +61,11 @@ func TestWarpBodyLiveReadStillPenalizes(t *testing.T) {
 	if _, err := body.Read(make([]byte, 8)); err == nil || errors.Is(err, wire.ErrStreamAborted) {
 		t.Fatalf("Read error = %v, want the raw read error", err)
 	}
-	if len(sink.reasons) != 1 || sink.reasons[0] != "stream read error" {
-		t.Fatalf("a live lease must fail its exit on a read error, got %v", sink.reasons)
+	if len(sink.reasons) != 0 {
+		t.Fatalf("a mid-stream read error must not hard-fail the exit, got %v", sink.reasons)
+	}
+	if len(sink.softReasons) != 1 || sink.softReasons[0] != "stream read error" {
+		t.Fatalf("a live lease must soft-fail its exit on a read error, got %v", sink.softReasons)
 	}
 }
 
@@ -68,8 +76,8 @@ func TestHealthWarpJSONFields(t *testing.T) {
 	}
 	document := string(raw)
 	for _, field := range []string{
-		"status", "stack", "size", "active", "standby", "cooling",
-		"started_at", "failures_total", "failure_streak",
+		"status", "stack", "size", "active", "standby", "draining", "cooling",
+		"started_at", "failures_total", "soft_failures_total", "failure_streak",
 		"create_failures_total", "last_failure_kind",
 	} {
 		if !strings.Contains(document, `"`+field+`"`) {

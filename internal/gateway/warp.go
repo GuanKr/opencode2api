@@ -50,10 +50,13 @@ func (g *Gateway) warpUsesBun(baseURL, model string) bool {
 	return g.catalog.IsFreeModel(model) && (models.IsV1Upstream(baseURL) || strings.HasSuffix(lane, "/inference"))
 }
 
-// warpFailureSink retires an exit that cannot carry traffic. *warp.Pool is the
-// production implementation; tests substitute a recorder.
+// warpFailureSink reports an exit failure. Fail retires the exit and aborts
+// its other leases; FailSoft only drains it so a single silent stream cannot
+// cut every stream sharing the tunnel. *warp.Pool is the production
+// implementation; tests substitute a recorder.
 type warpFailureSink interface {
 	Fail(lease *warp.Lease, reason string)
+	FailSoft(lease *warp.Lease, reason string)
 }
 
 type warpReportSink interface {
@@ -193,9 +196,13 @@ func (b *warpBody) Close() error {
 	return err
 }
 
-// fail retires the exit behind this body. Missing state is a no-op; the pool
-// ignores a lease that was already aborted or reported its failure, so a late
-// stream failure cannot penalize a restored exit a second time.
+// fail reports the failure behind this body. An idle or mid-body read failure
+// is scoped to this stream, so it drains the exit without aborting the other
+// streams sharing it; every other reason (transport, first event, attempt
+// timeout, HTTP 429/403 via Report) keeps the hard rotate-and-abort path.
+// Missing state is a no-op; the pool ignores a lease that was already aborted
+// or reported its failure, so a late stream failure cannot penalize a restored
+// exit a second time.
 func (b *warpBody) fail(reason string) {
 	if b == nil || b.lease == nil || b.lease.pool == nil || b.readOnly {
 		return
@@ -203,7 +210,18 @@ func (b *warpBody) fail(reason string) {
 	if b.lease.lease != nil && (b.lease.lease.Aborted() || b.lease.lease.Reported()) {
 		return
 	}
+	if warpSoftFailReason(reason) {
+		b.lease.pool.FailSoft(b.lease.lease, reason)
+		return
+	}
 	b.lease.pool.Fail(b.lease.lease, reason)
+}
+
+// warpSoftFailReason lists the conditions that prove only the current stream
+// is unusable. A hard transport error or a timeout before the first event says
+// the tunnel never carried anything, so those keep rotating the exit.
+func warpSoftFailReason(reason string) bool {
+	return reason == "stream idle timeout" || reason == "stream read error"
 }
 
 // warpFailReason names the condition that should retire an exit. A stalled

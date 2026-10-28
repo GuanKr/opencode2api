@@ -57,9 +57,11 @@ type healthWarp struct {
 	Preload             int        `json:"preload"`
 	Active              int        `json:"active"`
 	Standby             int        `json:"standby"`
+	Draining            int        `json:"draining"`
 	Cooling             int        `json:"cooling"`
 	StartedAt           time.Time  `json:"started_at"`
 	FailuresTotal       uint64     `json:"failures_total"`
+	SoftFailuresTotal   uint64     `json:"soft_failures_total"`
 	FailureStreak       int        `json:"failure_streak"`
 	CreateFailuresTotal uint64     `json:"create_failures_total"`
 	LastFailureAt       *time.Time `json:"last_failure_at,omitempty"`
@@ -90,9 +92,11 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Preload:             snapshot.Preload,
 			Active:              snapshot.Active,
 			Standby:             snapshot.Standby,
+			Draining:            snapshot.Draining,
 			Cooling:             snapshot.Cooling,
 			StartedAt:           snapshot.StartedAt.UTC(),
 			FailuresTotal:       snapshot.FailuresTotal,
+			SoftFailuresTotal:   snapshot.SoftFailuresTotal,
 			FailureStreak:       snapshot.FailureStreak,
 			CreateFailuresTotal: snapshot.CreateFailuresTotal,
 			LastFailureKind:     snapshot.LastFailureKind,

@@ -35,8 +35,9 @@ func TestWarpReadOnlyContext(t *testing.T) {
 }
 
 type recordingWarpReportSink struct {
-	fails   []string
-	reports []warpReportRecord
+	fails     []string
+	softFails []string
+	reports   []warpReportRecord
 }
 
 type warpReportRecord struct {
@@ -46,6 +47,10 @@ type warpReportRecord struct {
 
 func (s *recordingWarpReportSink) Fail(_ *warp.Lease, reason string) {
 	s.fails = append(s.fails, reason)
+}
+
+func (s *recordingWarpReportSink) FailSoft(_ *warp.Lease, reason string) {
+	s.softFails = append(s.softFails, reason)
 }
 
 func (s *recordingWarpReportSink) Report(_ *warp.Lease, status int, body []byte) {
@@ -125,7 +130,7 @@ func TestWarpBodyReadOnlySkipsReadFailure(t *testing.T) {
 	if _, err := body.Read(make([]byte, 8)); err == nil {
 		t.Fatal("Read error = nil, want the tunnel error")
 	}
-	if len(sink.fails) != 0 {
-		t.Fatalf("a read-only body must not retire the exit, got %v", sink.fails)
+	if len(sink.fails) != 0 || len(sink.softFails) != 0 {
+		t.Fatalf("a read-only body must not report the exit, hard=%v soft=%v", sink.fails, sink.softFails)
 	}
 }

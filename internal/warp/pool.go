@@ -21,6 +21,16 @@ const DefaultPoolSize = 2
 // that block, so a new tunnel inside it would only repeat the same answer.
 const egressCooldown = 30 * time.Minute
 
+// A soft failure (an idle stream or a read that died mid-body) is scoped to
+// the connection, not to the exit: another lease sharing the same tunnel may
+// still be healthy. The first one drains the exit without aborting its other
+// leases. Only a repeat on the same egress inside softFailureWindow is
+// evidence about the block itself and cools it.
+const (
+	softFailureThreshold = 2
+	softFailureWindow    = 10 * time.Minute
+)
+
 // refillRetryDelay spaces out a failed registration attempt. Successful
 // registrations run back to back in the background.
 const refillRetryDelay = 5 * time.Second
@@ -108,15 +118,21 @@ type Pool struct {
 	startedAt  time.Time
 	generation uint64
 	active     []*exit
-	inflight   int
-	waiting    int
-	next       int
-	reserved   map[string]bool
-	cooling    map[string]time.Time
-	changed    chan struct{}
-	closed     bool
-	refilling  bool
-	scaling    bool
+	// draining holds exits that left the rotation after a soft failure but
+	// still have leases attached. Close and Reset must abort and retire them
+	// too, or a watchdog node switch would leave those streams attached to a
+	// dead tunnel.
+	draining         []*exit
+	softFailureTimes map[string][]time.Time
+	inflight         int
+	waiting          int
+	next             int
+	reserved         map[string]bool
+	cooling          map[string]time.Time
+	changed          chan struct{}
+	closed           bool
+	refilling        bool
+	scaling          bool
 	// refillFailures counts consecutive failed preload registrations;
 	// refillPaused keeps every refill trigger quiet until it expires.
 	refillFailures int
@@ -125,6 +141,7 @@ type Pool struct {
 	createMu       sync.Mutex
 
 	failuresTotal       uint64
+	softFailuresTotal   uint64
 	failureStreak       int
 	createFailuresTotal uint64
 	lastFailureAt       time.Time
@@ -162,12 +179,17 @@ type Snapshot struct {
 	Standby int
 	Cooling int
 	Egress  []string
-	// Health counters: failures_total is monotonic and covers penalized exits
-	// plus failed exit creations; create_failures_total is the creation subset.
-	// failure_streak advances on every counted failure and is cleared only by a
-	// successful upstream response, never by a successful registration.
+	// Draining is the number of soft-drained exits that are out of rotation
+	// but still held by an in-flight lease.
+	Draining int
+	// Health counters: failures_total is monotonic and covers hard and soft
+	// failures plus failed exit creations; soft_failures_total is the soft
+	// subset and create_failures_total the creation subset. failure_streak
+	// advances only on hard failures and is cleared only by a successful
+	// upstream response, never by a successful registration.
 	StartedAt           time.Time
 	FailuresTotal       uint64
+	SoftFailuresTotal   uint64
 	FailureStreak       int
 	CreateFailuresTotal uint64
 	LastFailureAt       time.Time
@@ -291,16 +313,17 @@ func newPool(ctx context.Context, log logger, size int, create func(context.Cont
 	// leaving the pool stuck on its first egress forever.
 	poolCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	p := &Pool{
-		ctx:       poolCtx,
-		cancel:    cancel,
-		logger:    log,
-		size:      size,
-		preload:   preload,
-		newExit:   create,
-		startedAt: time.Now(),
-		reserved:  make(map[string]bool),
-		cooling:   make(map[string]time.Time),
-		changed:   make(chan struct{}),
+		ctx:              poolCtx,
+		cancel:           cancel,
+		logger:           log,
+		size:             size,
+		preload:          preload,
+		newExit:          create,
+		startedAt:        time.Now(),
+		reserved:         make(map[string]bool),
+		cooling:          make(map[string]time.Time),
+		softFailureTimes: make(map[string][]time.Time),
+		changed:          make(chan struct{}),
 	}
 	// The first registration gates readiness. Cloudflare can answer it with a
 	// rate limit even when this process has just started (the limit follows the
@@ -431,6 +454,150 @@ func (p *Pool) Fail(lease *Lease, reason string) {
 	p.penalize(lease.exit, lease, reason)
 }
 
+// FailSoft drains the exit behind a stream that failed in a way that only
+// proves this connection is unusable — an idle read or a body that died
+// mid-stream. The stream fails as usual, but unlike Fail the other leases on
+// the same exit are not aborted: one silent stream does not prove the tunnel
+// is broken for them. The exit leaves the rotation (retired, so addRef refuses
+// new leases), keeps serving its current leases, and is replaced in the
+// background. A second soft failure on the same egress inside
+// softFailureWindow cools the block; it still does not abort the other leases.
+func (p *Pool) FailSoft(lease *Lease, reason string) {
+	if lease == nil || lease.exit == nil || reason == "" {
+		return
+	}
+	if lease.Aborted() || !lease.markReported() {
+		return
+	}
+	p.softFail(lease.exit, reason)
+}
+
+// softFail implements the drain and the per-egress repeat threshold. The
+// counter contract is deliberate: failures_total and soft_failures_total move
+// so the watchdog window sees the event, while failure_streak stays still
+// because a silent stream is not proof that the pool is broken.
+func (p *Pool) softFail(bad *exit, reason string) {
+	now := time.Now()
+	kind := failureKind(reason)
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	// Drop draining exits whose device is already gone before consulting the
+	// list. A late soft report from a lease that outlived its closed exit must
+	// not count again or cool the egress a second time.
+	p.pruneDrainingLocked()
+	index := p.activeIndexLocked(bad)
+	if index < 0 && !p.drainingLocked(bad) {
+		// The exit is already gone (a hard failure won the race and penalty
+		// has counted it). A soft report cannot add anything.
+		p.mu.Unlock()
+		return
+	}
+	p.noteSoftFailureLocked(kind, now)
+	p.pruneSoftFailureTimesLocked(now)
+	key := bad.egressKey()
+	exhausted := false
+	if key != "" && p.recordSoftFailureLocked(key, now) {
+		if _, cooling := p.cooling[key]; !cooling {
+			p.cooling[key] = now.Add(egressCooldown)
+			exhausted = true
+		}
+		delete(p.reserved, key)
+	}
+	if index < 0 {
+		p.mu.Unlock()
+		if p.logger != nil {
+			p.logger.Warnf("OpenCode WARP exit %s is already draining after soft failure (%s) %s", bad.id, reason, egressLogFields(bad.egress))
+			if exhausted {
+				p.logSoftExhausted(bad, reason)
+			}
+		}
+		return
+	}
+	p.draining = append(p.draining, bad)
+	p.active = append(p.active[:index], p.active[index+1:]...)
+	if p.next >= len(p.active) {
+		p.next = 0
+	}
+	// The drained exit no longer accepts leases, so its egress block is free
+	// for the replacement. This is not a penalty: the block is not cooled
+	// unless the repeat threshold is reached.
+	if key != "" {
+		delete(p.reserved, key)
+	}
+	p.notifyLocked()
+	generation := p.generation
+	p.wait.Add(1)
+	p.mu.Unlock()
+
+	// Retire so addRef refuses new leases; the device stays open until the
+	// current leases release. Unlike penalize, nothing is aborted here.
+	bad.retire()
+	if p.logger != nil {
+		p.logger.Warnf("Draining OpenCode WARP exit %s after soft failure (%s) %s", bad.id, reason, egressLogFields(bad.egress))
+		if exhausted {
+			p.logSoftExhausted(bad, reason)
+		}
+	}
+	go func() {
+		defer p.wait.Done()
+		p.replace(bad, reason, generation)
+	}()
+}
+
+func (p *Pool) logSoftExhausted(bad *exit, reason string) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Warnf("Cooling OpenCode WARP egress after %d soft failures within %s (event=soft_exhausted, %s, %s) %s",
+		softFailureThreshold, softFailureWindow, bad.id, reason, egressLogFields(bad.egress))
+}
+
+// noteSoftFailureLocked counts a stream-scoped failure without advancing the
+// hard-failure streak.
+func (p *Pool) noteSoftFailureLocked(kind string, at time.Time) {
+	p.failuresTotal++
+	p.softFailuresTotal++
+	p.lastFailureAt = at
+	p.lastFailureKind = kind
+}
+
+// recordSoftFailureLocked appends now to the egress's recent soft failures and
+// reports whether the repeat threshold was reached inside the window.
+func (p *Pool) recordSoftFailureLocked(key string, now time.Time) bool {
+	if p.softFailureTimes == nil {
+		p.softFailureTimes = make(map[string][]time.Time)
+	}
+	recent := append(p.softFailureTimes[key], now)
+	p.softFailureTimes[key] = recent
+	return len(recent) >= softFailureThreshold
+}
+
+// pruneSoftFailureTimesLocked drops records older than the window, including
+// egresses that have not failed again. Without it the map would keep one entry
+// for every egress the process ever used.
+func (p *Pool) pruneSoftFailureTimesLocked(now time.Time) {
+	if len(p.softFailureTimes) == 0 {
+		return
+	}
+	cutoff := now.Add(-softFailureWindow)
+	for key, times := range p.softFailureTimes {
+		recent := times[:0]
+		for _, at := range times {
+			if at.After(cutoff) {
+				recent = append(recent, at)
+			}
+		}
+		if len(recent) == 0 {
+			delete(p.softFailureTimes, key)
+			continue
+		}
+		p.softFailureTimes[key] = recent
+	}
+}
+
 func (p *Pool) Size() int { return p.size }
 
 // Snapshot reports the pool's current capacity and the public egress address
@@ -438,14 +605,18 @@ func (p *Pool) Size() int { return p.size }
 func (p *Pool) Snapshot() Snapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.pruneDrainingLocked()
+	p.pruneSoftFailureTimesLocked(time.Now())
 	snapshot := Snapshot{
 		Stack:               string(p.stack),
 		Size:                p.size,
 		Preload:             p.preload,
 		Active:              len(p.active),
+		Draining:            len(p.draining),
 		Cooling:             len(p.cooling),
 		StartedAt:           p.startedAt,
 		FailuresTotal:       p.failuresTotal,
+		SoftFailuresTotal:   p.softFailuresTotal,
 		FailureStreak:       p.failureStreak,
 		CreateFailuresTotal: p.createFailuresTotal,
 		LastFailureAt:       p.lastFailureAt,
@@ -523,7 +694,28 @@ func (p *Pool) penalize(bad *exit, exclude *Lease, reason string) {
 	}
 	index := p.activeIndexLocked(bad)
 	if index < 0 {
+		// A hard failure (typically another lease's 429) can arrive after a
+		// soft failure already drained the exit. That is real evidence about
+		// the egress, so cool it and count a hard failure; the remaining
+		// leases still must not be aborted, because the exit is already out
+		// of rotation and they are the only users left on it.
+		if !p.drainingLocked(bad) {
+			p.mu.Unlock()
+			return
+		}
+		if !bad.markPenalized() {
+			p.mu.Unlock()
+			return
+		}
+		p.noteFailureLocked(failureKind(reason))
+		if key := bad.egressKey(); key != "" {
+			p.cooling[key] = time.Now().Add(egressCooldown)
+			delete(p.reserved, key)
+		}
 		p.mu.Unlock()
+		if p.logger != nil {
+			p.logger.Warnf("Cooling OpenCode WARP draining egress %s (%s) %s", bad.id, reason, egressLogFields(bad.egress))
+		}
 		return
 	}
 	if !bad.markPenalized() {
@@ -554,7 +746,7 @@ func (p *Pool) penalize(bad *exit, exclude *Lease, reason string) {
 	bad.abortLeases(exclude, ErrExitRotated)
 
 	if p.logger != nil {
-		p.logger.Warnf("Rotating OpenCode WARP egress %s (%s)", bad.id, reason)
+		p.logger.Warnf("Rotating OpenCode WARP egress %s (%s) %s", bad.id, reason, egressLogFields(bad.egress))
 	}
 	// Re-register immediately: the retired exit is replaced in the background
 	// and the retry draws whichever active exit is ready first.
@@ -580,7 +772,11 @@ func (p *Pool) replace(old *exit, reason string, generation uint64) {
 		return
 	}
 	if err != nil {
-		restored := len(p.active) == 0
+		// Restoring an exit that has already been retired (a soft-drained
+		// exit) would put a retired exit back in the ring, where addRef
+		// refuses every new lease and Acquire spins forever. Only the hard
+		// path, which retires after the replacement attempt, may restore.
+		restored := len(p.active) == 0 && !old.isRetired()
 		if restored {
 			old.clearPenalty()
 			if key := old.egressKey(); key != "" {
@@ -596,9 +792,9 @@ func (p *Pool) replace(old *exit, reason string, generation uint64) {
 		}
 		if p.logger != nil {
 			if pause := registrationPause(err); pause > 0 {
-				p.logger.Infof("OpenCode WARP replacement paused for %s", pause.Round(time.Second))
+				p.logger.Infof("OpenCode WARP replacement paused for %s %s", pause.Round(time.Second), egressLogFields(old.egress))
 			} else {
-				p.logger.Errorf("Cannot replace OpenCode WARP egress %s: %v", old.id, err)
+				p.logger.Errorf("Cannot replace OpenCode WARP egress %s: %v %s", old.id, err, egressLogFields(old.egress))
 			}
 		}
 		p.startRefill()
@@ -625,7 +821,7 @@ func (p *Pool) replace(old *exit, reason string, generation uint64) {
 		return
 	}
 	if p.logger != nil {
-		p.logger.Infof("OpenCode WARP egress %s replaced by %s at %s (%s), active=%d", old.id, replacement.id, replacement.egress, reason, len(p.active))
+		p.logger.Infof("OpenCode WARP egress %s replaced by %s at %s (%s) %s, active=%d", old.id, replacement.id, replacement.egress, reason, egressLogFields(replacement.egress), len(p.active))
 	}
 	old.retire()
 	p.startRefill()
@@ -826,7 +1022,9 @@ func (p *Pool) Reset(cause error) int {
 		return 0
 	}
 	active := p.active
+	draining := p.draining
 	p.active = nil
+	p.draining = nil
 	p.next = 0
 	p.generation++
 	// A reset is an explicit rotation (the watchdog switched the network path),
@@ -840,15 +1038,27 @@ func (p *Pool) Reset(cause error) int {
 			delete(p.reserved, key)
 		}
 	}
+	for _, item := range draining {
+		if key := item.egressKey(); key != "" {
+			delete(p.reserved, key)
+		}
+	}
 	p.notifyLocked()
 	p.mu.Unlock()
 
+	// A watchdog node switch invalidates every tunnel, including soft-drained
+	// exits that still carry leases. They must be aborted now rather than at
+	// device close.
 	for _, item := range active {
 		item.abortLeases(nil, cause)
 		item.retire()
 	}
-	if len(active) > 0 && p.logger != nil {
-		p.logger.Warnf("Resetting OpenCode WARP pool (%d exits): %v", len(active), cause)
+	for _, item := range draining {
+		item.abortLeases(nil, cause)
+		item.retire()
+	}
+	if removed := len(active) + len(draining); removed > 0 && p.logger != nil {
+		p.logger.Warnf("Resetting OpenCode WARP pool (%d exits): %v", removed, cause)
 	}
 	p.startRefill()
 	return len(active)
@@ -911,13 +1121,13 @@ func (p *Pool) createExit(ctx context.Context) (*exit, error) {
 		p.mu.Unlock()
 		if usable {
 			if p.logger != nil {
-				p.logger.Infof("OpenCode WARP/%s egress %s ready at %s", candidate.stack, candidate.id, candidate.egress)
+				p.logger.Infof("OpenCode WARP/%s egress %s ready at %s %s", candidate.stack, candidate.id, candidate.egress, egressLogFields(candidate.egress))
 			}
 			return candidate, nil
 		}
 		lastErr = fmt.Errorf("%w: %s", errDuplicateEgress, key)
 		if p.logger != nil {
-			p.logger.Warnf("Discarding duplicate WARP exit %s: %v", candidate.id, lastErr)
+			p.logger.Warnf("Discarding duplicate WARP exit %s: %v %s", candidate.id, lastErr, egressLogFields(candidate.egress))
 		}
 		candidate.close()
 	}
@@ -959,6 +1169,31 @@ func (p *Pool) activeIndexLocked(target *exit) int {
 	return -1
 }
 
+func (p *Pool) drainingLocked(target *exit) bool {
+	for _, candidate := range p.draining {
+		if candidate == target {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneDrainingLocked drops soft-drained exits whose device has already closed
+// (the last lease released). They stay listed only until then so Close and
+// Reset can abort the leases that still hold them.
+func (p *Pool) pruneDrainingLocked() {
+	if len(p.draining) == 0 {
+		return
+	}
+	kept := p.draining[:0]
+	for _, candidate := range p.draining {
+		if !candidate.isClosed() {
+			kept = append(kept, candidate)
+		}
+	}
+	p.draining = kept
+}
+
 func (p *Pool) needsRefillLocked() bool {
 	return len(p.active) < p.desiredLocked()
 }
@@ -971,17 +1206,27 @@ func (p *Pool) Close() {
 	}
 	p.closed = true
 	active := p.active
+	draining := p.draining
 	p.active = nil
+	p.draining = nil
 	p.notifyLocked()
 	p.mu.Unlock()
 
 	// Abort before canceling the pool context so these leases report the
-	// close, not a bare parent cancellation.
+	// close, not a bare parent cancellation. Soft-drained exits are still
+	// carrying leases, so they must be aborted too.
 	for _, item := range active {
+		item.abortLeases(nil, ErrClosed)
+	}
+	for _, item := range draining {
 		item.abortLeases(nil, ErrClosed)
 	}
 	p.cancel()
 	for _, item := range active {
+		p.releaseReservation(item)
+		item.retire()
+	}
+	for _, item := range draining {
 		p.releaseReservation(item)
 		item.retire()
 	}

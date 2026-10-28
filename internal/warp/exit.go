@@ -491,6 +491,21 @@ func (e *exit) retire() {
 	}
 }
 
+// isRetired reports whether the exit has left the rotation. A replacement must
+// not put a retired exit back into the ring.
+func (e *exit) isRetired() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.retired
+}
+
+// isClosed reports whether the exit's device is already gone.
+func (e *exit) isClosed() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.closed
+}
+
 func (e *exit) close() {
 	e.closeOnce.Do(func() {
 		e.mu.Lock()

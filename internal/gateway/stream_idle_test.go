@@ -118,11 +118,14 @@ func TestIdleReadCloserCloseUnblocksRead(t *testing.T) {
 }
 
 type recordingWarpSink struct {
-	mu      sync.Mutex
-	lease   *warp.Lease
-	reason  string
-	reasons []string
-	calls   int
+	mu          sync.Mutex
+	lease       *warp.Lease
+	reason      string
+	reasons     []string
+	calls       int
+	softReason  string
+	softReasons []string
+	softCalls   int
 }
 
 func (s *recordingWarpSink) Fail(lease *warp.Lease, reason string) {
@@ -134,16 +137,37 @@ func (s *recordingWarpSink) Fail(lease *warp.Lease, reason string) {
 	s.calls++
 }
 
+func (s *recordingWarpSink) FailSoft(lease *warp.Lease, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lease = lease
+	s.softReason = reason
+	s.softReasons = append(s.softReasons, reason)
+	s.softCalls++
+}
+
 func (s *recordingWarpSink) snapshot() (int, *warp.Lease, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls, s.lease, s.reason
 }
 
+func (s *recordingWarpSink) softSnapshot() (int, *warp.Lease, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.softCalls, s.lease, s.softReason
+}
+
 func (s *recordingWarpSink) reasonsSnapshot() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.reasons...)
+}
+
+func (s *recordingWarpSink) softReasonsSnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.softReasons...)
 }
 
 func TestNewStreamIdleBodyDoesNotRetireWarpExit(t *testing.T) {
@@ -174,16 +198,19 @@ func TestNewStreamIdleBodyDoesNotRetireWarpExit(t *testing.T) {
 		t.Fatal("a *warpBody must yield a failure callback")
 	}
 	fail()
-	calls, gotLease, reason := sink.snapshot()
+	if calls, _, _ := sink.snapshot(); calls != 0 {
+		t.Fatalf("a stream idle timeout must not hard-fail the exit, calls=%d", calls)
+	}
+	calls, gotLease, reason := sink.softSnapshot()
 	if calls != 1 || gotLease != lease || reason != "stream idle timeout" {
-		t.Fatalf("Fail calls=%d lease=%p reason=%q, want 1/%p/stream idle timeout", calls, gotLease, reason, lease)
+		t.Fatalf("FailSoft calls=%d lease=%p reason=%q, want 1/%p/stream idle timeout", calls, gotLease, reason, lease)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 }
 
-func TestWarpStreamFailureRetiresExit(t *testing.T) {
+func TestWarpStreamFailureDrainsSoftly(t *testing.T) {
 	sink := &recordingWarpSink{}
 	lease := new(warp.Lease)
 	body := &warpBody{
@@ -196,15 +223,25 @@ func TestWarpStreamFailureRetiresExit(t *testing.T) {
 		t.Fatal("a *warpBody must yield a failure callback")
 	}
 	fail()
-	calls, gotLease, reason := sink.snapshot()
-	if calls != 1 || gotLease != lease || reason != "stream idle timeout" {
-		t.Fatalf("Fail calls=%d lease=%p reason=%q, want 1/%p/stream idle timeout", calls, gotLease, reason, lease)
+	if calls, _, _ := sink.snapshot(); calls != 0 {
+		t.Fatalf("a stream idle timeout must not hard-fail the exit, calls=%d", calls)
+	}
+	softCalls, gotLease, reason := sink.softSnapshot()
+	if softCalls != 1 || gotLease != lease || reason != "stream idle timeout" {
+		t.Fatalf("FailSoft calls=%d lease=%p reason=%q, want 1/%p/stream idle timeout", softCalls, gotLease, reason, lease)
 	}
 
 	body.fail("stream read error")
-	calls, _, reason = sink.snapshot()
-	if calls != 2 || reason != "stream read error" {
-		t.Fatalf("direct fail calls=%d reason=%q, want 2/stream read error", calls, reason)
+	softCalls, _, reason = sink.softSnapshot()
+	if softCalls != 2 || reason != "stream read error" {
+		t.Fatalf("direct fail calls=%d reason=%q, want 2/stream read error", softCalls, reason)
+	}
+
+	// Every other reason keeps the hard path.
+	body.fail("transport error")
+	hardCalls, _, hardReason := sink.snapshot()
+	if hardCalls != 1 || hardReason != "transport error" {
+		t.Fatalf("hard Fail calls=%d reason=%q, want 1/transport error", hardCalls, hardReason)
 	}
 
 	diagnostic := &warpBody{
@@ -213,8 +250,11 @@ func TestWarpStreamFailureRetiresExit(t *testing.T) {
 		readOnly:   true,
 	}
 	diagnostic.fail("ignored")
-	if calls, _, _ := sink.snapshot(); calls != 2 {
-		t.Fatalf("diagnostic body must not retire the exit, calls=%d", calls)
+	if hardCalls, _, _ := sink.snapshot(); hardCalls != 1 {
+		t.Fatalf("diagnostic body must not retire the exit, calls=%d", hardCalls)
+	}
+	if softCalls, _, _ := sink.softSnapshot(); softCalls != 2 {
+		t.Fatalf("diagnostic body must not soft-fail the exit, calls=%d", softCalls)
 	}
 	if fail := warpStreamFailure(io.NopCloser(strings.NewReader(""))); fail != nil {
 		t.Fatal("a non-WARP body must not yield a failure callback")

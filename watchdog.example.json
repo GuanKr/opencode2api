@@ -128,6 +128,25 @@
     // 新增失败仍会触发（需再累计 threshold 次）。
     "threshold": 9,
 
+    // ---- 失败滑窗（2026-10-28，可选；省略即用默认值）----
+    // failure_streak 快路径之外的新信号：只看 /healthz 的 failures_total 与
+    // create_failures_total 累计增量。失败与成功交替时 failure_streak 会被每次成功
+    // 清零，单靠 threshold 可能永远到不了；滑窗按时间累计，普通成功不清窗。
+    // window_minutes：滑窗长度（1-120，默认 10）。
+    // window_failures：窗口内 failures_total 增量达到多少触发（1-1000，默认 10）。
+    // window_create_failures：窗口内 create_failures_total 增量达到多少触发
+    //   （0-1000，默认 6；0 = 关闭该子信号）。两个子信号任一满足即触发，
+    //   日志事件名为「WARP 出口失败窗口」。
+    // 首次观察只建基线、不触发；计数器回退（网关重启/started_at 变化/数值变小）
+    // 清空窗口并重建基线；动作成功（切换或 refresh_only 刷新成功）后清窗。
+    // 普通成功（last_success_at 变化）绝不清窗；/healthz 有 soft_failures_total 时
+    // 只附在触发日志里，不参与触发。三个键省略时使用内置默认值（窗口仍生效）；
+    // 旧版脚本不认识这些键，回滚脚本前必须从 watchdog.json 删除 window_* 键。
+    // 三个键都没有命令行参数；只收 JSON 整数，字符串/小数/指数一律启动失败。
+    "window_minutes": 10,
+    "window_failures": 10,
+    "window_create_failures": 6,
+
     // 动作后的冷却分钟数（0-120，默认 15）：冷却期内即使再次达标也不动作。
     // 只作用于本触发器，不碰中继失败/legacy 的 round cooldown。
     "cooldown_minutes": 15,
