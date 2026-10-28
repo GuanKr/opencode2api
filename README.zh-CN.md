@@ -260,7 +260,7 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 ### 官方系统提示词
 
-每个经过整形的免费模型请求都会携带 OpenCode CLI 自身的系统提示词——基础指令、`<env>` 环境块和内置 skill 列表——因为免费层级会校验请求是否具有 agent 形态。v1 `/zen` 使用 1.x 工具名，`/inference` 与 `/zen/go` 使用 2.x 工具名。环境块包含请求的模型、网关工作目录、平台和 UTC 日期。
+每个经过整形的免费模型请求都会携带 OpenCode CLI 自身的系统提示词——基础指令、`<env>` 环境块和内置 skill 列表——因为免费层级会校验请求是否具有 agent 形态。v1 `/zen` 使用 1.x 工具名，`/inference` 与 `/zen/go` 使用 2.x 工具名。环境块包含请求的模型、`prompt_env` 配置的工作目录、平台和 UTC 日期。
 
 注入按协议处理：Chat 的系统与 developer 消息会合并为一条位于最前的 `system` 消息；Anthropic 写入 `system`（字符串，或调用方提供块列表时在最前插入文本块）；Responses 写入 `instructions`。如果系统内容中已包含标记 `You are opencode, an interactive CLI tool`，请求会原样通过，因此已经发送官方提示词的客户端不会被重复注入。通过 Zen 或 Go Key 提供的免费模型也会接受同样的整形，只是仍然从对应 Tier 的代理出网。
 
@@ -316,6 +316,7 @@ Key 初始化时均衡分配到代理。真实流量可以触发代理检查、K
 | `upstream.go`               | `https://opencode.ai/zen/go`。                                                        |
 | `upstream.anonymous`        | `https://opencode.ai/inference`；匿名通道默认（也是默认配置下唯一）的上游。            |
 | `upstream.anonymous_lane_order` | `["inference"]`；匿名通道按序尝试的上游列表。`"inference"` = `upstream.anonymous`，`"legacy"` = `https://opencode.ai/zen`（v1 通道）。 |
+| `prompt_env`                | `/workspace`；`{working_directory, workspace_root}` 渲染进免费层“官方 CLI”的 `<env>` 块。空值使用 `/workspace`，`workspace_root` 为空时跟随 `working_directory`。 |
 | `proxies`                   | 两个代理来源都为空时，使用 `["direct"]`。                                             |
 | `proxyfile`                 | 可选；相对路径基于配置文件所在目录解析。                                              |
 | `models.refresh_seconds`    | `300`；最小为 1。                                                                     |

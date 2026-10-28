@@ -260,7 +260,7 @@ The upstream free quota is scoped to the egress block, so rotation only helps wh
 
 ### Official system prompt
 
-Every shaped free-model request carries the OpenCode CLI's own system prompt — its base instructions, the `<env>` block, and the built-in skill listing — because the free tier validates agent-shaped traffic. The v1 `/zen` lane uses the 1.x tool names; `/inference` and `/zen/go` use the 2.x names. The environment block names the requested model, the gateway's working directory, the platform, and a UTC date.
+Every shaped free-model request carries the OpenCode CLI's own system prompt — its base instructions, the `<env>` block, and the built-in skill listing — because the free tier validates agent-shaped traffic. The v1 `/zen` lane uses the 1.x tool names; `/inference` and `/zen/go` use the 2.x names. The environment block names the requested model, the configured `prompt_env` working directory, the platform, and a UTC date.
 
 Injection is protocol-aware: Chat system and developer messages are folded into one leading `system` message, Anthropic receives a `system` value (a string, or a leading text block when the caller sent blocks), and Responses receives `instructions`. A body whose system content already contains the marker `You are opencode, an interactive CLI tool` is passed through, so a client that sends the official prompt never gets a second copy. Free models served by a Zen or Go key receive the same shaping even though they still leave through that tier's proxy.
 
@@ -316,6 +316,7 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `upstream.go`               | `https://opencode.ai/zen/go`.                                               |
 | `upstream.anonymous`        | `https://opencode.ai/inference`; the anonymous lane's default (and, by default, only) base. |
 | `upstream.anonymous_lane_order` | `["inference"]`; the bases the anonymous lane tries in order. `"inference"` is `upstream.anonymous`, `"legacy"` is `https://opencode.ai/zen` (the v1 lane). |
+| `prompt_env`             | `/workspace`; `{working_directory, workspace_root}` rendered into the free-tier "official CLI" `<env>` block. Empty values use `/workspace`, and an empty `workspace_root` follows `working_directory`. |
 | `proxies`                   | Falls back to `["direct"]` when both proxy sources are empty.               |
 | `proxyfile`                 | Optional; relative paths resolve beside the configuration file.             |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                           |

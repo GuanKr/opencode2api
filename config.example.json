@@ -23,6 +23,14 @@
     "anonymous": "https://opencode.ai/inference",
     "anonymous_lane_order": ["inference"]
   },
+  // The <env> block injected into the free tier's "official CLI" system prompt.
+  // These are text, not filesystem paths: they decide what the impersonated CLI
+  // reports as its working directory. Empty falls back to /workspace, and an
+  // empty workspace_root follows working_directory.
+  "prompt_env": {
+    "working_directory": "/workspace",
+    "workspace_root": "/workspace"
+  },
   "retry": {
     "max_attempts": 3,
     "timeout_seconds": 300

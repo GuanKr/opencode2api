@@ -197,6 +197,32 @@ func TestBuildConfigCandidateKeepsWarpWhenTheFormOmitsIt(t *testing.T) {
 	}
 }
 
+// The console form does not render prompt_env, so an unrelated save must keep
+// the configured <env> strings instead of resetting them to the zero value (and
+// Normalize would then quietly substitute its default).
+func TestBuildConfigCandidateKeepsPromptEnvWhenTheFormOmitsIt(t *testing.T) {
+	current := config.Config{
+		ServerKeys: []string{"local-key"},
+		PromptEnv:  config.PromptEnvConfig{WorkingDirectory: `D:\Program Files\opencode2api`, WorkspaceRoot: `D:\Program Files\opencode2api`},
+	}
+	candidate, code, err := buildConfigCandidate(current, ConfigUpdate{})
+	if err != nil {
+		t.Fatalf("unexpected rejection (%s): %v", code, err)
+	}
+	if candidate.PromptEnv != current.PromptEnv {
+		t.Fatalf("an omitted prompt_env must keep the configured strings: %+v", candidate.PromptEnv)
+	}
+
+	explicit := config.PromptEnvConfig{WorkingDirectory: "/srv/agent", WorkspaceRoot: "/srv/agent-root"}
+	candidate, code, err = buildConfigCandidate(current, ConfigUpdate{PromptEnv: &explicit})
+	if err != nil {
+		t.Fatalf("unexpected rejection (%s): %v", code, err)
+	}
+	if candidate.PromptEnv != explicit {
+		t.Fatalf("an explicit prompt_env must win: %+v", candidate.PromptEnv)
+	}
+}
+
 // The console form renders enabled/pool_size/stack but not warp.proxy, so a
 // save from it would push the WARP outer path back to flaky direct UDP with
 // applied:true and no log line — the same silent-loss shape as the lane order.

@@ -281,7 +281,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	preparedBodies := make([][]byte, len(upstreams))
 	toolRenames := make([]*wire.ToolRenames, len(upstreams))
 	for i, baseURL := range upstreams {
-		preparedBodies[i], toolRenames[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL))
+		preparedBodies[i], toolRenames[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL), g.cfg.PromptEnv)
 		// The shaped dump for this candidate is emitted inside the attempt loop,
 		// not here: only attempted bytes reach the wire, and a dump of a
 		// candidate that lost the race would make "shaped" a lie (see D5).
@@ -606,7 +606,7 @@ func (g *Gateway) inferenceClient(proxy *proxyTransport, baseURL, model string) 
 // gatewayToolNote). System One payloads are decision requests, not agent
 // traffic, so they are forwarded verbatim, as is a body that is not a JSON
 // object.
-func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool) ([]byte, *wire.ToolRenames) {
+func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool, env config.PromptEnvConfig) ([]byte, *wire.ToolRenames) {
 	if protocol == wire.SystemOne {
 		return body, nil
 	}
@@ -622,7 +622,7 @@ func prepareAnonymousBody(body []byte, protocol wire.Protocol, v1 bool) ([]byte,
 	if ensureAnonymousChatUsage(payload, protocol) {
 		changed = true
 	}
-	if injectOfficialPrompt(payload, protocol, v1) {
+	if injectOfficialPrompt(payload, protocol, v1, env) {
 		changed = true
 	}
 	renames, toolsChanged := renameAndCompleteTools(payload, protocol, v1)
@@ -838,7 +838,7 @@ func (g *Gateway) shapeKeyBody(body []byte, route models.Route, tier config.Tier
 	if tier == config.TierGo {
 		baseURL = g.cfg.Upstream.Go
 	}
-	shaped, renames := prepareAnonymousBody(body, route.ProtocolFor(tier), models.IsV1Upstream(baseURL))
+	shaped, renames := prepareAnonymousBody(body, route.ProtocolFor(tier), models.IsV1Upstream(baseURL), g.cfg.PromptEnv)
 	return shaped, renames, !bytes.Equal(shaped, body)
 }
 

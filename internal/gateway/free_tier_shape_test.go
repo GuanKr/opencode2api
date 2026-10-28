@@ -7,9 +7,14 @@ import (
 	"strings"
 	"testing"
 
+	"opencode2api/internal/config"
 	"opencode2api/internal/jsonutil"
 	wire "opencode2api/internal/protocol"
 )
+
+// testPromptEnv is the configured <env> block shared by these fixtures. Its two
+// values differ so a test can tell which one landed where.
+var testPromptEnv = config.PromptEnvConfig{WorkingDirectory: "/srv/agent", WorkspaceRoot: "/srv/agent-root"}
 
 // The free-tier shaper is the security-relevant part of the anonymous lane: the
 // upstream gate only serves traffic that looks like an official CLI session, so
@@ -132,7 +137,7 @@ func equalStrings(got, want []string) bool {
 // and the 32000 completion ceiling a 2.1 client states.
 func TestFreeTierShapingForcesAgentChatShape(t *testing.T) {
 	body := []byte(`{"model":"opencode/probe-free","messages":[{"role":"user","content":"hi"}]}`)
-	shaped, renames := prepareAnonymousBody(body, wire.Chat, false)
+	shaped, renames := prepareAnonymousBody(body, wire.Chat, false, testPromptEnv)
 	if renames.Count() != 0 {
 		t.Fatalf("a body with no client tools must report no renames, got %d", renames.Count())
 	}
@@ -183,7 +188,7 @@ func TestFreeTierShapingHonoursAnExplicitCompletionLimit(t *testing.T) {
 // would silently skip every assertion below.
 func mustShape(t *testing.T, body []byte, protocol wire.Protocol, v1 bool) []byte {
 	t.Helper()
-	shaped, _ := prepareAnonymousBody(body, protocol, v1)
+	shaped, _ := prepareAnonymousBody(body, protocol, v1, testPromptEnv)
 	if len(shaped) == 0 {
 		t.Fatal("shaper returned an empty body")
 	}
@@ -274,7 +279,7 @@ func TestFreeTierShapingInjectsAnthropicSystemInPlace(t *testing.T) {
 
 	asString := decodeShaped(t, mustShape(t, []byte(`{"model":"m","system":"be terse","messages":[]}`), wire.Anthropic, false))
 	system, _ := asString["system"].(string)
-	if !strings.HasPrefix(system, opencodeSystemPrompt("m", false)) || !strings.Contains(system, "\n\nbe terse\n\n"+gatewayToolNote) {
+	if !strings.HasPrefix(system, opencodeSystemPrompt("m", false, testPromptEnv)) || !strings.Contains(system, "\n\nbe terse\n\n"+gatewayToolNote) {
 		t.Fatalf("a string system value must keep its text after the prompt and before the note, got %q", system)
 	}
 
@@ -336,7 +341,7 @@ func TestFreeTierShapingNeverDuplicatesTheOfficialPrompt(t *testing.T) {
 		},
 	}
 	for name, testCase := range cases {
-		shaped, _ := prepareAnonymousBody([]byte(testCase.body), testCase.protocol, false)
+		shaped, _ := prepareAnonymousBody([]byte(testCase.body), testCase.protocol, false, testPromptEnv)
 		if count := strings.Count(string(shaped), opencodePromptMarker); count != 1 {
 			t.Fatalf("%s: the prompt appears %d times, want exactly the client's one:\n%s", name, count, shaped)
 		}
@@ -396,6 +401,32 @@ func TestFreeTierShapingNotesABodyWithNoSystemSlot(t *testing.T) {
 	}
 }
 
+// TestFreeTierShapingRendersTheConfiguredPromptEnvironment pins the prompt_env
+// setting: the injected <env> block reports the configured strings, never the
+// gateway process's working directory (which used to leak the install path into
+// every shaped request).
+func TestFreeTierShapingRendersTheConfiguredPromptEnvironment(t *testing.T) {
+	// Deliberately unlike any process cwd: a regression that reads os.Getwd
+	// again must fail this case on every host, not only where the install path
+	// differs.
+	env := config.PromptEnvConfig{
+		WorkingDirectory: "/srv/configured-workdir",
+		WorkspaceRoot:    "/srv/configured-root",
+	}
+	shaped, _ := prepareAnonymousBody([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`), wire.Chat, false, env)
+	messages, _ := decodeShaped(t, shaped)["messages"].([]any)
+	system, _ := messages[0].(map[string]any)
+	content, _ := system["content"].(string)
+	for _, want := range []string{
+		"  Working directory: " + env.WorkingDirectory,
+		"  Workspace root folder: " + env.WorkspaceRoot,
+	} {
+		if !strings.Contains(content, want+"\n") {
+			t.Fatalf("the injected <env> block must carry %q, got:\n%s", want, content)
+		}
+	}
+}
+
 // TestFreeTierShapingNotesABodyThatAlreadyCarriesThePrompt: the marker suppresses
 // the prompt injection, not the tool shaping. A client that sends the official
 // prompt itself still has its tools renamed, so it still needs the note.
@@ -437,8 +468,8 @@ func TestFreeTierShapingDoesNotDuplicateTheGatewayToolNote(t *testing.T) {
 		},
 	}
 	for name, testCase := range cases {
-		first, _ := prepareAnonymousBody([]byte(testCase.body), testCase.protocol, false)
-		second, _ := prepareAnonymousBody(first, testCase.protocol, false)
+		first, _ := prepareAnonymousBody([]byte(testCase.body), testCase.protocol, false, testPromptEnv)
+		second, _ := prepareAnonymousBody(first, testCase.protocol, false, testPromptEnv)
 		if count := strings.Count(string(second), gatewayToolNote); count != 1 {
 			t.Fatalf("%s: the note appears %d times after two passes, want 1:\n%s", name, count, second)
 		}
@@ -492,13 +523,13 @@ func TestGatewayToolNoteStaysScopedToTheOfficialSet(t *testing.T) {
 // traffic.
 func TestFreeTierShapingLeavesUnusableBodiesAlone(t *testing.T) {
 	notJSON := []byte("this is not json")
-	shaped, renames := prepareAnonymousBody(notJSON, wire.Chat, false)
+	shaped, renames := prepareAnonymousBody(notJSON, wire.Chat, false, testPromptEnv)
 	if !bytes.Equal(shaped, notJSON) || renames != nil {
 		t.Fatalf("a non-JSON body must pass through untouched, got %s", shaped)
 	}
 
 	systemOne := []byte(`{"stream":false,"messages":[{"role":"user","content":"pick a model"}]}`)
-	shaped, renames = prepareAnonymousBody(systemOne, wire.SystemOne, false)
+	shaped, renames = prepareAnonymousBody(systemOne, wire.SystemOne, false, testPromptEnv)
 	if !bytes.Equal(shaped, systemOne) || renames != nil {
 		t.Fatalf("a System One payload must pass through untouched, got %s", shaped)
 	}
@@ -524,7 +555,7 @@ func TestFreeTierShapingRenamesClientTools(t *testing.T) {
 			clientChatTool("read_file", "client read duplicate", nil),
 		},
 	})
-	shaped, renames := prepareAnonymousBody(body, wire.Chat, false)
+	shaped, renames := prepareAnonymousBody(body, wire.Chat, false, testPromptEnv)
 	payload := decodeShaped(t, shaped)
 	tools := shapeTools(t, payload)
 
@@ -572,7 +603,7 @@ func TestFreeTierShapingDisambiguatesSanitizedCollisions(t *testing.T) {
 			clientChatTool("a/b", "slashed", nil),
 		},
 	})
-	_, renames := prepareAnonymousBody(body, wire.Chat, false)
+	_, renames := prepareAnonymousBody(body, wire.Chat, false, testPromptEnv)
 
 	first, _ := renames.Wire("a b")
 	second, _ := renames.Wire("a/b")

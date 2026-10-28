@@ -62,7 +62,7 @@ func (g *Gateway) resolvedEffort(model string, tier config.Tier, protocol wire.P
 // the availability probe pass a fresh one per request. v1 reports whether the
 // probe targets the v1 lane (models.IsV1Upstream), which selects the 1.x toolset
 // instead of the 2.x one.
-func probePayload(model string, protocol wire.Protocol, effort string, v1 bool, nonce string) ([]byte, error) {
+func probePayload(model string, protocol wire.Protocol, effort string, v1 bool, nonce string, env config.PromptEnvConfig) ([]byte, error) {
 	if protocol == wire.SystemOne {
 		// TypeSafe's native boolean type is "noul", not JSON Schema boolean.
 		return json.Marshal(map[string]any{"model": model, "state": "1 + 1 = 2", "questions": map[string]any{
@@ -85,7 +85,7 @@ func probePayload(model string, protocol wire.Protocol, effort string, v1 bool, 
 	if err != nil {
 		return nil, err
 	}
-	shaped, _ := prepareAnonymousBody(b, protocol, v1)
+	shaped, _ := prepareAnonymousBody(b, protocol, v1, env)
 	return shaped, nil
 }
 
@@ -269,7 +269,7 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 	// A fresh 40-hex project per attempt matches what DeriveRequestIDs now
 	// mints for a client that names none.
 	ids := identity.RequestIDs{Session: session, Project: identity.RandomProjectID(), Request: identity.RandomID("req", 16)}
-	b, err := probePayload(model, protocol, effort, models.IsV1Upstream(baseURL), nonce)
+	b, err := probePayload(model, protocol, effort, models.IsV1Upstream(baseURL), nonce, g.cfg.PromptEnv)
 	if err != nil {
 		return probeResult{reason: "request_conversion_error"}
 	}

@@ -369,7 +369,7 @@ func (g *Gateway) runWatchdogProbe(ctx context.Context, model string) watchdogPr
 	// and the nonce in the user turn both come from probeSession, so two probes
 	// never reuse a session id and never send a byte-identical body.
 	session, nonce := probeSession("watchdog:" + model)
-	payload, err := probePayload(model, protocol, "", legacy, nonce)
+	payload, err := probePayload(model, protocol, "", legacy, nonce, g.cfg.PromptEnv)
 	if err != nil {
 		result.Verdict = "config"
 		result.Cause = "probe request could not be built"

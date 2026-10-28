@@ -254,7 +254,7 @@ La quota gratuita dell'upstream è legata al **blocco di uscita**, quindi la rot
 
 ### System prompt ufficiale
 
-Ogni richiesta di un modello gratuito già normalizzata porta il system prompt della CLI OpenCode — istruzioni di base, blocco `<env>` ed elenco delle skill integrate — perché il canale gratuito verifica che il traffico abbia forma di agent. Il canale v1 `/zen` usa i nomi degli strumenti 1.x; `/inference` e `/zen/go` usano quelli 2.x. Il blocco ambiente indica il modello richiesto, la directory di lavoro del gateway, la piattaforma e la data UTC.
+Ogni richiesta di un modello gratuito già normalizzata porta il system prompt della CLI OpenCode — istruzioni di base, blocco `<env>` ed elenco delle skill integrate — perché il canale gratuito verifica che il traffico abbia forma di agent. Il canale v1 `/zen` usa i nomi degli strumenti 1.x; `/inference` e `/zen/go` usano quelli 2.x. Il blocco ambiente indica il modello richiesto, la directory di lavoro configurata in `prompt_env`, la piattaforma e la data UTC.
 
 L'iniezione dipende dal protocollo: i messaggi system e developer di Chat vengono fusi in un unico messaggio `system` iniziale; Anthropic riceve un valore `system` (stringa, oppure un blocco di testo iniziale quando il chiamante invia blocchi); Responses riceve `instructions`. Se il contenuto system contiene già il marcatore `You are opencode, an interactive CLI tool`, la richiesta passa invariata, quindi un client che invia già il prompt ufficiale non ne riceve una seconda copia. I modelli gratuiti serviti da una chiave Zen o Go ricevono la stessa normalizzazione, ma escono comunque dal proxy di quel tier.
 
@@ -312,6 +312,7 @@ Consulta [config.example.json](config.example.json) per una configurazione inizi
 | `upstream.go`               | `https://opencode.ai/zen/go`.                                                 |
 | `upstream.anonymous`        | `https://opencode.ai/inference`; base predefinita (e, con la configurazione predefinita, unica) della corsia anonima. |
 | `upstream.anonymous_lane_order` | `["inference"]`; basi della corsia anonima provate in ordine. `"inference"` = `upstream.anonymous`, `"legacy"` = `https://opencode.ai/zen` (corsia v1). |
+| `prompt_env`                | `/workspace`; `{working_directory, workspace_root}` resi nel blocco `<env>` della "CLI ufficiale" del canale gratuito. Valori vuoti usano `/workspace`; `workspace_root` vuoto segue `working_directory`. |
 | `proxies`                   | Fallback a `["direct"]` se entrambe le fonti proxy sono vuote.              |
 | `proxyfile`                 | Opzionale; i percorsi relativi sono risolti accanto al file di configurazione. |
 | `models.refresh_seconds`    | `300`; minimo 1.                                                              |

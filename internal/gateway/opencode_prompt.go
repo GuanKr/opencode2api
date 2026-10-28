@@ -2,13 +2,11 @@ package gateway
 
 import (
 	_ "embed"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
+	"opencode2api/internal/config"
 	wire "opencode2api/internal/protocol"
 )
 
@@ -40,25 +38,27 @@ Use the skill tool to load a skill when a task matches its description.
   </skill>
 </available_skills>`
 
-var (
-	opencodeEnvOnce sync.Once
-	opencodeWorkDir string
-)
+// promptEnvValues fills the two directory values of the <env> block from the
+// configured prompt_env. Normalize already guarantees non-empty strings; the
+// fallbacks keep a zero-value config (tests, direct callers) from rendering
+// empty paths. They are constants, never the gateway process's working
+// directory: the install path must not leak into every free-tier prompt.
+func promptEnvValues(env config.PromptEnvConfig) (working, root string) {
+	working = strings.TrimSpace(env.WorkingDirectory)
+	if working == "" {
+		working = config.DefaultPromptWorkingDirectory
+	}
+	root = strings.TrimSpace(env.WorkspaceRoot)
+	if root == "" {
+		root = working
+	}
+	return working, root
+}
 
 // opencodeEnvironment renders the <env> block the CLI puts after its base
-// prompt. The working directory is resolved once per process; a platform
-// without one falls back to the official container path.
-func opencodeEnvironment(model string) string {
-	opencodeEnvOnce.Do(func() {
-		directory := ""
-		if current, err := os.Getwd(); err == nil {
-			directory = filepath.Clean(strings.TrimSpace(current))
-		}
-		if directory == "" || directory == "." {
-			directory = "/workspace"
-		}
-		opencodeWorkDir = directory
-	})
+// prompt, reporting the directories prompt_env configures.
+func opencodeEnvironment(model string, env config.PromptEnvConfig) string {
+	working, root := promptEnvValues(env)
 	apiModel := strings.TrimSpace(strings.TrimPrefix(model, "opencode/"))
 	if apiModel == "" {
 		apiModel = "unknown"
@@ -71,8 +71,8 @@ func opencodeEnvironment(model string) string {
 		"You are powered by the model named " + apiModel + ". The exact model ID is opencode/" + apiModel,
 		"Here is some useful information about the environment you are running in:",
 		"<env>",
-		"  Working directory: " + opencodeWorkDir,
-		"  Workspace root folder: " + opencodeWorkDir,
+		"  Working directory: " + working,
+		"  Workspace root folder: " + root,
 		"  Is directory a git repo: yes",
 		"  Platform: " + platform,
 		"  Today's date: " + time.Now().UTC().Format("Mon Jan 02 2006"),
@@ -80,14 +80,14 @@ func opencodeEnvironment(model string) string {
 	}, "\n")
 }
 
-// opencodeSystemPrompt assembles the full CLI system prompt for model and the
-// upstream generation's tool naming.
-func opencodeSystemPrompt(model string, v1 bool) string {
+// opencodeSystemPrompt assembles the full CLI system prompt for model, the
+// upstream generation's tool naming, and the configured <env> values.
+func opencodeSystemPrompt(model string, v1 bool, env config.PromptEnvConfig) string {
 	base := opencodePromptV2
 	if v1 {
 		base = opencodePromptV1
 	}
-	return base + opencodeEnvironment(model) + "\n" + opencodeSkills
+	return base + opencodeEnvironment(model, env) + "\n" + opencodeSkills
 }
 
 // injectOfficialPrompt prepends the official CLI system prompt to a shaped
@@ -95,12 +95,12 @@ func opencodeSystemPrompt(model string, v1 bool) string {
 // already carries the marker is left untouched, so repeated shaping cannot
 // duplicate the prompt. System One payloads are not chat bodies and are never
 // touched.
-func injectOfficialPrompt(payload map[string]any, protocol wire.Protocol, v1 bool) bool {
+func injectOfficialPrompt(payload map[string]any, protocol wire.Protocol, v1 bool, env config.PromptEnvConfig) bool {
 	if payload == nil || protocol == wire.SystemOne {
 		return false
 	}
 	model, _ := payload["model"].(string)
-	prompt := opencodeSystemPrompt(model, v1)
+	prompt := opencodeSystemPrompt(model, v1, env)
 	switch protocol {
 	case wire.Chat:
 		return injectChatPrompt(payload, prompt)

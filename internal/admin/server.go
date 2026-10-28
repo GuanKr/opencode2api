@@ -151,6 +151,7 @@ type ConfigView struct {
 	Proxies     []SecretView             `json:"proxies"`
 	ProxyFile   string                   `json:"proxyfile"`
 	Upstream    config.UpstreamConfig    `json:"upstream"`
+	PromptEnv   config.PromptEnvConfig   `json:"prompt_env"`
 	Retry       config.RetryConfig       `json:"retry"`
 	Models      config.ModelsConfig      `json:"models"`
 	Performance config.PerformanceConfig `json:"performance"`
@@ -198,10 +199,14 @@ type ConfigUpdate struct {
 	// Warp is a pointer so an older console or script that omits the field
 	// keeps the current switch instead of silently disabling it; the struct is
 	// a value type, which cannot tell "absent" from "explicitly off".
-	Warp        *config.WarpConfig       `json:"warp,omitempty"`
-	Proxies     []SecretInput            `json:"proxies"`
-	ProxyFile   string                   `json:"proxyfile"`
-	Upstream    config.UpstreamConfig    `json:"upstream"`
+	Warp      *config.WarpConfig    `json:"warp,omitempty"`
+	Proxies   []SecretInput         `json:"proxies"`
+	ProxyFile string                `json:"proxyfile"`
+	Upstream  config.UpstreamConfig `json:"upstream"`
+	// PromptEnv is a pointer so the console form, which does not render these
+	// values, can omit the field and keep the configured strings. A value type
+	// could not tell "absent" from "explicitly cleared".
+	PromptEnv   *config.PromptEnvConfig  `json:"prompt_env,omitempty"`
 	Retry       config.RetryConfig       `json:"retry"`
 	Models      config.ModelsConfig      `json:"models"`
 	Performance config.PerformanceConfig `json:"performance"`
@@ -282,11 +287,15 @@ func buildConfigCandidate(current config.Config, update ConfigUpdate) (config.Co
 	if update.Warp != nil {
 		warp = *update.Warp
 	}
+	promptEnv := current.PromptEnv
+	if update.PromptEnv != nil {
+		promptEnv = *update.PromptEnv
+	}
 	return config.Config{
 		ServerKeyMetadata: current.ServerKeyMetadata,
 		Rotation:          current.Rotation,
 		Listen:            update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Warp: warp, Proxies: proxies, ProxyFile: update.ProxyFile,
-		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
+		Upstream: update.Upstream, PromptEnv: promptEnv, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		Reasoning: reasoning,
 		WebUI:     config.WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}, "", nil
@@ -472,7 +481,7 @@ func (a *Server) configView() ConfigView {
 	effective, restart := a.manager.RestartStatus()
 	return ConfigView{
 		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous, Warp: cfg.Warp,
-		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
+		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Upstream: cfg.Upstream, PromptEnv: cfg.PromptEnv, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, Reasoning: cfg.Reasoning,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
 		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},

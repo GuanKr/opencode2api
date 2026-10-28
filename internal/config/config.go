@@ -38,6 +38,7 @@ type Config struct {
 	Proxies           []string                     `json:"proxies"`
 	ProxyFile         string                       `json:"proxyfile"`
 	Upstream          UpstreamConfig               `json:"upstream"`
+	PromptEnv         PromptEnvConfig              `json:"prompt_env"`
 	Retry             RetryConfig                  `json:"retry"`
 	Models            ModelsConfig                 `json:"models"`
 	Performance       PerformanceConfig            `json:"performance"`
@@ -65,6 +66,23 @@ type ReasoningConfig struct {
 	Effort        string            `json:"effort,omitempty"`
 	EffortByModel map[string]string `json:"effort_by_model,omitempty"`
 }
+
+// PromptEnvConfig is the <env> block the free-tier shaper renders into the
+// official CLI system prompt. The values are strings on purpose: the prompt
+// impersonates a CLI running somewhere the operator chooses, so it must not
+// report the gateway process's working directory (that leaked the install path
+// into every shaped request). WorkingDirectory is required after Normalize;
+// WorkspaceRoot defaults to it when left empty.
+type PromptEnvConfig struct {
+	WorkingDirectory string `json:"working_directory,omitempty"`
+	WorkspaceRoot    string `json:"workspace_root,omitempty"`
+}
+
+// DefaultPromptWorkingDirectory is the container path the official CLI falls
+// back to when it cannot resolve a working directory. Normalize uses it so an
+// unset prompt_env still renders a plausible CLI environment, and the prompt
+// renderer never has to consult the gateway's own cwd.
+const DefaultPromptWorkingDirectory = "/workspace"
 
 // WarpConfig controls the optional Cloudflare WARP egress. While enabled,
 // free-model traffic on the anonymous lane and the free Zen-key fallback is
@@ -498,6 +516,24 @@ func Normalize(path string, cfg Config) (Config, error) {
 		return Config{}, err
 	}
 	cfg.Upstream.AnonymousLaneOrder = order
+	// The prompt <env> block is rendered text, not a filesystem path, so it is
+	// only trimmed here. A newline would break the block's shape, and the two
+	// values are independent: an unset workspace root follows the working
+	// directory, an unset working directory uses the CLI's container default.
+	cfg.PromptEnv.WorkingDirectory = strings.TrimSpace(cfg.PromptEnv.WorkingDirectory)
+	cfg.PromptEnv.WorkspaceRoot = strings.TrimSpace(cfg.PromptEnv.WorkspaceRoot)
+	if cfg.PromptEnv.WorkingDirectory == "" {
+		cfg.PromptEnv.WorkingDirectory = DefaultPromptWorkingDirectory
+	}
+	if cfg.PromptEnv.WorkspaceRoot == "" {
+		cfg.PromptEnv.WorkspaceRoot = cfg.PromptEnv.WorkingDirectory
+	}
+	if strings.ContainsAny(cfg.PromptEnv.WorkingDirectory, "\r\n") {
+		return Config{}, errors.New("prompt_env.working_directory must be a single line")
+	}
+	if strings.ContainsAny(cfg.PromptEnv.WorkspaceRoot, "\r\n") {
+		return Config{}, errors.New("prompt_env.workspace_root must be a single line")
+	}
 	if len(cfg.ServerKeys) == 0 {
 		return Config{}, errors.New("server_keys must contain at least one local key")
 	}

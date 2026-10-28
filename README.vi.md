@@ -262,7 +262,7 @@ Hạn mức miễn phí của upstream tính theo **dải đầu ra**, nên luâ
 
 ### System prompt chính thức
 
-Mỗi request mô hình miễn phí đã được định hình đều mang system prompt của chính OpenCode CLI — hướng dẫn gốc, khối `<env>` và danh sách skill tích hợp — vì làn miễn phí kiểm tra request có dạng agent. Làn v1 `/zen` dùng tên công cụ 1.x; `/inference` và `/zen/go` dùng tên 2.x. Khối môi trường nêu mô hình được yêu cầu, thư mục làm việc của gateway, nền tảng và ngày theo UTC.
+Mỗi request mô hình miễn phí đã được định hình đều mang system prompt của chính OpenCode CLI — hướng dẫn gốc, khối `<env>` và danh sách skill tích hợp — vì làn miễn phí kiểm tra request có dạng agent. Làn v1 `/zen` dùng tên công cụ 1.x; `/inference` và `/zen/go` dùng tên 2.x. Khối môi trường nêu mô hình được yêu cầu, thư mục làm việc được cấu hình trong `prompt_env`, nền tảng và ngày theo UTC.
 
 Việc chèn phụ thuộc giao thức: các message system và developer của Chat được gộp thành một message `system` duy nhất ở đầu; Anthropic nhận giá trị `system` (chuỗi, hoặc một text block ở đầu khi bên gọi gửi danh sách block); Responses nhận `instructions`. Nếu nội dung system đã chứa dấu hiệu `You are opencode, an interactive CLI tool`, request được giữ nguyên, nên client đã gửi prompt chính thức sẽ không bị chèn lần hai. Mô hình miễn phí phục vụ qua Zen hoặc Go Key cũng được định hình như vậy nhưng vẫn ra ngoài qua proxy của tier đó.
 
@@ -318,6 +318,7 @@ Xem [config.example.json](config.example.json) để có một cấu hình khở
 | `upstream.go`              | `https://opencode.ai/zen/go`.                                    |
 | `upstream.anonymous`       | `https://opencode.ai/inference`; upstream mặc định (và theo cấu hình mặc định là duy nhất) của kênh ẩn danh. |
 | `upstream.anonymous_lane_order` | `["inference"]`; các upstream kênh ẩn danh thử theo thứ tự. `"inference"` = `upstream.anonymous`, `"legacy"` = `https://opencode.ai/zen` (kênh v1). |
+| `prompt_env`               | `/workspace`; `{working_directory, workspace_root}` được hiển thị trong khối `<env>` của "CLI chính thức" ở làn miễn phí. Giá trị rỗng dùng `/workspace`; `workspace_root` rỗng sẽ theo `working_directory`. |
 | `proxies`                  | Rơi về `["direct"]` khi cả hai nguồn proxy đều rỗng.              |
 | `proxyfile`                | Không bắt buộc; đường dẫn tương đối được phân giải cạnh file cấu hình. |
 | `models.refresh_seconds`   | `300`; tối thiểu 1.                                              |
