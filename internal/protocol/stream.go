@@ -409,8 +409,8 @@ type streamToolRenamer struct {
 
 // rewriteFrame rewrites one SSE data payload, which is raw JSON text. Frames
 // that cannot carry a tool name are returned untouched, so only a payload that
-// mentions a client alias (Anthropic and Responses) or "tool_calls" (Chat) is
-// decoded.
+// mentions a client alias (Anthropic and Responses), a "tool_calls" list, or a
+// legacy "function_call" object (Chat) is decoded.
 func (renamer *streamToolRenamer) rewriteFrame(raw string) []byte {
 	if renamer.protocol != Chat {
 		// Anthropic and Responses streams always carry a complete tool name in
@@ -420,7 +420,7 @@ func (renamer *streamToolRenamer) rewriteFrame(raw string) []byte {
 		}
 		return RenameResponseTool([]byte(raw), renamer.protocol, renamer.renames)
 	}
-	if !strings.Contains(raw, `"tool_calls"`) {
+	if !strings.Contains(raw, `"tool_calls"`) && !strings.Contains(raw, `"function_call"`) {
 		return []byte(raw)
 	}
 	return renamer.rewriteChatFrame(raw)
@@ -458,6 +458,25 @@ func (renamer *streamToolRenamer) rewriteChatFrame(raw string) []byte {
 				if _, ok := function["arguments"]; ok && !state.decided {
 					// Arguments can only start once the name is complete: flush
 					// whatever was held back, verbatim.
+					if state.pending != "" {
+						function["name"] = state.pending
+						changed = true
+					}
+					state.decided = true
+				}
+			}
+			// Chat's legacy function_call sits beside tool_calls and carries the
+			// same wire name; the non-stream rewriter already handles it. It has
+			// no index or id, so one state per stream is enough (the protocol
+			// allows one legacy call at a time).
+			if function, ok := message["function_call"].(map[string]any); ok {
+				state := renamer.toolState("legacy:function_call")
+				if name, ok := function["name"].(string); ok && name != "" {
+					if renamer.applyNameFragment(state, function, name) {
+						changed = true
+					}
+				}
+				if _, ok := function["arguments"]; ok && !state.decided {
 					if state.pending != "" {
 						function["name"] = state.pending
 						changed = true

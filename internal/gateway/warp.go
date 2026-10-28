@@ -317,6 +317,16 @@ func (g *Gateway) doWarpAnonymousUpstream(ctx context.Context, route models.Rout
 	}
 	protocol := route.ProtocolFor(config.TierZen)
 	upstreams := g.anonymousUpstreams()
+	if len(upstreams) == 0 {
+		// Reachable when upstream.anonymous points at the v1 origin while the
+		// lane order leaves "legacy" out (see anonymousUpstreams). Without this
+		// guard the loop below makes zero attempts, the empty result reads as a
+		// lane failure and trips the breaker for an hour, and the client gets
+		// warp_unavailable for what is really a route misconfiguration. Match the
+		// proxy lane and report the unusable route.
+		g.logger.Warn("anonymous WARP lane has no usable upstream", "component", "upstream", "event", "anonymous_route_missing", "request_id", ids.Request, "anonymous", config.RedactURL(g.cfg.Upstream.Anonymous), "lane_order", strings.Join(g.cfg.Upstream.AnonymousLaneOrder, ","))
+		return nil, fmt.Errorf("no anonymous upstream is configured: %w", errProxyUnavailable), 0
+	}
 	prepared := make([][]byte, len(upstreams))
 	renames := make([]*wire.ToolRenames, len(upstreams))
 	for index, baseURL := range upstreams {

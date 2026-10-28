@@ -42,10 +42,12 @@ type RequestIDs struct {
 }
 
 // DeriveRequestIDs derives the upstream identity of one request. scope names
-// the authenticated caller (the server key fingerprint). Every session and
-// project the gateway derives itself is mixed with it, so two callers whose
-// conversations begin identically never share an upstream session, sticky
-// provider, preferred key, or anonymous proxy. An official OpenCode session is
+// the authenticated caller (the server key fingerprint). Every session the
+// gateway derives itself is mixed with it, so two callers whose conversations
+// begin identically never share an upstream session, sticky provider, preferred
+// key, or anonymous proxy. A project the client does not name is minted fresh
+// per request instead (the free tier ledges quota per project id and egress
+// together), so it is deliberately not scoped. An official OpenCode session is
 // kept verbatim because the client minted it uniquely.
 func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) RequestIDs {
 	signal := jsonutil.FirstString(

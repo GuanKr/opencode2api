@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"opencode2api/internal/config"
+	"opencode2api/internal/identity"
 	modelcatalog "opencode2api/internal/models"
 	wire "opencode2api/internal/protocol"
 	"opencode2api/internal/rotation"
@@ -239,6 +241,107 @@ func TestShouldRotateSessionOnlyOnQuota(t *testing.T) {
 	}
 	if shouldRotateSession(nil, nil) {
 		t.Fatal("no response must not rotate the session")
+	}
+	if shouldRotateSession(upstreamErrorResponse(http.StatusTooManyRequests, `{"error":{"type":"FreeUsageLimitError","message":"limit"}}`), context.Canceled) {
+		t.Fatal("a cancelled request must not rotate the session")
+	}
+	if shouldRotateSession(upstreamErrorResponse(http.StatusTooManyRequests, `{"error":{"type":"FreeUsageLimitError","message":"limit"}}`), context.DeadlineExceeded) {
+		t.Fatal("a timed-out request must not rotate the session")
+	}
+}
+
+// TestKeyLaneQuotaRotatesTheFreeModelSession: the Zen-key lane is the third
+// caller of the session store. A free model's quota 429 must rotate the
+// upstream session there too, and the next turn must reuse the new generation.
+func TestKeyLaneQuotaRotatesTheFreeModelSession(t *testing.T) {
+	capture := &sessionCapture{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if capture.record(r) == 1 {
+			quota429(w)
+			return
+		}
+		ok200(w)
+	}))
+	t.Cleanup(server.Close)
+
+	g := newStubGateway(t, server.URL)
+	zen, err := nodePool([]string{"key-1", "key-2"}, g.transports, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.zenNodes = zen
+	freezeProxyHealth(g)
+
+	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("key-lane-conversation"), Request: "req-key-1"}
+	bodies := map[config.Tier][]byte{config.TierZen: []byte(`{"model":"probe-free","stream":false,"messages":[{"role":"user","content":"hi"}]}`)}
+	for turn := 0; turn < 2; turn++ {
+		resp, err, _ := g.doKeyUpstream(context.Background(), chatDumpRoute(), bodies, ids, 0)
+		if err != nil {
+			t.Fatalf("turn %d: %v", turn, err)
+		}
+		if resp == nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("turn %d: want 200, got %+v", turn, resp)
+		}
+		resp.Body.Close()
+	}
+
+	seen := capture.sessions()
+	if len(seen) != 3 {
+		t.Fatalf("want two attempts in turn one and one in turn two, got %d: %v", len(seen), seen)
+	}
+	if seen[0] == seen[1] {
+		t.Fatalf("the retry after a quota 429 must rotate the session, both %q", seen[0])
+	}
+	if seen[2] != seen[1] {
+		t.Fatalf("the next turn must reuse generation 1: %v", seen)
+	}
+	for _, id := range seen {
+		if !strings.HasPrefix(id, "ses_") {
+			t.Fatalf("the upstream session must keep the ses_ shape, got %q", id)
+		}
+	}
+}
+
+// TestKeyLanePaidQuotaDoesNotRotateTheSession: a paid model's 429 is
+// account-level. The key lane serves both kinds, so the free-model gate must
+// keep the paid case off the rotation store.
+func TestKeyLanePaidQuotaDoesNotRotateTheSession(t *testing.T) {
+	capture := &sessionCapture{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capture.record(r)
+		quota429(w)
+	}))
+	t.Cleanup(server.Close)
+
+	g := newStubGateway(t, server.URL)
+	zen, err := nodePool([]string{"key-1", "key-2"}, g.transports, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.zenNodes = zen
+	freezeProxyHealth(g)
+
+	route := chatDumpRoute()
+	route.ID = "claude-sonnet-4"
+	route.Anonymous = false
+	ids := identity.RequestIDs{Session: identity.CanonicalSessionID("key-lane-paid"), Request: "req-paid"}
+	bodies := map[config.Tier][]byte{config.TierZen: []byte(`{"model":"claude-sonnet-4","stream":false,"messages":[{"role":"user","content":"hi"}]}`)}
+	resp, _, _ := g.doKeyUpstream(context.Background(), route, bodies, ids, 0)
+	if resp != nil {
+		resp.Body.Close()
+	}
+
+	seen := capture.sessions()
+	if len(seen) < 2 {
+		t.Fatalf("want the two keys attempted, got %d: %v", len(seen), seen)
+	}
+	for index := 1; index < len(seen); index++ {
+		if seen[index] != seen[0] {
+			t.Fatalf("a paid 429 must not rotate the session: %v", seen)
+		}
+	}
+	if got := g.sessions.Generation(ids.Session); got != 0 {
+		t.Fatalf("a paid 429 must leave the generation at 0, got %d", got)
 	}
 }
 

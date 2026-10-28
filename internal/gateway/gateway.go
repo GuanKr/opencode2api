@@ -309,9 +309,10 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 		//
 		// Two of the four request paths still derive again downstream
 		// (handleRotation, forwardSystemOne). That is harmless: Session is
-		// deterministic, so both derivations agree on it and only Request
-		// differs, with the second one winning every consumer. It is not
-		// deduplicated because those handlers are separate entry points.
+		// deterministic, so both derivations agree on it; Request and a
+		// nameless Project differ, with the second one winning every consumer.
+		// It is not deduplicated because those handlers are separate entry
+		// points.
 		ids := identity.DeriveRequestIDs(r, payload, callerScope(r.Context()))
 		if meta != nil {
 			meta.Request = ids.Request

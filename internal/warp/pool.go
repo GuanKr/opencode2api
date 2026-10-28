@@ -829,6 +829,12 @@ func (p *Pool) Reset(cause error) int {
 	p.active = nil
 	p.next = 0
 	p.generation++
+	// A reset is an explicit rotation (the watchdog switched the network path),
+	// so a pause recorded for the previous registration source must not keep the
+	// new generation empty for up to five minutes. A real rate limit re-pauses
+	// after the next failed attempt.
+	p.refillPaused = time.Time{}
+	p.refillFailures = 0
 	for _, item := range active {
 		if key := item.egressKey(); key != "" {
 			delete(p.reserved, key)
@@ -915,7 +921,14 @@ func (p *Pool) createExit(ctx context.Context) (*exit, error) {
 		}
 		candidate.close()
 	}
-	p.noteCreateFailure()
+	// A duplicate egress means the colo has no more distinct blocks, not that the
+	// tunnel or exit failed. Counting it would move failure_streak — the
+	// watchdog's primary switch signal — on a pool whose user traffic is fine,
+	// and the preload keeps half the pool registering, so a saturated colo makes
+	// that routine.
+	if !errors.Is(lastErr, errDuplicateEgress) {
+		p.noteCreateFailure()
+	}
 	return nil, lastErr
 }
 

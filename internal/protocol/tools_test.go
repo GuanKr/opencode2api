@@ -281,6 +281,29 @@ func TestRenameStreamReaderPassesAnUnmappedNameThrough(t *testing.T) {
 	}
 }
 
+// TestRenameStreamReaderRestoresALegacyFunctionCall: Chat's legacy
+// delta.function_call names a tool outside tool_calls; it must be renamed like
+// the non-stream path, including a name split over two frames.
+func TestRenameStreamReaderRestoresALegacyFunctionCall(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"function_call\":{\"name\":\"clint_\"}}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"function_call\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}}]}\n\n" +
+		"data: [DONE]\n\n"
+	out, err := io.ReadAll(RenameStreamReader(strings.NewReader(stream), Chat, newTestRenames()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	if strings.Contains(text, "clint_") {
+		t.Fatalf("a wire-name fragment leaked downstream: %s", text)
+	}
+	if !strings.Contains(text, `"name":"read_file"`) {
+		t.Fatalf("the legacy function_call name was not restored: %s", text)
+	}
+	if strings.Contains(text, `"name":"read_"`) || strings.Contains(text, `"name":"file"`) {
+		t.Fatalf("a partial name leaked downstream: %s", text)
+	}
+}
+
 // TestRenameStreamReaderNonChatUsesTheObjectRewrite: Anthropic and Responses
 // name a tool in a single frame, so the stateless rewrite applies and every
 // other line — including CRLF terminators and non-data lines — stays byte-equal.

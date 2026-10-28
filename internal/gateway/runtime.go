@@ -516,6 +516,7 @@ type WarpStatus struct {
 	Enabled             bool       `json:"enabled"`
 	Stack               string     `json:"stack"`
 	Size                int        `json:"size"`
+	Preload             int        `json:"preload"`
 	Active              int        `json:"active"`
 	Standby             int        `json:"standby"`
 	Cooling             int        `json:"cooling"`
@@ -589,7 +590,7 @@ func (m *RuntimeController) Resources() ResourceSnapshot {
 		snapshot := gateway.warp.Snapshot()
 		result.Warp = &WarpStatus{
 			Enabled: true, Stack: snapshot.Stack, Size: snapshot.Size,
-			Active: snapshot.Active, Standby: snapshot.Standby, Cooling: snapshot.Cooling,
+			Preload: snapshot.Preload, Active: snapshot.Active, Standby: snapshot.Standby, Cooling: snapshot.Cooling,
 			Egress: snapshot.Egress, StartedAt: snapshot.StartedAt.UTC(),
 			FailuresTotal: snapshot.FailuresTotal, FailureStreak: snapshot.FailureStreak,
 			CreateFailuresTotal: snapshot.CreateFailuresTotal, LastFailureKind: snapshot.LastFailureKind,
