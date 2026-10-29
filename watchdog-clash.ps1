@@ -99,6 +99,7 @@
       "warp_exit_failure": {
         "enabled": true, "threshold": 9, "cooldown_minutes": 15,
         "reset_rounds": 2, "action": "refresh_then_switch",
+        "node_selection": "random",
         "window_minutes": 10, "window_failures": 10, "window_create_failures": 6
       }
     }
@@ -114,8 +115,9 @@
   脚本再只读 GET 网关 /healthz（5s 超时；失败后 60s 退避，网关没起时不拖慢每轮巡检），
   读 warp.failure_streak（主信号）与 warp.status/active。failure_streak 达到 threshold
   （1-100，默认 9）时按 action 动作：refresh_only = 只刷新订阅；refresh_then_switch
-  （默认）= 先刷新（节流/失败只记日志、继续）再按 Get-RankedCandidates 的 WARP 排序
-  切到第一个可切换候选；switch_only = 不刷新直接切。failure_streak 缺失或为 0、但
+  （默认）= 先刷新（节流/失败只记日志、继续）再按 node_selection 选择候选
+  （random = 洗牌袋随机轮换，latency = 按延迟排序的旧行为）切到第一个可切换候选；
+  switch_only = 不刷新直接切。failure_streak 缺失或为 0、但
   warp.status=unavailable 或 warp.active=0 连续达到 threshold 轮（本地计数，日志单列
   原因）同样触发，覆盖“出口池建不出任何出口”的故障；主信号有数时不再重复累计。
   动作成功后 POST /v1/watchdog/warp/reset（server_keys 鉴权；404/405 视为旧网关忽略）
@@ -148,6 +150,19 @@
   reset_rounds 逻辑不变。日志事件名是「WARP 出口失败窗口」；/healthz 有
   soft_failures_total 时只附在日志里，不参与触发。-Once 单轮只有一次采样，窗口首次观察
   不会触发；窗口信号靠常驻循环推进。
+  node_selection（2026-10-28，random/latency，默认 random）决定 WARP 出口失败动作时的
+  候选顺序。random = 进程内洗牌袋随机轮换：排除当前节点，优先 alive 候选（全部
+  alive=false 时回退到全部候选并在日志/返回字段标明），整池轮完前不重复；订阅刷新
+  导致池变化时增量调和（袋中保留仍在池中的名字、新名字随机追加、消失的移除，袋空
+  重新洗牌开始新扫描）；每次动作只消费实际尝试过的数量，未尝试的尾部留给下次。
+  节点名按 Ordinal 区分（仅大小写不同视为两个节点），袋过滤/新名字判定/对象映射
+  全部用大小写敏感比较，映射缺键时跳过并记 Missing，Order 不含 $null。
+  latency = 旧的按 DelayRank, Name 排序（延迟优先），不碰洗牌袋。为什么默认 random：
+  WARP 出口的 /48 段由注册源 IP/Clash 节点决定，低延迟不预测段质量，延迟优先会让动作
+  在少数低延迟节点间循环；random 覆盖整池。random 不按 deprioritize 的排序罚分选择，
+  地区排除请用 exclude_contains。此键只在 watchdog.json，没有命令行参数；它只作用于
+  WARP 出口失败动作，WARP 中继故障路径（Invoke-WarpProxyFailover）仍按延迟排序。
+  升级/回滚必须脚本与 watchdog.json 一起：旧脚本会因这个未知键拒绝启动。
   优先级：显式命令行参数 > 配置文件 > 内置默认值——所以临时 -DeprioritizeContains
   试一把仍然压过文件，不必先改文件。exclude_contains 没有对应的命令行参数，
   它写错了只能改文件或把 -WatchdogConfig 指向别的路径。
@@ -267,6 +282,14 @@
   窗口外旧失败不触发、create 子信号阈值/关闭、计数器回退清窗）。不读 watchdog.json、
   不联网、不切换、不写状态文件（也不写运行日志）；输出 PASS/FAIL 并以 0/1 退出。
 
+.PARAMETER WarpExitNodeSelectionSelfTest
+  隐藏诊断开关：用纯内存合成候选验证 WARP 出口失败切换的节点选择（9 场景：random
+  洗牌袋整池不重复、当前节点永不选、alive 优先与全死回退、池变化增量调和、latency
+  保持延迟序且不消费袋、空池/仅当前节点返回空、消费超过袋长度不崩、多 seed 顺序
+  不同于延迟序、仅大小写不同的名字按 Ordinal 区分且池变化不残留旧变体）。不读
+  watchdog.json、不联网、不切换、不写状态文件（也不写运行日志）；输出 PASS/FAIL
+  并以 0/1 退出。
+
 .EXAMPLE
   pwsh -NoProfile -ExecutionPolicy Bypass -File watchdog-clash.ps1 -DryRun
   pwsh -NoProfile -ExecutionPolicy Bypass -File watchdog-clash.ps1
@@ -374,6 +397,11 @@ param(
   # 不切换、不写状态文件，输出 PASS/FAIL 并以 0/1 退出。必须早于 Read-WatchdogConfig、
   # 实例互斥与所有 Resolve-*/网络路径（见脚本末尾入口）。
   [switch]$WarpExitFailureWindowSelfTest,
+  # 隐藏诊断入口：纯内存验证 WARP 出口失败切换的节点选择（random 洗牌袋/当前节点排除/
+  # alive 优先与回退/池变化调和/latency 旧序/空池）；不读 watchdog.json、不联网、不切换、
+  # 不写状态文件，输出 PASS/FAIL 并以 0/1 退出。必须早于 Read-WatchdogConfig、实例互斥
+  # 与所有 Resolve-*/网络路径（见脚本末尾入口）。
+  [switch]$WarpExitNodeSelectionSelfTest,
   [switch]$DryRun,
   [switch]$Once
 )
@@ -450,6 +478,15 @@ $script:WarpExitFailureAction = $WarpExitFailureAction
 $script:WarpExitFailureWindowMinutes = 10
 $script:WarpExitFailureWindowFailures = 10
 $script:WarpExitFailureWindowCreateFailures = 6
+# WARP 出口失败切换的节点选择策略（2026-10-28）：random = 洗牌袋随机轮换（默认）；
+# latency = 旧的延迟排序。只有 watchdog.json 的 warp_exit_failure.node_selection，
+# 没有对应命令行参数。洗牌袋/Seen 只存在进程内存，重启清零；latency 完全不碰它们。
+$script:WarpExitNodeSelection = 'random'
+$script:WarpExitSelectionRandom = [System.Random]::new()
+$script:WarpExitSelectionState = @{
+  Bag = @()
+  Seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+}
 # 运行状态：主循环按 WarpProxyActive 选择 sleep 间隔；LastState/LastLogAt 做心跳与状态切换
 # 去重；ConfigErrSig 让同一配置错误只打一次；DirectWarned 让直连 WARP 告警只打一次。
 $script:WarpProxyActive = $false
@@ -1549,7 +1586,7 @@ function Resolve-ProxyCheckPlan {
 
 function Set-WarpProxyMode {
   # 模式切换清理（§6）：清轮冷却/transport 计数/恢复签到/WARP 状态/Clash 错误签名；
-  # 不清 LastSeenNow、LastRefresh/LastSwitch、QuotaFailedAt（WARP 候选排序用 IgnoreQuotaPenalty）。
+  # 不清 LastSeenNow、LastRefresh/LastSwitch、QuotaFailedAt（WARP 候选选择用 IgnoreQuotaPenalty）。
   param([bool]$Active)
   $target = if ($Active) { 'warp-proxy' } else { 'legacy' }
   if ($script:WarpProxyLastMode -ne '' -and $script:WarpProxyLastMode -ne $target) {
@@ -1716,6 +1753,8 @@ function Read-WatchdogConfig {
   #   deprioritize.penalty_ms       降权罚分毫秒（0 = 关闭降权）
   #   transport_confirm_rounds      transport 连续确认轮数（1-10，默认 2；等价命令行
   #                                 -TransportConfirmRounds，命令行显式传参时以命令行为准）
+  #   warp_exit_failure.node_selection         WARP 出口失败动作的候选选择策略
+  #                                 （random/latency，默认 random；random = 洗牌袋随机轮换）
   #   warp_exit_failure.window_minutes        失败滑窗分钟数（1-120，默认 10）
   #   warp_exit_failure.window_failures       窗口内 failures_total 增量阈值（1-1000，默认 10）
   #   warp_exit_failure.window_create_failures 窗口内 create_failures_total 增量阈值
@@ -2025,10 +2064,10 @@ function Read-WatchdogConfig {
   if (Test-HasKey $cfg 'warp_exit_failure') {
     $wef = Get-Prop $cfg 'warp_exit_failure'
     if (-not (Test-JsonObjectShape $wef)) {
-      throw ('看门狗配置 warp_exit_failure 必须是对象（{"enabled": true, "threshold": 9, "cooldown_minutes": 15, "reset_rounds": 2, "action": "refresh_then_switch", "window_minutes": 10, "window_failures": 10, "window_create_failures": 6}），实际是 ' + (Get-ShapeName $wef))
+      throw ('看门狗配置 warp_exit_failure 必须是对象（{"enabled": true, "threshold": 9, "cooldown_minutes": 15, "reset_rounds": 2, "action": "refresh_then_switch", "node_selection": "random", "window_minutes": 10, "window_failures": 10, "window_create_failures": 6}），实际是 ' + (Get-ShapeName $wef))
     }
     $knownWef = @('enabled', 'threshold', 'cooldown_minutes', 'reset_rounds', 'action',
-      'window_minutes', 'window_failures', 'window_create_failures')
+      'node_selection', 'window_minutes', 'window_failures', 'window_create_failures')
     $unknownWef = @(@($wef.PSObject.Properties | ForEach-Object { $_.Name }) |
       Where-Object { $knownWef -notcontains $_ })
     if ($unknownWef.Count -gt 0) {
@@ -2114,6 +2153,23 @@ function Read-WatchdogConfig {
         $applied++
         Write-WdLog "配置生效：warp_exit_failure.action = $wefActionVal"
       }
+    }
+    # node_selection 只有 watchdog.json 入口，没有对应命令行参数；省略即内置 random。
+    # 与 action 同一口径：只收字符串，trim + lower 后比较枚举；写错启动即失败。
+    if (Test-HasKey $wef 'node_selection') {
+      $seen++
+      $rawWefNodeSel = Get-Prop $wef 'node_selection'
+      if (-not ($rawWefNodeSel -is [string])) {
+        $tn = if ($null -eq $rawWefNodeSel) { 'null' } else { $rawWefNodeSel.GetType().Name }
+        throw "看门狗配置 warp_exit_failure.node_selection 非法：[$rawWefNodeSel]（类型 $tn；必须是 random / latency）"
+      }
+      $wefNodeSelVal = ([string]$rawWefNodeSel).Trim().ToLowerInvariant()
+      if (@('random', 'latency') -notcontains $wefNodeSelVal) {
+        throw "看门狗配置 warp_exit_failure.node_selection 非法：[$rawWefNodeSel]（必须是 random / latency）"
+      }
+      $script:WarpExitNodeSelection = $wefNodeSelVal
+      $applied++
+      Write-WdLog "配置生效：warp_exit_failure.node_selection = $wefNodeSelVal"
     }
   }
   # {} 是合法的“不改任何默认值”，但很容易是误建/误清空后的残留，单独提示一句。
@@ -2519,6 +2575,143 @@ function Get-DemoteMark {
     if ($r) { return '（地区降权中）' }
   } catch { }
   return ''
+}
+
+# ==== WARP 出口失败切换的节点选择（2026-10-28）=================================
+# 只用于 Invoke-WarpExitFailureTrigger 的切换块；legacy Invoke-Failover 与 WARP 中继
+# 故障路径 Invoke-WarpProxyFailover 仍直接使用 Get-RankedCandidates 的延迟排序，不受影响。
+# random 用进程内洗牌袋（Bag）而不是每次独立均匀随机：整池轮完前不重复，避免同一对
+# 低延迟节点反复互切；池变化（订阅刷新改名/增减、alive 变化）时对袋做增量调和。
+
+function New-WarpExitSelectionState {
+  # 洗牌袋状态：Bag = 本轮扫描尚未消费的节点名（有序，头部优先尝试）；
+  # Seen = 本轮扫描已经出现过的名字（含当前节点），增量调和时不重复追加。
+  # 只有 random 策略使用；latency 完全不碰这个状态。
+  return @{
+    Bag = @()
+    Seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+  }
+}
+
+function Get-WarpExitShuffledNames {
+  # Fisher-Yates（注入 [System.Random] 以便自检固定 seed；不用 Get-Random -Shuffle）。
+  # 返回数组；单元素/空数组由调用方用 @(...) 包住，避免输出流展开成标量/零对象。
+  param([string[]]$Names, [System.Random]$Random)
+  $arr = @($Names)
+  for ($i = $arr.Count - 1; $i -gt 0; $i--) {
+    $j = $Random.Next(0, $i + 1)
+    $tmp = $arr[$i]
+    $arr[$i] = $arr[$j]
+    $arr[$j] = $tmp
+  }
+  return $arr
+}
+
+function Get-WarpExitCandidateOrder {
+  # 输入 Get-RankedCandidates 返回的候选对象（Name/Alive/Delay/DelayRank）、当前节点名
+  # 与策略，返回本次动作可尝试的有序候选列表（.Order）及元数据：
+  #   latency = 按 DelayRank, Name 排序（旧行为；不过滤 Alive=false），不碰袋状态；
+  #   random  = 洗牌袋随机轮换：排除当前节点（ExcludeNow 非空时），优先 Alive=true，
+  #             alive 池为空才回退到全部候选（.Fallback=true）；整池轮完前不重复；
+  #             袋空重新洗牌开始新扫描；池变化时增量调和（保留仍在池中的袋内名字、
+  #             新名字随机追加、消失的移除）。
+  # 本函数只读候选与袋状态，不切换、不写日志；调用方按 Order 尝试后必须调用
+  # Update-WarpExitSelectionConsumed 消费实际尝试数量（未尝试的尾部留给下次）。
+  param(
+    $Candidates,
+    [string]$ExcludeNow = '',
+    [ValidateSet('random', 'latency')][string]$Strategy = 'random',
+    [System.Random]$Random = $null,
+    [hashtable]$State = $null
+  )
+  if ($null -eq $State) { $State = $script:WarpExitSelectionState }
+  if ($null -eq $Random) {
+    if ($null -eq $script:WarpExitSelectionRandom) { $script:WarpExitSelectionRandom = [System.Random]::new() }
+    $Random = $script:WarpExitSelectionRandom
+  }
+  $res = [pscustomobject]@{
+    Order = @()
+    Strategy = $Strategy
+    PoolSize = 0
+    AliveCount = 0
+    Fallback = $false
+    BagRemaining = 0
+    Missing = 0
+  }
+  $all = @($Candidates | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string](Get-Prop $_ 'Name')) })
+  # ExcludeNow 为空/null 时不排除任何节点（当前节点名可能读不到）。
+  $poolAll = @($all | Where-Object { $ExcludeNow -eq '' -or [string](Get-Prop $_ 'Name') -cne $ExcludeNow })
+  $res.PoolSize = @($poolAll).Count
+  $res.AliveCount = @($poolAll | Where-Object { [bool](Get-Prop $_ 'Alive') }).Count
+  if ($Strategy -eq 'latency') {
+    # 旧行为：只排序，不过滤 Alive=false（死节点本来就在 DelayRank 末尾），不碰袋。
+    $res.Order = @($poolAll | Sort-Object -Property DelayRank, Name)
+    return $res
+  }
+  $alivePool = @($poolAll | Where-Object { [bool](Get-Prop $_ 'Alive') })
+  $fallback = ($alivePool.Count -eq 0 -and $poolAll.Count -gt 0)
+  $pool = if ($alivePool.Count -gt 0) { $alivePool } else { $poolAll }
+  $res.Fallback = $fallback
+  if (@($pool).Count -eq 0) {
+    # 空池不清袋：可能只是 Clash 暂时没返回候选（或只剩当前节点），保留本轮扫描进度，
+    # 下次非空池继续增量调和。BagRemaining 如实反映旧袋，日志不再误报 0。
+    $res.BagRemaining = @($State.Bag).Count
+    return $res
+  }
+  # 名字一律 Ordinal 比较：Clash 允许仅大小写不同的两个节点名；Select-Object -Unique、
+  # -contains、-notcontains 默认大小写不敏感，会把它们折叠或留下已不在池中的变体，
+  # 再按 Ordinal 字典取对象就会 KeyNotFound。这里统一用 Ordinal HashSet/字典与 -c* 运算符。
+  $poolNames = @()
+  $poolNameSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+  $byName = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
+  foreach ($c in @($pool)) {
+    $n = [string](Get-Prop $c 'Name')
+    if ($poolNameSet.Add($n)) { $poolNames += $n }
+    $byName[$n] = $c
+  }
+  # 增量调和：消失的名字从袋中移除；袋空则重新洗牌开始新扫描（当前节点进 Seen、不进袋）。
+  $bag = @($State.Bag | Where-Object { $poolNames -ccontains $_ })
+  if ($bag.Count -eq 0) {
+    $State.Seen.Clear()
+    if ($ExcludeNow -ne '') { [void]$State.Seen.Add($ExcludeNow) }
+    $bag = @(Get-WarpExitShuffledNames -Names $poolNames -Random $Random)
+    foreach ($n in $bag) { [void]$State.Seen.Add($n) }
+  } else {
+    $newNames = @($poolNames | Where-Object { -not $State.Seen.Contains($_) -and ($bag -cnotcontains $_) })
+    if ($newNames.Count -gt 0) {
+      $shuffledNew = @(Get-WarpExitShuffledNames -Names $newNames -Random $Random)
+      $bag = @($bag) + @($shuffledNew)
+      foreach ($n in $shuffledNew) { [void]$State.Seen.Add($n) }
+    }
+  }
+  $State.Bag = @($bag)
+  # 防御性映射：正常不会缺键（bag 已按 Ordinal 池名过滤）；真缺了也跳过并记到 Missing，
+  # 绝不让 $null 进入 Order（调用方 StrictMode 下读 .Name 会抛）。
+  $ordered = @()
+  foreach ($n in @($bag)) {
+    if ($byName.ContainsKey($n)) { $ordered += $byName[$n] } else { $res.Missing++ }
+  }
+  $res.Order = @($ordered)
+  $res.BagRemaining = @($bag).Count
+  return $res
+}
+
+function Update-WarpExitSelectionConsumed {
+  # 动作结束后按“实际尝试过的数量”裁剪袋头：成功 break、预算 break、全部失败都要走到
+  # 这里；未尝试的尾部留给下次。latency 不维护袋，直接 no-op；Count 超过袋长度时清空，
+  # 不抛异常。
+  param(
+    [int]$Count,
+    [string]$Strategy = $script:WarpExitNodeSelection,
+    [hashtable]$State = $null
+  )
+  if ($Strategy -ne 'random') { return }
+  if ($null -eq $State) { $State = $script:WarpExitSelectionState }
+  if ($Count -le 0) { return }
+  $bag = @($State.Bag)
+  if ($bag.Count -eq 0) { return }
+  if ($Count -ge $bag.Count) { $State.Bag = @(); return }
+  $State.Bag = @($bag[$Count..($bag.Count - 1)])
 }
 
 function ConvertFrom-WatchdogProbe {
@@ -3951,6 +4144,217 @@ function Invoke-WarpExitFailureWindowSelfTest {
   return $false
 }
 
+function Invoke-WarpExitNodeSelectionSelfTest {
+  # -WarpExitNodeSelectionSelfTest 的实现：纯内存合成候选，不读 watchdog.json、不联网、
+  # 不切换、不写状态/日志文件。输出 PASS/FAIL，返回 $true/$false 供入口映射 exit 0/1。
+  # 每个场景都新建袋/Seen/RNG，避免场景间串状态。
+  $fail = 0
+  $total = 0
+  $mk = {
+    param([string]$Name, [bool]$Alive, [int]$Rank)
+    [pscustomobject]@{ Name = $Name; Alive = $Alive; Delay = $Rank; DelayRank = $Rank }
+  }
+
+  # 1) random 连续消费：整池每个名字恰好一次、无重复。
+  $total++
+  $pool = @(
+    (& $mk 'A' $true 100), (& $mk 'B' $true 200), (& $mk 'C' $true 300),
+    (& $mk 'D' $true 400), (& $mk 'E' $true 500), (& $mk 'F' $true 600)
+  )
+  $st = New-WarpExitSelectionState
+  $rnd = [System.Random]::new(20261028)
+  $seen = @()
+  for ($i = 0; $i -lt 6; $i++) {
+    $r = Get-WarpExitCandidateOrder -Candidates $pool -ExcludeNow '' -Strategy random -Random $rnd -State $st
+    $order = @($r.Order)
+    if ($order.Count -lt 1) { break }
+    $seen += [string]$order[0].Name
+    Update-WarpExitSelectionConsumed -Count 1 -Strategy random -State $st
+  }
+  $unique = @($seen | Select-Object -Unique)
+  $missing = @($pool | ForEach-Object { $_.Name } | Where-Object { $seen -notcontains $_ })
+  if ($seen.Count -eq 6 -and $unique.Count -eq 6 -and $missing.Count -eq 0) {
+    Write-Host 'PASS 1/9 random 连续消费整池每名恰好一次、无重复'
+  } else {
+    Write-Host "FAIL 1/9 random 轮换（seen=$($seen -join ',') unique=$($unique.Count) missing=$($missing -join ',')）"
+    $fail++
+  }
+
+  # 2) 当前节点在整个扫描中永不出现。
+  $total++
+  $pool = @((& $mk 'A' $true 100), (& $mk 'Cur' $true 50), (& $mk 'B' $true 200), (& $mk 'C' $true 300))
+  $st = New-WarpExitSelectionState
+  $rnd = [System.Random]::new(7)
+  $names = @()
+  $orderNames = @()
+  for ($i = 0; $i -lt 3; $i++) {
+    $r = Get-WarpExitCandidateOrder -Candidates $pool -ExcludeNow 'Cur' -Strategy random -Random $rnd -State $st
+    $order = @($r.Order)
+    if ($order.Count -lt 1) { break }
+    # 整个返回顺序都不得含当前节点（不只检查头部），否则去掉排除后首个袋就会露馅。
+    $orderNames += @($order | ForEach-Object { [string]$_.Name })
+    $names += [string]$order[0].Name
+    Update-WarpExitSelectionConsumed -Count 1 -Strategy random -State $st
+  }
+  if ($names.Count -eq 3 -and ($names -notcontains 'Cur') -and ($orderNames -notcontains 'Cur')) {
+    Write-Host 'PASS 2/9 当前节点永不出现'
+  } else {
+    Write-Host "FAIL 2/9 当前节点排除（names=$($names -join ',') order=$($orderNames -join ',')）"
+    $fail++
+  }
+
+  # 3) alive 池非空时不选 Alive=false；alive 全 false 时回退到全部候选并标记 Fallback。
+  $total++
+  $pool = @((& $mk 'Dead1' $false 10), (& $mk 'Alive1' $true 500), (& $mk 'Dead2' $false 20))
+  $st = New-WarpExitSelectionState
+  $r = Get-WarpExitCandidateOrder -Candidates $pool -ExcludeNow '' -Strategy random -Random ([System.Random]::new(3)) -State $st
+  $order = @($r.Order)
+  $okAlive = (-not [bool]$r.Fallback) -and ($order.Count -eq 1) -and
+    (@($order | Where-Object { -not [bool]$_.Alive }).Count -eq 0) -and ([string]$order[0].Name -eq 'Alive1')
+  $poolDead = @((& $mk 'Dead1' $false 10), (& $mk 'Dead2' $false 20))
+  $st2 = New-WarpExitSelectionState
+  $r2 = Get-WarpExitCandidateOrder -Candidates $poolDead -ExcludeNow '' -Strategy random -Random ([System.Random]::new(3)) -State $st2
+  $order2 = @($r2.Order)
+  $okFallback = ([bool]$r2.Fallback) -and ($order2.Count -eq 2) -and
+    (@($order2 | Where-Object { -not [bool]$_.Alive }).Count -eq 2)
+  if ($okAlive -and $okFallback) {
+    Write-Host 'PASS 3/9 alive 优先；alive 全 false 时回退全池并标记 Fallback'
+  } else {
+    Write-Host "FAIL 3/9 alive 过滤/回退（alive=$okAlive fallback=$okFallback）"
+    $fail++
+  }
+
+  # 4) 池变化增量调和：删除的名字不再出现；新增名字随机追加并最终可出现；袋空重洗也不带回删除项。
+  $total++
+  $pool1 = @((& $mk 'A' $true 100), (& $mk 'B' $true 200), (& $mk 'C' $true 300), (& $mk 'D' $true 400))
+  $st = New-WarpExitSelectionState
+  $rnd = [System.Random]::new(11)
+  $r1 = Get-WarpExitCandidateOrder -Candidates $pool1 -ExcludeNow '' -Strategy random -Random $rnd -State $st
+  $ok1 = (@($r1.Order).Count -eq 4)
+  $pool2 = @((& $mk 'A' $true 100), (& $mk 'C' $true 300), (& $mk 'D' $true 400))
+  $r2 = Get-WarpExitCandidateOrder -Candidates $pool2 -ExcludeNow '' -Strategy random -Random $rnd -State $st
+  $names2 = @($r2.Order | ForEach-Object { $_.Name })
+  $okRemove = ($names2.Count -eq 3) -and ($names2 -notcontains 'B')
+  $pool3 = @((& $mk 'A' $true 100), (& $mk 'C' $true 300), (& $mk 'D' $true 400), (& $mk 'E' $true 500))
+  $r3 = Get-WarpExitCandidateOrder -Candidates $pool3 -ExcludeNow '' -Strategy random -Random $rnd -State $st
+  $names3 = @($r3.Order | ForEach-Object { $_.Name })
+  $okAdd = ($names3.Count -eq 4) -and ($names3 -contains 'E') -and ($names3 -notcontains 'B')
+  Update-WarpExitSelectionConsumed -Count 4 -Strategy random -State $st
+  $r4 = Get-WarpExitCandidateOrder -Candidates $pool3 -ExcludeNow '' -Strategy random -Random $rnd -State $st
+  $names4 = @($r4.Order | ForEach-Object { $_.Name })
+  $okRestart = ($names4.Count -eq 4) -and ($names4 -contains 'E') -and ($names4 -notcontains 'B')
+  if ($ok1 -and $okRemove -and $okAdd -and $okRestart) {
+    Write-Host 'PASS 4/9 池删除/新增增量调和，袋空重洗不带回删除项'
+  } else {
+    Write-Host "FAIL 4/9 池变化调和（init=$ok1 remove=$okRemove add=$okAdd restart=$okRestart）"
+    $fail++
+  }
+
+  # 5) latency：保持 DelayRank, Name 顺序（不过滤 Alive=false），且完全不消费袋状态。
+  $total++
+  $pool = @((& $mk 'Slow' $true 300), (& $mk 'Fast' $true 100), (& $mk 'Mid' $true 200), (& $mk 'Dead' $false 900))
+  $st = New-WarpExitSelectionState
+  $st.Bag = @('Preserved')
+  [void]$st.Seen.Add('Preserved')
+  $r = Get-WarpExitCandidateOrder -Candidates $pool -ExcludeNow '' -Strategy latency -Random ([System.Random]::new(1)) -State $st
+  $names = @($r.Order | ForEach-Object { $_.Name })
+  $okOrder = (($names -join ',') -eq 'Fast,Mid,Slow,Dead')
+  $okBag = (@($st.Bag).Count -eq 1) -and ([string]$st.Bag[0] -eq 'Preserved') -and $st.Seen.Contains('Preserved')
+  if ($okOrder -and $okBag) {
+    Write-Host 'PASS 5/9 latency 保持 DelayRank 顺序、不过滤 dead、不消费袋'
+  } else {
+    Write-Host "FAIL 5/9 latency（order=$($names -join ',') bag=$okBag）"
+    $fail++
+  }
+
+  # 6) 空池 / 仅当前节点返回空；单元素池返回单个候选（数组语义不塌成标量）。
+  $total++
+  $st = New-WarpExitSelectionState
+  $rnd = [System.Random]::new(5)
+  $rEmpty = Get-WarpExitCandidateOrder -Candidates @() -ExcludeNow '' -Strategy random -Random $rnd -State $st
+  $rOnly = Get-WarpExitCandidateOrder -Candidates @((& $mk 'Cur' $true 100)) -ExcludeNow 'Cur' -Strategy random -Random $rnd -State $st
+  $rSingle = Get-WarpExitCandidateOrder -Candidates @((& $mk 'Only' $true 100)) -ExcludeNow '' -Strategy random -Random $rnd -State $st
+  $ok = (@($rEmpty.Order).Count -eq 0) -and (@($rOnly.Order).Count -eq 0) -and
+    (-not [bool]$rOnly.Fallback) -and (@($rSingle.Order).Count -eq 1) -and ([string]$rSingle.Order[0].Name -eq 'Only')
+  if ($ok) {
+    Write-Host 'PASS 6/9 空池/仅当前节点返回空，单元素池返回单个候选'
+  } else {
+    Write-Host 'FAIL 6/9 空池/仅当前节点/单元素池'
+    $fail++
+  }
+
+  # 7) 消费超过袋长度不崩：清空袋，下一次调用重新洗牌开始新扫描。
+  $total++
+  $pool = @((& $mk 'A' $true 100), (& $mk 'B' $true 200), (& $mk 'C' $true 300))
+  $st = New-WarpExitSelectionState
+  $rnd = [System.Random]::new(9)
+  Get-WarpExitCandidateOrder -Candidates $pool -ExcludeNow '' -Strategy random -Random $rnd -State $st | Out-Null
+  Update-WarpExitSelectionConsumed -Count 99 -Strategy random -State $st
+  $okEmpty = (@($st.Bag).Count -eq 0)
+  $r2 = Get-WarpExitCandidateOrder -Candidates $pool -ExcludeNow '' -Strategy random -Random $rnd -State $st
+  $okRestart = (@($r2.Order).Count -eq 3)
+  if ($okEmpty -and $okRestart) {
+    Write-Host 'PASS 7/9 消费超过袋长度清空且下次重新洗牌'
+  } else {
+    Write-Host "FAIL 7/9 超长消费（empty=$okEmpty restart=$okRestart）"
+    $fail++
+  }
+
+  # 8) 多 seed 下 random 顺序至少一次不同于延迟序（防“假随机 = 排序”）。
+  $total++
+  $pool = @(
+    (& $mk 'A' $true 100), (& $mk 'B' $true 200), (& $mk 'C' $true 300),
+    (& $mk 'D' $true 400), (& $mk 'E' $true 500)
+  )
+  $latSt = New-WarpExitSelectionState
+  $lat = @((Get-WarpExitCandidateOrder -Candidates $pool -ExcludeNow '' -Strategy latency -Random ([System.Random]::new(1)) -State $latSt).Order |
+    ForEach-Object { $_.Name }) -join ','
+  $diff = $false
+  foreach ($seed in 1..8) {
+    $st = New-WarpExitSelectionState
+    $ord = @((Get-WarpExitCandidateOrder -Candidates $pool -ExcludeNow '' -Strategy random -Random ([System.Random]::new($seed)) -State $st).Order |
+      ForEach-Object { $_.Name }) -join ','
+    if ($ord -ne $lat) { $diff = $true }
+  }
+  if ($diff) {
+    Write-Host 'PASS 8/9 多 seed random 顺序至少一次不同于延迟序'
+  } else {
+    Write-Host 'FAIL 8/9 random 顺序与延迟序完全相同（疑似退化成排序）'
+    $fail++
+  }
+
+  # 9) 仅大小写不同的两个名字按 Ordinal 视为两个节点：都出现、不混叠、Order 不含 $null；
+  #    池只剩其中一个变体时，袋里的另一个变体按 Ordinal 移除，不得留下取不到对象的键。
+  $total++
+  $pool = @((& $mk 'NodeA' $true 100), (& $mk 'nodea' $true 200), (& $mk 'Other' $true 300))
+  $st = New-WarpExitSelectionState
+  $rnd = [System.Random]::new(13)
+  $r1 = Get-WarpExitCandidateOrder -Candidates $pool -ExcludeNow '' -Strategy random -Random $rnd -State $st
+  $order1 = @($r1.Order)
+  $names1 = @($order1 | ForEach-Object { [string]$_.Name })
+  $okBoth = ($order1.Count -eq 3) -and ($names1 -ccontains 'NodeA') -and ($names1 -ccontains 'nodea') -and
+    ($names1 -ccontains 'Other') -and (@($order1 | Where-Object { $null -eq $_ }).Count -eq 0) -and ([int]$r1.Missing -eq 0)
+  $pool2 = @((& $mk 'nodea' $true 200), (& $mk 'Other' $true 300))
+  $r2 = Get-WarpExitCandidateOrder -Candidates $pool2 -ExcludeNow '' -Strategy random -Random $rnd -State $st
+  $order2 = @($r2.Order)
+  $names2 = @($order2 | ForEach-Object { [string]$_.Name })
+  $okSwap = ($order2.Count -eq 2) -and ($names2 -ccontains 'nodea') -and ($names2 -cnotcontains 'NodeA') -and
+    (@($order2 | Where-Object { $null -eq $_ }).Count -eq 0) -and ([int]$r2.Missing -eq 0)
+  if ($okBoth -and $okSwap) {
+    Write-Host 'PASS 9/9 大小写不同的名字按 Ordinal 区分且池变化不残留旧变体'
+  } else {
+    Write-Host "FAIL 9/9 大小写名字（both=$okBoth swap=$okSwap names1=$($names1 -join ',') names2=$($names2 -join ',')）"
+    $fail++
+  }
+
+  if ($fail -eq 0) {
+    Write-Host "PASS WARP 出口节点选择自检（$total/$total）"
+    return $true
+  }
+  Write-Host "FAIL WARP 出口节点选择自检（失败 $fail/$total）"
+  return $false
+}
+
 function Reset-WarpExitTriggerState {
   # 清零 WARP 出口失败触发状态。BaselineStreak > 0 表示刚动作/刚切换：连击需再涨
   # threshold 才会重复触发；GraceRounds 是动作后不累计“出口池不可用”本地计数的轮数。
@@ -4276,23 +4680,48 @@ function Invoke-WarpExitFailureTrigger {
       } else {
         $map = Get-ProxyMap
         $cands = Get-RankedCandidates -ProxyMap $map -SelectorAll $all -ExcludeNow $original -IgnoreQuotaPenalty
-        Write-WdLog "WARP 出口失败触发：候选池 $(@($cands).Count) 个（已忽略 legacy quota 降权），按排名尝试切换" 'INFO'
+        $poolCount = @($cands).Count
+        $nodeStrategy = $script:WarpExitNodeSelection
+        $selection = Get-WarpExitCandidateOrder -Candidates $cands -ExcludeNow $original -Strategy $nodeStrategy
+        $ordered = @($selection.Order)
+        $attemptCap = [Math]::Min([int]@($ordered).Count, [int]$script:MaxCandidates)
+        $strategyTxt = if ($nodeStrategy -eq 'random') {
+          "strategy=random（随机轮换，整池轮完前不重复；当前节点不选），袋剩余 $($selection.BagRemaining)"
+        } else {
+          'strategy=latency（按延迟排序，旧行为）'
+        }
+        Write-WdLog "WARP 出口失败触发：候选池 $poolCount 个（已忽略 legacy quota 降权），alive $($selection.AliveCount)，$strategyTxt，本次可尝试 $attemptCap 个（上限 $($script:MaxCandidates)）" 'INFO'
+        if ([bool]$selection.Fallback) {
+          Write-WdLog "WARP 出口失败触发：候选池没有 alive 节点（alive=$($selection.AliveCount)/$poolCount），random 策略回退到全部候选（含 alive=false）" 'WARN'
+        }
+        if ([int]$selection.Missing -gt 0) {
+          Write-WdLog "WARP 出口失败触发：候选映射缺失 $($selection.Missing) 个（内部不一致，已跳过；Order 不含 null，请报告）" 'WARN'
+        }
+        if (@($ordered).Count -eq 0) {
+          Write-WdLog 'WARP 出口失败触发：没有可尝试的候选（候选池为空或只剩当前节点）' 'WARN'
+        }
         $switchSw = [System.Diagnostics.Stopwatch]::StartNew()
-        foreach ($c in @($cands | Select-Object -First $script:MaxCandidates)) {
-          if ($switchSw.Elapsed.TotalSeconds -ge $script:ProxyFailoverBudgetSeconds) {
-            Write-WdLog "WARP 出口失败触发：切换候选预算 $($script:ProxyFailoverBudgetSeconds)s 已耗尽，停止本轮切换" 'WARN'
-            break
-          }
-          try {
-            if (Switch-ClashNode -Name $c.Name -Uid $script:SubscriptionUid) {
-              $switched = $true
-              $switchedNode = $c.Name
+        $attempted = 0
+        try {
+          foreach ($c in @($ordered | Select-Object -First $attemptCap)) {
+            if ($switchSw.Elapsed.TotalSeconds -ge $script:ProxyFailoverBudgetSeconds) {
+              Write-WdLog "WARP 出口失败触发：切换候选预算 $($script:ProxyFailoverBudgetSeconds)s 已耗尽，停止本轮切换" 'WARN'
               break
             }
-            Write-WdLog "WARP 出口失败触发：切换 [$($c.Name)] 返回失败，试下一个候选" 'WARN'
-          } catch {
-            Write-WdLog "WARP 出口失败触发：切换 [$($c.Name)] 异常：$(Mask-Text $_.Exception.Message)" 'WARN'
+            $attempted++
+            try {
+              if (Switch-ClashNode -Name $c.Name -Uid $script:SubscriptionUid) {
+                $switched = $true
+                $switchedNode = $c.Name
+                break
+              }
+              Write-WdLog "WARP 出口失败触发：切换 [$($c.Name)] 返回失败，试下一个候选" 'WARN'
+            } catch {
+              Write-WdLog "WARP 出口失败触发：切换 [$($c.Name)] 异常：$(Mask-Text $_.Exception.Message)" 'WARN'
+            }
           }
+        } finally {
+          Update-WarpExitSelectionConsumed -Count $attempted -Strategy $nodeStrategy
         }
       }
     } catch {
@@ -4810,7 +5239,7 @@ function Invoke-DryRun {
     $hzDry = Get-GatewayHealthz -Force
     if ([bool](Get-Prop $hzDry 'Ok')) {
       if ([bool](Get-Prop $hzDry 'HasWarp')) {
-        Write-WdLog ("WARP 出口失败触发（DryRun 只读，不动作）：enabled=true threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction) window=$($script:WarpExitFailureWindowMinutes)分钟/$($script:WarpExitFailureWindowFailures)次 create=$($script:WarpExitFailureWindowCreateFailures)次 healthz=$(Get-Prop $hzDry 'Status') status=$(Get-Prop $hzDry 'WarpStatus') active=$(Get-Prop $hzDry 'WarpActive') standby=$(Get-Prop $hzDry 'WarpStandby') cooling=$(Get-Prop $hzDry 'WarpCooling') failure_streak=$(Get-Prop $hzDry 'FailureStreak') failures_total=$(Get-Prop $hzDry 'FailuresTotal') create_failures=$(Get-Prop $hzDry 'CreateFailuresTotal') soft_failures_total=$(Get-Prop $hzDry 'SoftFailuresTotal') has_soft=$([bool](Get-Prop $hzDry 'HasSoftFailuresTotal')) last_failure_kind=$(Get-Prop $hzDry 'LastFailureKind') started_at=$(Get-Prop $hzDry 'StartedAt') last_success_at=$(Get-Prop $hzDry 'LastSuccessAt')")
+        Write-WdLog ("WARP 出口失败触发（DryRun 只读，不动作）：enabled=true threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction) node_selection=$($script:WarpExitNodeSelection) window=$($script:WarpExitFailureWindowMinutes)分钟/$($script:WarpExitFailureWindowFailures)次 create=$($script:WarpExitFailureWindowCreateFailures)次 healthz=$(Get-Prop $hzDry 'Status') status=$(Get-Prop $hzDry 'WarpStatus') active=$(Get-Prop $hzDry 'WarpActive') standby=$(Get-Prop $hzDry 'WarpStandby') cooling=$(Get-Prop $hzDry 'WarpCooling') failure_streak=$(Get-Prop $hzDry 'FailureStreak') failures_total=$(Get-Prop $hzDry 'FailuresTotal') create_failures=$(Get-Prop $hzDry 'CreateFailuresTotal') soft_failures_total=$(Get-Prop $hzDry 'SoftFailuresTotal') has_soft=$([bool](Get-Prop $hzDry 'HasSoftFailuresTotal')) last_failure_kind=$(Get-Prop $hzDry 'LastFailureKind') started_at=$(Get-Prop $hzDry 'StartedAt') last_success_at=$(Get-Prop $hzDry 'LastSuccessAt')")
       } else {
         Write-WdLog 'WARP 出口失败触发（DryRun 只读）：/healthz 无 warp 段（WARP 未启用），不会触发'
       }
@@ -4818,7 +5247,10 @@ function Invoke-DryRun {
       Write-WdLog "WARP 出口失败触发（DryRun 只读）：/healthz 不可用（$(Get-Prop $hzDry 'Error')）"
     }
   } else {
-    Write-WdLog 'WARP 出口失败触发：enabled=false（不读 /healthz）'
+    Write-WdLog "WARP 出口失败触发：enabled=false（不读 /healthz；node_selection=$($script:WarpExitNodeSelection)）"
+  }
+  if ($script:WarpExitFailureEnabled -and $script:WarpExitNodeSelection -eq 'random') {
+    Write-WdLog 'WARP 出口失败触发：node_selection=random（洗牌袋随机轮换，整池轮完前不重复）；下面的候选 Top10 仍按延迟(+地区/quota罚分)展示，只是池内容/筛选预览，不代表实际切换顺序；random 不按 deprioritize 排序罚分选择，地区排除请用 exclude_contains' 'INFO'
   }
   $wd = Get-WatchdogStatus
   $prox = Get-Prop $wd 'proxies'
@@ -4849,9 +5281,18 @@ function Invoke-DryRun {
   $dryAlive = @($cands | Where-Object { $_.Alive -and $_.Delay -gt 0 }).Count
   if ($dryAlive -eq 0 -and @($cands).Count -gt 0) {
     # 与正式切换路径同一条告警：DryRun 正是用来判断「到底有没有测速数据」的场合。
-    Write-WdLog '候选全部没有测速数据（Clash 尚未对这些节点做过 url-test）：实际切换会按名字序试候选，不是按延迟；开一次 Verge 的组测速可改善' 'WARN'
+    $noDelayHint = if ($script:WarpExitFailureEnabled -and $script:WarpExitNodeSelection -eq 'random') {
+      '实际 WARP 出口失败切换按 random 洗牌袋顺序试候选（与延迟无关）；开一次 Verge 的组测速可改善下面的排名展示'
+    } else {
+      '实际切换会按名字序试候选，不是按延迟；开一次 Verge 的组测速可改善'
+    }
+    Write-WdLog "候选全部没有测速数据（Clash 尚未对这些节点做过 url-test）：$noDelayHint" 'WARN'
   }
-  Write-WdLog "候选（生效子串排除=$exclTxt；另有内置精确排除：非叶子组/占位节点；按延迟(+地区/quota罚分)排序）共 $(@($cands).Count) 个，Top10："
+  $orderNote = '按延迟(+地区/quota罚分)排序'
+  if ($script:WarpExitFailureEnabled -and $script:WarpExitNodeSelection -eq 'random') {
+    $orderNote = '按延迟(+地区/quota罚分)展示，仅池内容/筛选预览，不代表 random 实际切换顺序'
+  }
+  Write-WdLog "候选（生效子串排除=$exclTxt；另有内置精确排除：非叶子组/占位节点；$orderNote）共 $(@($cands).Count) 个，Top10："
   $i = 0
   foreach ($c in @($cands | Select-Object -First 10)) {
     $i++
@@ -4972,6 +5413,16 @@ $script:WarpExitTriggerErrSig = ''
 
 # 隐藏诊断入口：必须早于 Read-WatchdogConfig（本自检不读 watchdog.json）、实例互斥与
 # 所有 Resolve-*/网络路径；纯内存合成序列，不切换、不写状态/日志文件。
+if ($WarpExitNodeSelectionSelfTest) {
+  $selfTestOk = $false
+  try { $selfTestOk = Invoke-WarpExitNodeSelectionSelfTest }
+  catch {
+    Write-Host ('FAIL WARP 出口节点选择自检异常：' + $_.Exception.Message)
+    $selfTestOk = $false
+  }
+  if ($selfTestOk) { exit 0 }
+  exit 1
+}
 if ($WarpExitFailureWindowSelfTest) {
   $selfTestOk = $false
   try { $selfTestOk = Invoke-WarpExitFailureWindowSelfTest }
@@ -5088,9 +5539,9 @@ try {
   $bannerTarget = if ($bannerPlan.Endpoint -ne '') { Format-ProxyEndpoint -Url $bannerPlan.Endpoint } else { '(无)' }
   Write-WdLog "proxy-check 模式=$($bannerPlan.Mode) target=$bannerTarget source=$($bannerPlan.Source) 间隔=$($script:ProxyCheckIntervalSeconds)s 复检=$($script:ProxyCheckRecheckSeconds)s 超时=$($script:ProxyCheckTimeoutSeconds)s failover=$($script:ProxyCheckFailover) 预算=$($script:ProxyFailoverBudgetSeconds)s udp=$($script:ProxyCheckUdpTarget) require_udp=$($script:ProxyCheckRequireUdp)"
   $wefBanner = if ($script:WarpExitFailureEnabled) {
-    "enabled threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction) window=$($script:WarpExitFailureWindowMinutes)分钟/$($script:WarpExitFailureWindowFailures)次 create=$($script:WarpExitFailureWindowCreateFailures)次"
+    "enabled threshold=$($script:WarpExitFailureThreshold) cooldown=$($script:WarpExitFailureCooldownMinutes)分钟 reset_rounds=$($script:WarpExitFailureResetRounds) action=$($script:WarpExitFailureAction) node_selection=$($script:WarpExitNodeSelection) window=$($script:WarpExitFailureWindowMinutes)分钟/$($script:WarpExitFailureWindowFailures)次 create=$($script:WarpExitFailureWindowCreateFailures)次"
   } else { 'disabled' }
-  Write-WdLog "WARP 出口失败触发=$wefBanner（中继健康时只读 /healthz；失败窗口按累计计数增量判定，成功不清窗；副信号本地连续轮数仅常驻循环推进）"
+  Write-WdLog "WARP 出口失败触发=$wefBanner（中继健康时只读 /healthz；失败窗口按累计计数增量判定，成功不清窗；副信号本地连续轮数仅常驻循环推进；node_selection 只影响切换候选顺序，中继故障路径仍按延迟）"
   if ($DryRun) {
     Invoke-DryRun -Uid $script:SubscriptionUid
     exit 0

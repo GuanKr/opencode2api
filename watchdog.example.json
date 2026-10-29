@@ -147,6 +147,20 @@
     "window_failures": 10,
     "window_create_failures": 6,
 
+    // ---- 候选选择策略（2026-10-28，random/latency，默认 random）----
+    // random = 进程内洗牌袋随机轮换：排除当前节点，优先 alive 候选（全部 alive=false
+    //   时回退到全部候选并在日志/返回字段标出），整池轮完前不重复；订阅刷新导致池变化
+    //   时增量调和（袋中保留仍在池中的名字、新名字随机追加、消失的移除，袋空重新洗牌）；
+    //   每次动作只消费实际尝试过的候选，未尝试的尾部留给下次。
+    // latency = 旧的按延迟排序（DelayRank, Name），是回退项，不碰洗牌袋。
+    // 为什么默认 random：WARP 出口的 /48 段由注册源 IP/Clash 节点决定，低延迟不预测
+    //   段质量；按延迟优先会让动作在少数低延迟节点间循环，random 覆盖整池。
+    // random 不按 deprioritize 的排序罚分选择，要排除地区请用 exclude_contains。
+    // 只作用于 WARP 出口失败动作；WARP 中继故障路径（Invoke-WarpProxyFailover）仍按延迟。
+    // 只收字符串 random/latency，写错启动失败；只在启动时读取。
+    // 升级/回滚必须脚本与本文件一起：旧脚本会因这个未知键拒绝启动。
+    "node_selection": "random",
+
     // 动作后的冷却分钟数（0-120，默认 15）：冷却期内即使再次达标也不动作。
     // 只作用于本触发器，不碰中继失败/legacy 的 round cooldown。
     "cooldown_minutes": 15,
@@ -157,7 +171,8 @@
 
     // 触发后的动作：
     //   refresh_only         只刷新订阅（受 RefreshCooldownMinutes 节流）；
-    //   refresh_then_switch  先刷新（节流/失败只记日志、继续），再按 WARP 候选排序切换；
+    //   refresh_then_switch  先刷新（节流/失败只记日志、继续），再按 node_selection
+    //                        选择候选（random 默认随机轮换 / latency 延迟排序）切换；
     //   switch_only          不刷新，直接切换。
     // 成功切换后 POST /v1/watchdog/warp/reset（server_keys 鉴权；404/405 视为旧网关忽略），
     // 让网关退役旧出口。等价命令行参数：-WarpExitFailureEnabled:$true / :$false（[bool] 经
